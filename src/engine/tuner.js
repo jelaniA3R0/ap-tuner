@@ -12,6 +12,9 @@ const { neededParams, oscSmaxFor, filterRules, iRule, gainLimits } = require('..
 
 const AXES = ['roll', 'pitch', 'yaw'];
 const PID_TUNING_ID = 194, ATTITUDE_ID = 30;
+// after a gain change the watchdog ignores this many seconds: ArduPilot's slew-rate signal looks back ~0.3 s
+// and telemetry arrives late, so those samples still describe the gains before the change
+const WATCH_GRACE_S = 0.5;
 
 class Tuner extends EventEmitter {
   constructor(link, opts = {}) {
@@ -257,32 +260,55 @@ class Tuner extends EventEmitter {
     await this.writeGains(axis, pre, 'apply filters');
     for (let s = 1; s <= steps; s++) {
       if (this.state === 'paused' || this.state === 'idle') return false;
+      const before = currentGains(this.family, axis, this.params);
       const g = {};
       for (const k of keys) { const a = cur[k], b = target[k]; g[k] = (a > 0 && b > 0) ? a * Math.pow(b / a, s / steps) : (s === steps ? b : a + (b - a) * s / steps); }
       await this.writeGains(axis, g, `apply step ${s}/${steps}`);
       const ok = await this._watch(axis, this.opts.watchSeconds);
-      if (!ok) { await this.revertAxis(axis, 'oscillation detected after step ' + s); this.pause(`${axis}: oscillation after applying step ${s}/${steps}; reverted to last good gains`); return false; }
+      if (!ok) {
+        // a step that only lowered gains did not cause the oscillation: going back up would make it worse
+        if (keys.every(k => !(g[k] > before[k] * (1 + 1e-6)))) {
+          const low = {}; for (const k of keys) low[k] = target[k];
+          await this.writeGains(axis, low, `oscillation continued after lowering the gains (step ${s}): lowered to the target`);
+          this.lastGood[axis] = currentGains(this.family, axis, this.params); this.saveSession();
+          this.pause(`${axis}: still oscillating after lowering the gains, so the lower gains were kept (${keys.map(k => k + ' ' + fmt(low[k])).join(', ')}). Land if it keeps shaking, otherwise press Resume`);
+          return false;
+        }
+        await this.revertAxis(axis, 'oscillation detected after step ' + s); this.pause(`${axis}: oscillation after applying step ${s}/${steps}; reverted to last good gains`); return false;
+      }
       this.lastGood[axis] = currentGains(this.family, axis, this.params); this.saveSession();
     }
     if (target.angleP !== undefined || target.tconst !== undefined) {
+      const before = currentGains(this.family, axis, this.params);
       await this.writeGains(axis, { angleP: target.angleP, tconst: target.tconst }, 'apply angle gain');
       const ok = await this._watch(axis, this.opts.watchSeconds);
-      if (!ok) { await this.revertAxis(axis, 'oscillation after angle gain'); this.pause(`${axis}: oscillation after the angle gain; reverted`); return false; }
+      if (!ok) {
+        // a softer angle loop (lower angle P, longer time constant) did not cause it either: keep it
+        if (!(target.angleP > before.angleP * (1 + 1e-6)) && !(target.tconst < before.tconst * (1 - 1e-6))) {
+          this.lastGood[axis] = currentGains(this.family, axis, this.params); this.saveSession();
+          this.pause(`${axis}: still oscillating after softening the angle gain, so it was kept. Land if it keeps shaking, otherwise press Resume`);
+          return false;
+        }
+        await this.revertAxis(axis, 'oscillation after angle gain'); this.pause(`${axis}: oscillation after the angle gain; reverted`); return false;
+      }
       this.lastGood[axis] = currentGains(this.family, axis, this.params); this.saveSession();
     }
     this.log('tuner', `${axis}: new gains applied and held for ${this.opts.watchSeconds} s without oscillation`);
     return true;
   }
 
-  /** watch an axis for `seconds`; false if the watchdog trips (also checks attitude error) */
+  /**
+   * watch an axis for `seconds` after a change; false if the watchdog trips (also checks attitude error).
+   * Samples from the first WATCH_GRACE_S are ignored: they still describe the gains before the change.
+   */
   _watch(axis, seconds) {
     return new Promise(resolve => {
-      const t0 = Date.now();
+      const t0 = Date.now(); const since = t0 / 1000 + WATCH_GRACE_S;
       const iv = setInterval(() => {
-        const w = this.axes[axis].watchdog(2, { oscSmax: this.opts.oscSmax });
+        const w = this.axes[axis].watchdog(2, { oscSmax: this.opts.oscSmax, since });
         const attErr = this._attitudeError();
         if (w.oscillating || attErr > this.opts.angleAbort) { clearInterval(iv); this.log('watchdog', `${axis}: ${w.reasons.join('; ') || 'attitude error ' + attErr.toFixed(1) + ' deg'}`); resolve(false); return; }
-        if (Date.now() - t0 > seconds * 1000) { clearInterval(iv); resolve(true); }
+        if (Date.now() - t0 > (seconds + WATCH_GRACE_S) * 1000) { clearInterval(iv); resolve(true); }
       }, 250);
     });
   }

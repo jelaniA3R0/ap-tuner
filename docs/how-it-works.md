@@ -132,8 +132,12 @@ ArduPilot's.
 excitation), analyses, proposes; with auto-apply it writes filters first, then P/I/D in
 multiplicative steps ≤ ×1.5 (D before P), watching 4 s after each step. The watchdog trips on
 `SRate` above the threshold (5 default; 3 for 50 kg, 1.5 for 100 kg), `Dmod` < 0.9, or a jump
-in oscillation-band error energy (≥ 3× the baseline and ≥ 8°/s RMS), and reverts to the last
-good set, then pauses. Rounds repeat (at most four per axis) until the rate gains change by less than 10% and the angle
+in oscillation-band error energy (≥ 3× the baseline and ≥ 8°/s RMS). It only judges samples
+from 0.5 s after the write on (ArduPilot's `SRate` looks back ~0.3 s and telemetry arrives late,
+so earlier samples still show the old gains). After a step that raised a gain it reverts to the
+last good set, then pauses; after a step that only lowered gains the oscillation was already
+there, so it goes on down to the proposed (lower) gains instead of back up, then pauses.
+Rounds repeat (at most four per axis) until the rate gains change by less than 10% and the angle
 gain by less than 15%, then the next axis.
 Everything written is journaled in `sessions/*.json` and **Restore original gains** rewrites the
 originals. A QuikTune-style ramp (same doubling time, back-off and limits as the Lua applet) is

@@ -29,10 +29,12 @@ class LiveAxis {
   get seconds() { return this.t.length > 1 ? this.t[this.t.length - 1] - this.t[0] : 0; }
   get rateHz() { return estimateRate(this.t.slice(-400)); }
 
-  /** uniform dataset over the last `seconds` (or all) */
-  window(seconds = null) {
+  /** uniform dataset over the last `seconds` (or all); `since` (s, same clock as push) also drops older samples */
+  window(seconds = null, since = null) {
     let i0 = 0;
-    if (seconds !== null) { const cut = this.lastTs - seconds; while (i0 < this.t.length && this.t[i0] < cut) i0++; }
+    let cut = seconds !== null ? this.lastTs - seconds : null;
+    if (since !== null && (cut === null || since > cut)) cut = since;
+    if (cut !== null) while (i0 < this.t.length && this.t[i0] < cut) i0++;
     const t = this.t.slice(i0);
     if (t.length < 20) return null;
     const raw = estimateRate(t);
@@ -59,16 +61,20 @@ class LiveAxis {
   /**
    * Oscillation watchdog over the last `seconds`. Returns {oscillating, reasons[], srateMax, dmodMin, bandRms, peakHz}
    * thresholds: {oscSmax (QuikTune QUIK_OSC_SMAX, default 5), bandRmsDegs (default 8), ratio vs baseline (3x)}
+   * since: ignore samples older than this (s, same clock as push), e.g. those from before a gain change; the
+   * spectral check then waits until a full window (max(seconds, 3) s) has come in after it: shorter windows
+   * mistake stick taps for oscillation
    */
-  watchdog(seconds = 2, { oscSmax = 5, bandRmsDegs = 8, dmodMin = 0.9 } = {}) {
-    let i0 = this.t.length - 1; const cut = this.lastTs - seconds;
+  watchdog(seconds = 2, { oscSmax = 5, bandRmsDegs = 8, dmodMin = 0.9, since = null } = {}) {
+    let i0 = this.t.length - 1; const cut = since !== null ? Math.max(this.lastTs - seconds, since) : this.lastTs - seconds;
     let srMax = 0, dmMin = 1, n = 0;
     while (i0 >= 0 && this.t[i0] >= cut) { if (this.srate[i0] > srMax) srMax = this.srate[i0]; if (this.dmod[i0] < dmMin) dmMin = this.dmod[i0]; n++; i0--; }
     const reasons = [];
     if (srMax > oscSmax) reasons.push(`slew rate ${srMax.toFixed(1)} > ${oscSmax}`);
     if (dmMin < dmodMin) reasons.push(`Dmod ${dmMin.toFixed(2)} (slew limiter cutting gains)`);
     let band = 0, peakHz = 0;
-    const w = this.window(Math.max(seconds, 3));
+    const span = Math.max(seconds, 3);
+    const w = since === null || this.lastTs - since >= span ? this.window(span) : null;
     if (w && w.n >= 32) {
       const win = Math.min(nextPow2(w.n), 256);
       if (w.n >= win) {

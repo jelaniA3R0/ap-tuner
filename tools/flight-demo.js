@@ -35,7 +35,7 @@ const snapshot = () => new Promise((res, rej) => { let s = ''; const req = http.
     const prep = await api('prepare', { confirm: true }); log('vehicle read:', prep.family, '| checks:', prep.checks.map(c => (c.ok ? 'ok ' : '!! ') + c.title).join(' | '));
     const st = await api('flight/start', { axes: ['roll', 'pitch'], preset: 'normal', size: 'medium', auto, observeSeconds: 30 });
     log('flight session started, phase', st.flight.phase);
-    let last = '', reviewed = false, lastInfo = '', verdictShown = false;
+    let last = '', reviewed = false, lastInfo = '', verdictShown = false, pausedAt = 0;
     for (;;) {
       await sleep(3000);
       let s; try { s = await snapshot(); } catch (e) { continue; }
@@ -43,6 +43,8 @@ const snapshot = () => new Promise((res, rej) => { let s = ''; const req = http.
       if (f.phase !== last) { log('PHASE', f.phase, '-', f.info); last = f.phase; }
       else if (f.info !== lastInfo && /tuning|recheck/.test(f.phase)) { log('   ', f.info); }
       lastInfo = f.info;
+      // a paused tuner waits for the pilot: press Resume after 5 s, as a pilot would once it flies normally
+      if (f.phase === 'paused' || /^paused/.test(f.info || '')) { if (!pausedAt) pausedAt = Date.now(); else if (Date.now() - pausedAt > 5000) { log('  -> resume'); await api('flight/resume', {}).catch(e => log('  resume failed:', e.message)); pausedAt = 0; } } else pausedAt = 0;
       if (f.phase === 'review' && !reviewed) {
         reviewed = true;
         for (const [ax, a] of Object.entries(f.checkup.axes)) { log(`  ${ax}: grade ${a.grade ? a.grade.letter : '?'} | ` + (a.issues || []).map(i => `[${i.level}] ${i.text}`).join(' | ')); if (a.proposal) log(`  ${ax} proposed: ` + a.proposal.changes.map(c => `${c.key} ${(+c.from).toPrecision(3)}->${(+c.to).toPrecision(3)} (${Math.round(c.pct)}%)`).join(', ')); }
