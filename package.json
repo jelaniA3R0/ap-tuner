@@ -3,7 +3,10 @@
   "version": "0.1.0",
   "description": "Live and log-based ArduPilot rate PID and notch filter tuning (Mission Planner MAVLink mirror)",
   "main": "src/server.js",
-  "scripts": { "start": "node src/server.js --open", "test": "node test/synthetic.test.js" },
+  "scripts": {
+    "start": "node src/server.js --open",
+    "test": "node test/synthetic.test.js && node test/watchdog.test.js && node test/live-safety.test.js && node test/web-escape.test.js && node test/server-security.test.js"
+  },
   "license": "MIT",
   "private": true
 }

@@ -1,9 +1,13 @@
 // AP Tuner server: HTTP + Server-Sent Events, no dependencies. Serves the web UI and drives the tuner.
+// Only this PC's own app page may drive it: the Host (and Origin, when sent) must be 127.0.0.1 / localhost on
+// this port, every state-changing request must be a POST carrying the per-run token that is written into the
+// page, and the page is served with a Content-Security-Policy (2026-10-17 audit F-05, F-90).
 'use strict';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { Link, listSerialPorts } = require('./mavlink/link');
 const { Tuner, AXES } = require('./engine/tuner');
 const { NotchLive } = require('./engine/notchlive');
@@ -18,8 +22,10 @@ const PORT = parseInt(process.env.PORT || '8090', 10);
 const APP_MODE = process.argv.includes('--app');
 const WEB = path.join(__dirname, '..', 'web');
 const SESSIONS = path.join(__dirname, '..', 'sessions');
+const TOKEN = crypto.randomBytes(24).toString('hex');   // per run; the app page gets it, other pages cannot read it
 const link = new Link();
 const tuner = new Tuner(link);
+tuner.startMonitor();
 const notch = new NotchLive(link, tuner);
 const flight = new FlightSession(link, tuner, notch);
 flight.on('phase', p => sse('flight', p));
@@ -69,7 +75,28 @@ if (APP_MODE) setInterval(() => {
   console.log('app window closed, exiting'); process.exit(0);
 }, 5000);
 
-function json(res, code, obj) { const b = JSON.stringify(obj); res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b); }
+function json(res, code, obj, headers = {}) { const b = JSON.stringify(obj); res.writeHead(code, Object.assign({ 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b), 'X-Content-Type-Options': 'nosniff' }, headers)); res.end(b); }
+
+// ---------- request gate (F-05) ----------
+const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
+const ALLOWED_ORIGINS = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
+// API routes that only read: GET, no token. Everything else under /api/ changes state: POST + token.
+const READ_ROUTES = new Set(['/api/events', '/api/ports', '/api/presets', '/api/notch/status', '/api/live/rows', '/api/live/param', '/api/log/list', '/api/log/param', '/api/ground/result', '/api/ground/state', '/api/ground/file']);
+const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+function sameToken(t) { const a = Buffer.from(String(t || '')), b = Buffer.from(TOKEN); return a.length === b.length && crypto.timingSafeEqual(a, b); }
+/** null when the request may go on, else [status, error, extra headers] */
+function gate(req, url) {
+  if (!ALLOWED_HOSTS.has(String(req.headers.host || '').toLowerCase())) return [403, 'forbidden: unknown Host'];
+  const origin = req.headers.origin;
+  if (origin !== undefined && !ALLOWED_ORIGINS.has(String(origin).toLowerCase())) return [403, 'forbidden: request from another site'];
+  if (req.headers['sec-fetch-site'] === 'cross-site') return [403, 'forbidden: request from another site'];
+  if (!url.pathname.startsWith('/api/')) return null;
+  const write = !READ_ROUTES.has(url.pathname) || (url.pathname === '/api/log/param' && url.searchParams.get('save') === '1');
+  if (!write) return req.method === 'GET' || req.method === 'HEAD' ? null : [405, 'use GET', { Allow: 'GET' }];
+  if (req.method !== 'POST') return [405, 'this request changes something: it must be a POST', { Allow: 'POST' }];
+  if (!sameToken(req.headers['x-aptuner-token'])) return [403, 'missing or wrong app token: reload the page (the app may have been restarted)'];
+  return null;
+}
 function readBody(req) { return new Promise(r => { let b = ''; req.on('data', c => b += c); req.on('end', () => { try { r(b ? JSON.parse(b) : {}); } catch (e) { r({}); } }); }); }
 function readRaw(req) { return new Promise(r => { const chunks = []; req.on('data', c => chunks.push(c)); req.on('end', () => r(Buffer.concat(chunks))); }); }
 
@@ -171,6 +198,8 @@ function liveRows() {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   try {
+    const refused = gate(req, url);
+    if (refused) { req.resume(); return json(res, refused[0], { error: refused[1] }, refused[2] || {}); }
     if (url.pathname === '/api/events') {
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       res.write('retry: 2000\n\n'); clients.add(res); everHadClient = true; req.on('close', () => { clients.delete(res); lastClientAt = Date.now(); });
@@ -190,8 +219,8 @@ const server = http.createServer(async (req, res) => {
         case '/api/disconnect': link.disconnect(); return json(res, 200, { ok: true });
         case '/api/ports': return json(res, 200, listSerialPorts());
         case '/api/prepare': { const r = await tuner.prepare({ confirm: !!body.confirm }); return json(res, 200, Object.assign({ ok: true }, r)); }
-        case '/api/start': Object.assign(tuner.opts, sanitizeOpts(body)); tuner.start(); return json(res, 200, { ok: true, opts: tuner.opts });
-        case '/api/options': Object.assign(tuner.opts, sanitizeOpts(body)); return json(res, 200, { ok: true, opts: tuner.opts });
+        case '/api/start': setOpts(body); tuner.start(); return json(res, 200, { ok: true, opts: tuner.opts });
+        case '/api/options': setOpts(body); return json(res, 200, { ok: true, opts: tuner.opts });
         case '/api/pause': tuner.pause('paused by user'); return json(res, 200, { ok: true });
         case '/api/resume': tuner.resume(); return json(res, 200, { ok: true });
         case '/api/stop': await tuner.stop(); return json(res, 200, { ok: true });
@@ -199,7 +228,7 @@ const server = http.createServer(async (req, res) => {
         case '/api/undo': await tuner.undoAxis(body.axis); return json(res, 200, { ok: true });
         case '/api/restore': await tuner.restoreOriginals(); return json(res, 200, { ok: true });
         case '/api/analyze': { const r = tuner.analyze(body.axis || tuner.currentAxis(), body.seconds || null); return json(res, 200, r); }
-        case '/api/setparam': { if (!body.name) return json(res, 400, { error: 'name' }); const v = await tuner.setParam(body.name, parseFloat(body.value), 'manual'); return json(res, 200, { ok: true, value: v }); }
+        // (no /api/setparam: arbitrary parameter writes are not offered, F-05)
         case '/api/presets': return json(res, 200, PRESETS);
         case '/api/notch/status': return json(res, 200, await notch.status());
         case '/api/notch/esc': return json(res, 200, { ok: true, applied: await notch.applyEsc() });
@@ -207,7 +236,7 @@ const server = http.createServer(async (req, res) => {
         case '/api/notch/reboot': return json(res, 200, Object.assign({ ok: true }, await notch.reboot()));
         case '/api/notch/fft/start': return json(res, 200, Object.assign({ ok: true }, await notch.startFftTune()));
         case '/api/notch/fft/stop': return json(res, 200, Object.assign({ ok: true }, await notch.stopFftTune()));
-        case '/api/flight/start': { Object.assign(tuner.opts, sanitizeOpts(body)); flight.start({ axes: tuner.opts.axes, preset: tuner.opts.preset, auto: !!body.auto, observeSeconds: tuner.opts.observeSeconds }); return json(res, 200, { ok: true, flight: flight.snapshot() }); }
+        case '/api/flight/start': { setOpts(body); flight.start({ axes: tuner.opts.axes, preset: tuner.opts.preset, auto: !!body.auto, observeSeconds: tuner.opts.observeSeconds }); return json(res, 200, { ok: true, flight: flight.snapshot() }); }
         case '/api/flight/continue': flight.continue(); return json(res, 200, { ok: true });
         case '/api/flight/repeat': flight.repeatCheckup(); return json(res, 200, { ok: true });
         case '/api/flight/skip': flight.skipFilters(); return json(res, 200, { ok: true });
@@ -262,8 +291,14 @@ const server = http.createServer(async (req, res) => {
     // static
     let p = url.pathname === '/' ? '/index.html' : url.pathname;
     const file = path.join(WEB, path.normalize(p).replace(/^([.][.][/\\])+/, ''));
-    if (!file.startsWith(WEB) || !fs.existsSync(file)) { res.writeHead(404); res.end('not found'); return; }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
+    if (!file.startsWith(WEB) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404); res.end('not found'); return; }
+    if (path.extname(file) === '.html') {
+      // the page carries this run's token (only a page served from here can read it) and a strict CSP
+      const html = fs.readFileSync(file, 'utf8').replace('__APTUNER_TOKEN__', TOKEN);
+      res.writeHead(200, { 'Content-Type': MIME['.html'], 'Cache-Control': 'no-store', 'Content-Security-Policy': CSP, 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+      return res.end(html);
+    }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache', 'X-Content-Type-Options': 'nosniff' });
     fs.createReadStream(file).pipe(res);
   } catch (e) {
     json(res, 500, { error: e.message });
@@ -282,6 +317,13 @@ function sanitizeOpts(b) {
   if (b.allowRamp !== undefined) o.allowRamp = !!b.allowRamp;
   if (b.stepMax) o.stepMax = Math.max(1.1, Math.min(2, +b.stepMax));
   if (b.watchSeconds) o.watchSeconds = Math.max(2, Math.min(15, +b.watchSeconds));
+  if (b.inFlightWrites !== undefined) o.inFlightWrites = b.inFlightWrites === true;
+  return o;
+}
+function setOpts(b) {
+  const o = sanitizeOpts(b);
+  if (o.inFlightWrites !== undefined && o.inFlightWrites !== !!tuner.opts.inFlightWrites) tuner.log('tuner', o.inFlightWrites ? 'changes in flight turned ON (experimental, tested only in the simulator)' : 'changes in flight turned off');
+  Object.assign(tuner.opts, o);
   return o;
 }
 

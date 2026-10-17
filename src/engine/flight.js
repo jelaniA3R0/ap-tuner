@@ -4,6 +4,9 @@
 //   with the watchdog until the gains converge) -> filters (notch via ESC RPM or the autopilot FFT)
 //   -> recheck (one more pass over all chosen axes with the filter active) -> overall (30 s final
 //   check: grades, vibration, hover throttle, notch) -> land (wait for disarm) -> finished (summary).
+//   Writing in flight (tuning, filters, recheck) needs the tuner's in-flight opt-in; without it the session
+//   measures (check-up, overall check) and the changes are written on the ground. A trip of the tuner's
+//   oscillation monitor or post-change watch pauses the session in any phase.
 'use strict';
 const EventEmitter = require('events');
 const { axisIssues, vehicleIssues } = require('./issues');
@@ -18,7 +21,7 @@ const PHASES = ['preflight', 'checkup', 'review', 'tuning', 'filters', 'recheck'
 const RUNNING = new Set(['preflight', 'checkup', 'review', 'tuning', 'filters', 'recheck', 'overall', 'land', 'paused']);
 
 class FlightSession extends EventEmitter {
-  constructor(link, tuner, notch) { super(); this.link = link; this.tuner = tuner; this.notch = notch; this.reset(); }
+  constructor(link, tuner, notch) { super(); this.link = link; this.tuner = tuner; this.notch = notch; this.reset(); tuner.on('trip', t => this._onTrip(t)); }
 
   reset() {
     this.phase = 'idle'; this.since = Date.now(); this.info = '';
@@ -38,13 +41,17 @@ class FlightSession extends EventEmitter {
   setPhase(p, info) { this.phase = p; this.since = Date.now(); this.info = info || ''; this.emit('phase', { phase: p, info: this.info }); this.tuner.log('flight', `${p}${info ? ': ' + info : ''}`); }
   note(level, text) { this.notes.push({ t: Date.now(), phase: this.phase, level, text }); this.tuner.log('flight', text); }
 
+  get inFlight() { return !!this.tuner.opts.inFlightWrites; }
+
   /** start a session: the vehicle must have been read (prepare) first */
   start(opts = {}) {
     if (!this.tuner.prepared) throw new Error('read the vehicle first');
     if (RUNNING.has(this.phase)) throw new Error('a flight session is already running');
+    if (opts.auto && !this.inFlight) throw new Error('"Apply by itself" writes in flight: turn on "Allow changes in flight" first (experimental, tested only in the simulator)');
     this.reset();
     Object.assign(this.opts, opts);
     this.tuner.opts.axes = this.opts.axes; this.tuner.opts.preset = this.opts.preset; this.tuner.opts.autoApply = true;
+    this.tuner.beginSession();
     this.gainsStart = JSON.parse(JSON.stringify(this.tuner.snapshot().gains));
     this.journalStart = this.tuner.journal.length;
     this.setPhase('preflight', 'arm, take off and hover at a safe height');
@@ -54,15 +61,35 @@ class FlightSession extends EventEmitter {
 
   /** the pilot's confirmation at a waiting point */
   continue() {
-    if (this.phase === 'review') { if (!this.checkup || !this.checkup.summary.anyProposal) throw new Error('nothing to apply yet: repeat the check-up with sharper stick taps'); this._startTuning(); return; }
+    if (this.phase === 'review') {
+      if (!this.checkup || !this.checkup.summary.anyProposal) throw new Error('nothing to apply yet: repeat the check-up with sharper stick taps');
+      if (!this.inFlight) {
+        // nothing may be written in flight: the check-up is the result (apply it on the ground), or the final check
+        if (this.checkup.summary.changes) { this.note('warn', 'changes in flight are off, so nothing was written: land, then apply the proposals on the ground (Advanced view) or use the Telemetry + USB tab'); this._finish('check-up only: changes in flight are off'); return; }
+        this.filters = { done: true, result: 'off' }; this.note('warn', 'changes in flight are off: the filter step is skipped');
+        this._startOverall(); return;
+      }
+      this._startTuning(); return;
+    }
     if (this.phase === 'land' || this.phase === 'paused') { this._finish(this.phase === 'land' ? 'finished before landing' : 'finished early'); return; }
     throw new Error('nothing to continue in phase ' + this.phase);
+  }
+
+  /** the tuner's monitor or a post-change watch tripped: the session pauses (in the landing phase it is only noted) */
+  _onTrip(t) {
+    if (!RUNNING.has(this.phase)) return;
+    const text = (t.reasons || []).join('; ');
+    if (this.phase === 'land') { this.note('bad', 'oscillation while landing: ' + text); return; }
+    this.note('bad', 'oscillation: ' + text);
+    this._tripPause = true;
+    this._pause('oscillation: ' + text);
   }
   repeatCheckup() { if (this.phase !== 'review' && this.phase !== 'paused') throw new Error('not at the check-up'); for (const ax of this.opts.axes) this.tuner.axes[ax].setBaseline(); this.setPhase('checkup', 'measuring again: short sharp stick taps on roll and pitch'); if (!this._timer) this._tick(); }
   skipFilters() { if (this.phase !== 'filters') throw new Error('not at the filter step'); this.filters = Object.assign(this.filters || {}, { done: true, result: 'skipped' }); this.note('warn', 'filter step skipped'); }
   resume() {
     if (this.phase !== 'paused') { if (this.tuner.state === 'paused') this.tuner.resume(); return; }
-    const p = this.resumePhase || 'checkup'; this.pausedInfo = null;
+    if (this.tuner.writing) throw new Error(`the app is still reverting (${this.tuner.writing}): wait until it has finished`);
+    const p = this.resumePhase || 'checkup'; this.pausedInfo = null; this._tripPause = false;
     if (p === 'tuning' || p === 'recheck') { this.setPhase(p, 'continuing'); this.tuner.resume(); }
     else if (p === 'checkup' || p === 'overall') { for (const ax of this.opts.axes) this.tuner.axes[ax].setBaseline(); this.setPhase(p, 'continuing: keep tapping the sticks'); }
     else this.setPhase(p, 'continuing');
@@ -88,6 +115,7 @@ class FlightSession extends EventEmitter {
             this.info = `switching to the ${want === 'vtol' ? 'hover (VTOL)' : 'fixed-wing'} controller`; this._tFlying = 0;
             await this.tuner.switchFamily(want);
             this.tuner.opts.axes = this.opts.axes; this.tuner.opts.preset = this.opts.preset; this.tuner.opts.autoApply = true;
+            this.tuner.beginSession();   // the values to go back to are those of the controller now flown
             this.gainsStart = JSON.parse(JSON.stringify(this.tuner.snapshot().gains));
             this.note('ok', `QuadPlane in ${v.modeName}: tuning the ${want === 'vtol' ? 'hover (Q_A_*)' : 'fixed-wing'} gains`);
             return;
@@ -130,11 +158,17 @@ class FlightSession extends EventEmitter {
         this.pausedInfo = null; this.info = this.tuner.stateInfo; return;
       }
       case 'filters': {
-        // after the filter step the gains are always checked again (all chosen axes), filter changed or not
-        if (this.filters && this.filters.done) this._startRecheck();
+        // after the filter step the gains are always checked again (all chosen axes), filter changed or not;
+        // without in-flight changes there is nothing to re-tune: straight to the final check
+        if (this.filters && this.filters.done) { if (!this.inFlight) this._startOverall(); else this._startRecheck(); }
         return;
       }
       case 'land': { if (!armed) this._finish('landed'); return; }
+      case 'paused': {
+        // after a trip the tuner's message says what was reverted and what to do next
+        if (this._tripPause && this.tuner.state === 'paused') { this.pausedInfo = this.tuner.stateInfo; this.info = this.tuner.stateInfo; }
+        return;
+      }
       default: return;
     }
   }
@@ -150,18 +184,23 @@ class FlightSession extends EventEmitter {
       const st = await this.notch.status();
       this.filters.status = { notchActive: st.notchActive, mode: st.mode, esc: st.escTelemetry, fft: st.fftCapable, fftEnabled: st.fftEnabled, freq: st.current.INS_HNTCH_FREQ };
       if (st.notchActive) { this.filters.result = 'kept'; this.note('ok', `notch filter already configured (mode ${st.mode}, ${st.current.INS_HNTCH_FREQ} Hz): kept`); }
-      else if (st.escProposal) { const a = await this.notch.applyEsc(); this.filters.result = 'esc'; this.filters.applied = a; this.note('ok', 'notch filter set to track the ESC RPM: ' + Object.entries(a).map(([k, v]) => k.replace('INS_HNTCH_', '') + ' ' + v).join(', ')); }
-      else if (st.fftCapable && st.fftEnabled && this.link.vehicle && this.link.vehicle.armed) {
+      else if (!this.inFlight) { this.filters.result = 'off'; this.note('warn', 'changes in flight are off: the notch filter was not changed (set it on the ground, from a log)'); }
+      else if (st.escProposal) {
+        this.info = 'setting the notch to the ESC RPM; every axis is watched for oscillation for a few seconds';
+        const a = await this.notch.applyEsc(); this.filters.result = 'esc'; this.filters.applied = a; this.note('ok', 'notch filter set to track the ESC RPM: ' + Object.entries(a).map(([k, v]) => k.replace('INS_HNTCH_', '') + ' ' + v).join(', '));
+      } else if (st.fftCapable && st.fftEnabled && this.link.vehicle && this.link.vehicle.armed) {
         this.info = 'measuring the motor noise with the autopilot FFT: hold a steady hover for 30 s, sticks centred';
-        await this.notch.startFftTune(); await new Promise(r => setTimeout(r, 30000));
+        await this.notch.startFftTune();
+        // 30 s of measuring; a pause, stop or trip ends it early (the tune is stopped either way)
+        for (let i = 0; i < 120 && this.phase === 'filters' && this.tuner.state !== 'paused'; i++) await new Promise(r => setTimeout(r, 250));
         const r = await this.notch.stopFftTune();
-        this.filters.result = r.ok ? 'fft' : 'none'; this.filters.applied = r.changed;
-        this.note(r.ok ? 'ok' : 'warn', r.ok ? 'the autopilot measured its motor noise and wrote the notch filter' : 'the FFT measurement wrote nothing (it needs a steadier hover): set the notch from a log after landing');
+        this.filters.result = r.ok ? 'fft' : r.held === false ? 'reverted' : 'none'; this.filters.applied = r.changed;
+        this.note(r.ok ? 'ok' : 'warn', r.ok ? 'the autopilot measured its motor noise and wrote the notch filter' : r.held === false ? 'the notch the autopilot wrote made the vehicle oscillate and was reverted' : 'the FFT measurement wrote nothing (it needs a steadier hover): set the notch from a log after landing');
       } else {
         this.filters.result = 'none';
         this.note('warn', st.fftCapable ? 'no ESC RPM telemetry, and the autopilot FFT is off (enable it and reboot on the ground): set the notch from a log after landing' : 'no in-flight route for the notch on this autopilot (no ESC RPM, no FFT): set it from a log after landing');
       }
-    } catch (e) { this.filters.result = 'none'; this.note('warn', 'filter step failed: ' + e.message); }
+    } catch (e) { this.filters.result = e.code === 'reverted' ? 'reverted' : 'none'; this.note(e.code === 'reverted' ? 'bad' : 'warn', (e.code === 'reverted' ? '' : 'filter step failed: ') + e.message); }
     this.filters.done = true;
   }
   _startRecheck() { this.tuner.opts.useFreshResult = false; this.tuner.start(); this.setPhase('recheck', 'checking the gains again with the filter active'); }
@@ -208,7 +247,7 @@ class FlightSession extends EventEmitter {
     const v = this.link.vehicle;
     const slim = (r) => r ? { issues: r.issues || [], grade: r.diagnostics && r.diagnostics.grade ? r.diagnostics.grade : null, diagnostics: r.diagnostics ? { trackingPct: r.diagnostics.trackingPct, rmsErrorDegs: r.diagnostics.rmsErrorDegs, oscRmsDegs: r.diagnostics.oscRmsDegs, saturationPct: r.diagnostics.saturationPct, oscillating: r.diagnostics.oscillating } : null, proposal: r.proposal ? { changes: r.proposal.changes, margins: r.proposal.margins, overshootPct: r.proposal.overshootPct, predicted: r.proposal.predicted ? { current: r.proposal.predicted.currentMetrics, proposed: r.proposal.predicted.proposedMetrics } : null } : null, measuredStep: r.measuredStep ? r.measuredStep.metrics : null, error: r.error || null, current: r.current || null, warnings: r.warnings || [] } : null;
     const block = (b) => b ? { summary: b.summary, axes: Object.fromEntries(Object.entries(b.results).map(([a, r]) => [a, slim(r)])), gains: b.gains, vehicleIssues: b.vehicleIssues || [], verdict: b.verdict || null, vibe: b.vibe || null, hover: b.hover ?? null, notch: b.notch, t: b.t } : null;
-    return { phase: this.phase, phases: PHASES, since: this.since, info: this.info, opts: this.opts, mode: v ? v.modeName : null, armed: !!(v && v.armed), modeOk: this.modeOk(), goodModes: this.goodModesText(),
+    return { phase: this.phase, phases: PHASES, since: this.since, info: this.info, opts: this.opts, mode: v ? v.modeName : null, armed: !!(v && v.armed), modeOk: this.modeOk(), goodModes: this.goodModesText(), inFlight: this.inFlight,
       pausedInfo: this.pausedInfo, resumePhase: this.resumePhase, checkup: block(this.checkup), filters: this.filters, overall: block(this.overall), summary: this.summary, notes: this.notes.slice(-30),
       tunerState: this.tuner.state, tunerInfo: this.tuner.stateInfo, tunerRound: this.tuner.round, tunerAxis: this.tuner.currentAxis(), writes: this.tuner.journal.length - this.journalStart };
   }

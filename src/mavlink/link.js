@@ -82,6 +82,17 @@ class Link extends EventEmitter {
     this.transport = null; this.connected = false; this.opts = null;
   }
 
+  /** a connection on a given transport object {send(buf), close()} (tests: a fake vehicle); bytes come in via feed() */
+  attachTransport(transport, description = 'test transport') {
+    this.disconnect();
+    this.opts = { kind: 'test' }; this.generation++; this.serialOpened = false;
+    this.parser = new Parser();
+    this.lastHeartbeatAt = 0; this.heartbeat = null; this.vehicle = null;
+    this.description = description; this.transport = transport; this.connected = true;
+    this._start();
+  }
+  feed(data) { this._rx(data); }
+
   _start() {
     if (this._hbTimer) clearInterval(this._hbTimer);
     this._hbTimer = setInterval(() => this.send('HEARTBEAT', { type: 6, autopilot: 8, base_mode: 0, custom_mode: 0, system_status: 4, mavlink_version: 3 }), 1000);
@@ -154,12 +165,21 @@ class Link extends EventEmitter {
     return out;
   }
 
-  /** set a parameter and wait for the echo; resolves the value the vehicle reports */
-  setParam(name, value, timeoutMs = 1500, retries = 3) {
+  /**
+   * set a parameter and wait for the echo; resolves the value the vehicle reports.
+   * keepGoing (optional): checked before every PARAM_SET, retries included; when it returns false nothing more is
+   * sent and the promise rejects with code 'cancelled' (an earlier attempt may still have reached the vehicle)
+   */
+  setParam(name, value, timeoutMs = 1500, retries = 3, keepGoing = null) {
     const known = this.params.get(name);
     const type = known ? known.type : 9;
     return new Promise((resolve, reject) => {
       const attempt = (n) => {
+        if (keepGoing && !keepGoing()) {
+          const ws = this.pendingParams.get(name);
+          if (ws && !ws.length) this.pendingParams.delete(name);
+          reject(Object.assign(new Error(`${name} not written: cancelled`), { code: 'cancelled', attempts: n })); return;
+        }
         const timer = setTimeout(() => {
           const ws = this.pendingParams.get(name) || [];
           this.pendingParams.set(name, ws.filter(w => w.timer !== timer));

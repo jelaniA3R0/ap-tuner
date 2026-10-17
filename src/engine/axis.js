@@ -68,7 +68,8 @@ class LiveAxis {
   watchdog(seconds = 2, { oscSmax = 5, bandRmsDegs = 8, dmodMin = 0.9, since = null } = {}) {
     let i0 = this.t.length - 1; const cut = since !== null ? Math.max(this.lastTs - seconds, since) : this.lastTs - seconds;
     let srMax = 0, dmMin = 1, n = 0;
-    while (i0 >= 0 && this.t[i0] >= cut) { if (this.srate[i0] > srMax) srMax = this.srate[i0]; if (this.dmod[i0] < dmMin) dmMin = this.dmod[i0]; n++; i0--; }
+    // Dmod <= 0 means the PID_TUNING extension fields are missing (they decode as 0): no slew-limiter information
+    while (i0 >= 0 && this.t[i0] >= cut) { if (this.srate[i0] > srMax) srMax = this.srate[i0]; if (this.dmod[i0] > 0 && this.dmod[i0] < dmMin) dmMin = this.dmod[i0]; n++; i0--; }
     const reasons = [];
     if (srMax > oscSmax) reasons.push(`slew rate ${srMax.toFixed(1)} > ${oscSmax}`);
     if (dmMin < dmodMin) reasons.push(`Dmod ${dmMin.toFixed(2)} (slew limiter cutting gains)`);
@@ -88,6 +89,28 @@ class LiveAxis {
     return { oscillating: reasons.length > 0, reasons, srateMax: srMax, dmodMin: dmMin, bandRms: band, peakHz, samples: n };
   }
   setBaseline() { const w = this.watchdog(5, { oscSmax: 1e9, bandRmsDegs: 1e9, dmodMin: -1 }); this.baselineOsc = w.bandRms || 0.5; }
+
+  /**
+   * Slew-rate / Dmod evidence over the last `seconds` before `now` (default: the last sample), only samples at or
+   * after `since` when given: what the oscillation monitor and the post-change watch act on. A sample is "bad" when
+   * SRate > oscSmax or 0 < Dmod < dmodMin; samples with Dmod <= 0 carry no slew-limiter data (noSlew) and are only
+   * bad through SRate. Returns {n, bad, frac, srateMax, dmodMin, noSlew, first, last, badFirst, badLast} (times in s).
+   */
+  slewStats(seconds, { oscSmax = 5, dmodMin = 0.9, since = null, now = null } = {}) {
+    let cut = (now !== null ? now : this.lastTs) - seconds;
+    if (since !== null && since > cut) cut = since;
+    let n = 0, bad = 0, noSlew = 0, srMax = 0, dmMin = 1, first = null, last = null, badFirst = null, badLast = null;
+    for (let i = this.t.length - 1; i >= 0 && this.t[i] >= cut; i--) {
+      const t = this.t[i], sr = this.srate[i], dm = this.dmod[i];
+      if (now !== null && t > now) continue;
+      n++; if (last === null) last = t; first = t;
+      if (!(dm > 0)) noSlew++;
+      if (sr > srMax) srMax = sr;
+      if (dm > 0 && dm < dmMin) dmMin = dm;
+      if (sr > oscSmax || (dm > 0 && dm < dmodMin)) { bad++; if (badLast === null) badLast = t; badFirst = t; }
+    }
+    return { n, bad, frac: n ? bad / n : 0, srateMax: srMax, dmodMin: dmMin, noSlew, first, last, badFirst, badLast };
+  }
 }
 
 module.exports = { LiveAxis };

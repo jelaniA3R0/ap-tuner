@@ -20,7 +20,7 @@ const gUsb = (useSaved) => guard(async () => { await api('ground/usb', { useSave
 const gWrite = guard(async () => {
   const g = snap.ground; const names = $$('.grow:checked').map(x => x.value);
   if (!names.length) { toast('Tick at least one change', 'bad'); return; }
-  const rows = g.rows.filter(r => names.includes(r.name)).map(r => `<tr class="changed"><td>${r.name}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`).join('');
+  const rows = g.rows.filter(r => names.includes(r.name)).map(r => `<tr class="changed"><td>${esc(r.name)}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`).join('');
   const ok = await modal('Write these values to the autopilot?', `<p class="muted">The vehicle must stay disarmed. The current values are saved to an UNDO file first, and every value is read back after writing.</p><table class="gains"><tr><th>parameter</th><th>now</th><th>new</th></tr>${rows}</table>`, { yes: 'Write to the autopilot' });
   if (!ok) return;
   const r = await api('ground/write', { names });
@@ -52,18 +52,18 @@ function gButtons(g) {
 function gAxisCard(ax, a) {
   if (!a) return '';
   const p = a.proposal; const gr = a.grade || {};
-  const rows = p ? p.changes.map(c => `<tr class="changed"><td>${c.key}</td><td>${f3(c.from)}</td><td>${f3(c.to)}</td><td class="${(c.pct || 0) < 0 ? 'down' : 'up'}">${fmtPct(c.pct)}</td></tr>`).join('') : '';
+  const rows = p ? p.changes.map(c => `<tr class="changed"><td>${esc(c.key)}</td><td>${f3(c.from)}</td><td>${f3(c.to)}</td><td class="${(c.pct || 0) < 0 ? 'down' : 'up'}">${fmtPct(c.pct)}</td></tr>`).join('') : '';
   const bars = p && p.margins ? `<div class="bars">${marginBar('gain margin', p.margins.gmDb, ' dB', 4, 6)}${marginBar('phase margin', p.margins.pmDeg, '°', 25, 35)}${marginBar('overshoot', p.overshootPct, '%', 12, 20, true)}</div>` : '';
-  const di = a.dataInfo ? `<div class="muted small">${a.dataInfo.seconds.toFixed(0)} s of log data at ${Math.round(a.dataInfo.rawRateHz)} Hz</div>` : '';
-  return `<div class="card axis"><div class="head"><div class="grade ${gr.letter || ''}">${gr.letter || '?'}</div><div style="flex:1"><h3>${ax}</h3>${di}</div><span class="pill ${p ? 'ok' : 'warn'}">${p ? (p.changes.length ? p.changes.length + ' change(s)' : 'no change needed') : 'no proposal'}</span></div>
-    ${issueList(a.issues || [])}${a.error ? `<div class="bad small">${a.error}</div>` : ''}${(a.warnings || []).map(w => `<div class="warn small">⚠ ${w}</div>`).join('')}
+  const di = a.dataInfo ? `<div class="muted small">${num(a.dataInfo.seconds, 0)} s of log data at ${num(a.dataInfo.rawRateHz, 0)} Hz</div>` : '';
+  return `<div class="card axis"><div class="head"><div class="grade ${/^[A-F]$/.test(gr.letter || '') ? gr.letter : ''}">${/^[A-F]$/.test(gr.letter || '') ? gr.letter : '?'}</div><div style="flex:1"><h3>${esc(ax)}</h3>${di}</div><span class="pill ${p ? 'ok' : 'warn'}">${p ? (p.changes.length ? p.changes.length + ' change(s)' : 'no change needed') : 'no proposal'}</span></div>
+    ${issueList(a.issues || [])}${a.error ? `<div class="bad small">${esc(a.error)}</div>` : ''}${(a.warnings || []).map(w => `<div class="warn small">⚠ ${esc(w)}</div>`).join('')}
     ${rows ? `<table class="gains"><tr><th>gain</th><th>in the log</th><th>new</th><th>change</th></tr>${rows}</table>${bars}` : ''}</div>`;
 }
 function gRowsTable(g) {
   let group = null; let html = '<table class="gains"><tr><th></th><th>parameter</th><th>on the autopilot now</th><th>new</th></tr>';
   for (const r of g.rows) {
-    if (r.group !== group) { group = r.group; html += `<tr><td colspan="4" class="muted small" style="padding-top:8px">${group}</td></tr>`; }
-    html += `<tr class="changed"><td><input type="checkbox" class="grow" value="${r.name}" checked></td><td>${r.name}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`;
+    if (r.group !== group) { group = r.group; html += `<tr><td colspan="4" class="muted small" style="padding-top:8px">${esc(group)}</td></tr>`; }
+    html += `<tr class="changed"><td><input type="checkbox" class="grow" value="${esc(r.name)}" checked></td><td>${esc(r.name)}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`;
   }
   return html + '</table>';
 }
@@ -83,22 +83,22 @@ function gBody(g) {
       <div class="card"><b>6 · Review and write</b><span>You tick the changes and press Write. The old values are saved to an UNDO file first; each value is read back.</span></div></div>`; break;
     case 'flight': case 'capture': case 'captured': el.innerHTML = `<div class="card"><h3>${g.phase === 'capture' ? 'Keep tapping the sticks' : g.phase === 'captured' ? 'Captured' : 'Before the capture'}</h3><ul class="vt">
       <li>${ICON.ok}<div>Calm air, safe height, hand on the mode switch. Nothing is written in the air.</div></li>
-      <li>${ICON.ok}<div>During the 30 s: short, sharp taps on ${g.opts.axes.join(', ')}, hovering steady in between.</div></li>
-      ${g.mark ? `<li>${ICON.ok}<div>Marked: ${(g.mark.tEnd - g.mark.tStart).toFixed(0)} s in ${g.mark.mode}. Land and disarm when you are ready.</div></li>` : ''}</ul></div>`; break;
+      <li>${ICON.ok}<div>During the 30 s: short, sharp taps on ${esc(g.opts.axes.join(', '))}, hovering steady in between.</div></li>
+      ${g.mark ? `<li>${ICON.ok}<div>Marked: ${num(g.mark.tEnd - g.mark.tStart, 0)} s in ${esc(g.mark.mode)}. Land and disarm when you are ready.</div></li>` : ''}</ul></div>`; break;
     case 'usb': case 'download': {
       const p = g.progress; const pct = p && p.total ? Math.round(100 * p.done / p.total) : 0;
-      el.innerHTML = `<div class="card"><h3>${g.phase === 'usb' ? 'Plug the USB cable into the autopilot' : 'Reading the log over USB'}</h3><p class="muted">${g.info}</p>${g.phase === 'download' && p ? `<div class="progress" style="margin-top:8px"><i style="width:${pct}%"></i></div>` : ''}
-        <ul class="notes">${g.notes.map(n => `<li>${n.text}</li>`).join('')}</ul></div>`; break;
+      el.innerHTML = `<div class="card"><h3>${g.phase === 'usb' ? 'Plug the USB cable into the autopilot' : 'Reading the log over USB'}</h3><p class="muted">${esc(g.info)}</p>${g.phase === 'download' && p ? `<div class="progress" style="margin-top:8px"><i style="width:${pct}%"></i></div>` : ''}
+        <ul class="notes">${g.notes.map(n => `<li>${esc(n.text)}</li>`).join('')}</ul></div>`; break;
     }
     case 'review': case 'writing': case 'done': {
       const r = g.result; if (!r) { el.innerHTML = ''; break; }
-      let html = `<div class="banner ok"><div class="ico">📄</div><div style="flex:1"><b>${r.family === 'vtol' ? 'QuadPlane hover (Q_A_*)' : r.family} · ${r.firmware || ''}</b><span>${g.notes.map(n => n.text).join(' · ')}</span></div><div class="row">${fileLinks(g)}</div></div>`;
+      let html = `<div class="banner ok"><div class="ico">📄</div><div style="flex:1"><b>${r.family === 'vtol' ? 'QuadPlane hover (Q_A_*)' : esc(r.family)} · ${esc(r.firmware || '')}</b><span>${g.notes.map(n => esc(n.text)).join(' · ')}</span></div><div class="row">${fileLinks(g)}</div></div>`;
       html += `<div class="cards cols-auto" style="margin-top:12px">${(r.chosenAxes || []).map(ax => gAxisCard(ax, r.axes[ax])).join('')}</div>`;
       if (g.phase === 'review') html += g.rows.length ? `<div class="card" style="margin-top:12px"><h3>Changes to write</h3><p class="muted small">Untick anything you do not want. These are one round of changes: fly again afterwards and repeat until the app says no change is needed.</p>${gRowsTable(g)}</div>` : `<div class="banner warn" style="margin-top:12px"><div class="ico">⚠</div><div><b>Nothing to write</b><span>Either the gains are already right, or there was too little stick input in the 30 s. See the cards above.</span></div></div>`;
-      if (g.phase === 'done') html += `<div class="card" style="margin-top:12px"><h3>Written</h3><table class="gains"><tr><th>parameter</th><th>was</th><th>now</th><th></th></tr>${g.writes.map(w => `<tr class="${w.ok ? 'changed' : ''}"><td>${w.name}</td><td>${f3(w.from)}</td><td>${f3(w.to)}</td><td>${w.ok ? (w.same ? 'already set' : (w.undone ? 'undone' : '✓ read back')) : '<span class="bad">' + (w.error || 'failed') + '</span>'}</td></tr>`).join('')}</table><p class="muted small">Unplug the USB and fly again to check (run another capture). The UNDO file loads in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params.</p></div>`;
+      if (g.phase === 'done') html += `<div class="card" style="margin-top:12px"><h3>Written</h3><table class="gains"><tr><th>parameter</th><th>was</th><th>now</th><th></th></tr>${g.writes.map(w => `<tr class="${w.ok ? 'changed' : ''}"><td>${esc(w.name)}</td><td>${f3(w.from)}</td><td>${f3(w.to)}</td><td>${w.ok ? (w.same ? 'already set' : (w.undone ? 'undone' : (w.undoError ? '<span class="bad">undo failed</span>' : '✓ read back'))) : '<span class="bad">' + esc(w.error || 'failed') + '</span>'}</td></tr>`).join('')}</table><p class="muted small">Unplug the USB and fly again to check (run another capture). The UNDO file loads in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params.</p></div>`;
       el.innerHTML = html; break;
     }
-    case 'error': el.innerHTML = `<div class="banner bad"><div class="ico">✖</div><div><b>${g.error || 'error'}</b><span>${g.notes.map(n => n.text).join(' · ')}</span></div></div>`; break;
+    case 'error': el.innerHTML = `<div class="banner bad"><div class="ico">✖</div><div><b>${esc(g.error || 'error')}</b><span>${g.notes.map(n => esc(n.text)).join(' · ')}</span></div></div>`; break;
     default: el.innerHTML = '';
   }
 }
@@ -111,7 +111,7 @@ function renderGround(s) {
   $('#gtitle').textContent = G_TITLE[g.phase] || g.phase;
   $('#ginfo').textContent = g.phase === 'idle' ? 'For a vehicle on a telemetry radio: the radio only marks the 30 s you fly; the gains come from the autopilot\'s full-rate log over USB after landing.' : g.info;
   const chips = [];
-  if (s.alive) { chips.push(`<span class="chip good"><span class="dot"></span>${g.linkDesc || ''}</span>`); chips.push(`<span class="chip ${g.modeOk ? 'good' : ''}"><span class="dot"></span>${g.mode || '?'}${g.modeOk ? ' ✓' : ''}</span>`); chips.push(`<span class="chip ${g.armed ? 'good' : ''}"><span class="dot"></span>${g.armed ? 'armed' : 'disarmed'}</span>`); }
+  if (s.alive) { chips.push(`<span class="chip good"><span class="dot"></span>${esc(g.linkDesc || '')}</span>`); chips.push(`<span class="chip ${g.modeOk ? 'good' : ''}"><span class="dot"></span>${esc(g.mode || '?')}${g.modeOk ? ' ✓' : ''}</span>`); chips.push(`<span class="chip ${g.armed ? 'good' : ''}"><span class="dot"></span>${g.armed ? 'armed' : 'disarmed'}</span>`); }
   else chips.push('<span class="chip"><span class="dot"></span>no link</span>');
   if (g.mark) chips.push(`<span class="chip good"><span class="dot"></span>30 s marked</span>`);
   $('#gchips').innerHTML = chips.join('');

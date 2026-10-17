@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="aptuner-token" content="__APTUNER_TOKEN__">
 <title>AP Tuner</title>
 <link rel="icon" href="icon.png">
 <link rel="stylesheet" href="vendor/uPlot.min.css">
@@ -49,9 +50,10 @@
       <div id="fsetup" class="cards cols-3" style="margin-top:12px">
         <div class="card"><h4>Feel</h4><div class="seg" id="fpresetSeg" style="margin-top:6px"><button data-preset="conservative">Smooth</button><button data-preset="normal" class="active">Normal</button><button data-preset="aggressive">Sporty</button></div><p class="explain" id="fpresetExplain">Normal: the margins ArduPilot's own tuners aim for.</p></div>
         <div class="card"><h4>Axes and size</h4><div class="row" style="margin-top:6px"><label class="check"><input type="checkbox" class="fax" value="roll" checked>roll</label><label class="check"><input type="checkbox" class="fax" value="pitch" checked>pitch</label><label class="check"><input type="checkbox" class="fax" value="yaw">yaw</label></div><div class="seg" id="fsizeSeg" style="margin-top:8px"><button data-size="small">Small</button><button data-size="medium" class="active">Medium</button><button data-size="large">Large</button><button data-size="heavy">Heavy</button></div><p class="explain">Size sets how sensitive the oscillation detector is.</p></div>
-        <div class="card"><h4>After the check-up</h4><label class="switch" id="fswAsk" style="margin-top:6px"><input type="radio" name="fmode" value="ask" checked><div><b>Show me first</b><span>You see the issues and the proposed changes, then press Apply in flight.</span></div></label><label class="switch" id="fswAuto" style="margin-top:8px"><input type="radio" name="fmode" value="auto"><div><b>Apply by itself</b><span>The changes go to the vehicle right after the check-up, in small watched steps.</span></div></label></div>
+        <div class="card"><h4>After the check-up</h4><label class="switch" id="fswAsk" style="margin-top:6px"><input type="radio" name="fmode" value="ask" checked><div><b>Show me first</b><span>You see the issues and the proposed changes, then decide.</span></div></label><label class="switch" id="fswAuto" style="margin-top:8px"><input type="radio" name="fmode" value="auto"><div><b>Apply by itself</b><span>Only with changes in flight allowed: the changes go to the vehicle right after the check-up, in small watched steps.</span></div></label></div>
       </div>
-      <div class="banner" style="margin-top:12px"><div class="ico">📡</div><div><b>Flying on a telemetry radio?</b><span>A radio is too slow for tuning in the air. Use the <a href="#" onclick="document.querySelector('nav.views button[data-view=ground]').click();return false">Telemetry + USB</a> tab: fly 30 s, land, plug in USB, and the app writes the gains on the ground.</span></div></div>
+      <div class="card inflight" style="margin-top:12px"><label class="check"><input type="checkbox" class="inflight-toggle"><b>Allow changes in flight</b></label><span class="pill warn">experimental · tested only in the simulator</span><p class="explain">Off (the default): while the vehicle is armed the app only measures; you write the changes on the ground (Telemetry + USB tab, or the parameter file). On: the app writes gains and the notch filter to the flying vehicle, watches every change and tries to undo it if the vehicle starts to oscillate. This has never been tried on a real aircraft.</p></div>
+      <div class="banner" style="margin-top:12px"><div class="ico">📡</div><div><b>Flying on a telemetry radio?</b><span>A radio is too slow for tuning in the air. Use the <a href="#" data-goview="ground">Telemetry + USB</a> tab: fly 30 s, land, plug in USB, and the app writes the gains on the ground.</span></div></div>
       <div id="fbody" style="margin-top:12px"></div>
       <div class="chart" id="chFlight" style="margin-top:12px"><h4>Rate demanded (dashed) vs actual, deg/s</h4></div>
     </div>
@@ -143,15 +145,18 @@
         <div class="card">
           <h4>How to apply</h4>
           <label class="switch" id="swAdvise" style="margin-top:6px"><input type="radio" name="mode" value="advise" checked><div><b>Advise me</b><span>The app proposes; nothing is written until you press Apply on an axis.</span></div></label>
-          <label class="switch" id="swAuto" style="margin-top:8px"><input type="radio" name="mode" value="auto"><div><b>Auto-apply</b><span>Writes each proposal in small steps while watching for oscillation, reverts by itself, and continues to the next axis.</span></div></label>
+          <label class="switch" id="swAuto" style="margin-top:8px"><input type="radio" name="mode" value="auto"><div><b>Auto-apply</b><span>Writes each proposal in small watched steps and continues to the next axis. While the vehicle is armed only with changes in flight allowed.</span></div></label>
+          <label class="check" style="margin-top:10px"><input type="checkbox" class="inflight-toggle"><b>Allow changes in flight</b></label><span class="pill warn">experimental · tested only in the simulator</span>
+          <p class="explain">Off (the default): nothing is written while the vehicle is armed.</p>
         </div>
         <div class="card">
           <h4>Session</h4>
           <div class="row" style="margin-top:6px"><button id="btnStart" class="btn good lg">Start</button><button id="btnPause" class="btn">Pause</button><button id="btnResume" class="btn">Resume</button><button id="btnStop" class="btn ghost">Stop</button></div>
           <div class="row" style="margin-top:10px"><button id="btnRestore" class="btn danger">Restore original gains</button></div>
-          <p class="explain">Changes are capped at 2× per round, written in steps of at most 1.5× and watched 4 s each. Any oscillation reverts to the last good gains.</p>
+          <p class="explain">Changes are capped at 2× per round and written in steps of at most 1.5×. In flight every change is watched (4 s, the notch 10 s) on every axis it affects; if the vehicle starts to oscillate the app pauses and tries to undo the change. That is a safety net, not a guarantee.</p>
         </div>
       </div>
+      <div class="muted small" id="monitorLine" style="margin:4px 0 10px">Oscillation monitor: not running</div>
       <div class="banner" id="tuneBanner"><div class="ico">🛈</div><div><b id="tuneState">Not started</b><span id="tuneInfo">Press Start, then fly in Stabilize / AltHold (plane: FBWA) and give short, sharp stick taps every few seconds.</span><div class="progress" style="margin-top:8px;width:320px"><i id="tuneProg"></i></div></div></div>
       <div class="cards cols-2">
         <div class="chart" id="chAtt"><h4>Rate demanded vs actual (deg/s)</h4></div>
@@ -252,7 +257,7 @@
     <ol>
       <li><b>Connect and read.</b> Press <b>Start flight check</b>. The app connects, reads the vehicle and runs the setup check. Take off and hover in Stabilize, AltHold or PosHold (QuadPlane: QStabilize / QHover / QLoiter; plane: FBWA).</li>
       <li><b>Check-up (30 s, nothing written).</b> Tap the sticks. You get the issues per axis in plain words (sluggish, bouncy, oscillating, noisy D, motors at the limit…) and the exact parameter changes proposed, with the margins and the predicted response.</li>
-      <li><b>Tune in flight.</b> Press <b>Apply in flight</b> (or choose "Apply by itself" before starting). The gains go to the flying vehicle in steps of at most 1.5×, each watched 4 s for oscillation and reverted by itself if it trips. The app re-measures and repeats until the gains settle (at most 4 rounds per axis).</li>
+      <li><b>Tune in flight</b> (only with <b>Allow changes in flight</b> on: experimental, tested only in the simulator). Press <b>Apply in flight</b> (or choose "Apply by itself" before starting). The gains go to the flying vehicle in steps of at most 1.5×, each watched for oscillation; if the vehicle starts to oscillate the app pauses and tries to undo the change. The app re-measures and repeats until the gains settle (at most 4 rounds per axis). With changes in flight off, land after the check-up and write the changes on the ground.</li>
       <li><b>Filters.</b> The harmonic notch is set through the vehicle: ESC RPM tracking if the ESCs report RPM, otherwise the autopilot's own 30 s FFT measurement (FFT-capable boards with FFT_ENABLE = 1). If neither exists, you are told to set it from a log later. The gains of all chosen axes are then checked once more with the filter active.</li>
       <li><b>Overall check.</b> 30 s of normal flying with the final gains: grade per axis, vibration, hover throttle, notch state, and whether the gains could still move.</li>
       <li><b>Land and save.</b> Land and disarm. The summary compares the check-up with the final check, lists every write, and the parameter file is one click away.</li>
@@ -277,10 +282,11 @@
     <h3>How do I know it will not apply wrong gains?</h3>
     <ul>
       <li>Nothing is written unless you press Apply (or switch Auto-apply on). The only exceptions are the two housekeeping values in step 2, and it asks first.</li>
+      <li>While the vehicle is armed nothing at all is written unless you turned on <b>Allow changes in flight</b>. That mode is experimental: it has been tested only in the simulator, never on a real aircraft.</li>
       <li>Every proposal is derived from what the vehicle actually did: it fits a physical model to the measured response and refuses to propose when the measurement is weak (and tells you why).</li>
       <li>Before writing, you see the exact parameters, the margins (gain margin, phase margin, sensitivity peak) and the predicted step response next to the measured one.</li>
-      <li>Changes are capped at 2× per round, written in steps of at most 1.5× and watched 4 s each by an oscillation detector (the same slew-rate signal ArduPilot's QuikTune uses). Any sign of oscillation reverts to the last good gains and pauses.</li>
-      <li><b>Undo</b> per axis and <b>Restore original gains</b> are always available, and every write is journaled in the <code>sessions</code> folder.</li>
+      <li>Changes are capped at 2× per round and written in steps of at most 1.5×. In flight, an oscillation monitor checks every axis four times a second (the slew-rate signal ArduPilot's QuikTune uses, and Dmod), and every change is watched afterwards (4 s; notch and filter changes 10 s). If the vehicle starts to oscillate, or the data stop coming in, the app pauses and undoes the change: back to the values just before it when the vehicle was calm before, otherwise back to the values the session started with, in steps of at most 1.5×. The parameters are stored on the vehicle as they are written, so an undo can fail (for example when the link is lost): watch the vehicle, not the app.</li>
+      <li><b>Undo</b> per axis and <b>Restore original gains</b> are available (in flight only with changes in flight allowed), and every write is journaled in the <code>sessions</code> folder.</li>
     </ul>
     <h3>What the maths does</h3>
     <p>From demanded rate, actual rate and the PID output it measures the bare airframe response (actuator → gyro) with a feedback-safe spectral estimator and fits <code>G(s) = K·e<sup>−s·Td</sup> / ((s + a)(τs + 1))</code>: K is how hard the motors turn the aircraft, a the aerodynamic damping, τ the motor lag, Td the delay. It then searches P and D against ArduPilot's exact AC_PID structure (target/error/D filters, the gyro low-pass, notches, loop rate) for the best disturbance rejection within the chosen margins, and sets I, FF, filters and the angle gain with ArduPilot's own rules (I = P on roll/pitch, I = 0.1 P on yaw, plane I = FF, FLTT = FLTD = INS_GYRO_FILTER/2, plane FF from the AUTOTUNE event method). Copter gains are computed per rad/s, so the numbers are directly ArduPilot's.</p>
