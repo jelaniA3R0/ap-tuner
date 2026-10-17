@@ -62,8 +62,10 @@ harmonics bitmask; single/double/triple notches; `HarmonicNotchFilter.cpp`).
 
 ### Identification (`engine/analysis.js identify`, `dsp/spectra.js`, `model/plant.js`)
 
-Inputs per axis, uniformly resampled: `r` = rate target, `y` = actual rate, `u` = P+I+D+FF+DFF.
-Windowed (Hann), overlapped FFTs are averaged into cross spectra. Because the data are taken in
+Inputs per axis at the rate they were logged: `r` = rate target, `y` = actual rate, `u` = P+I+D+FF+DFF
+(from a log: unbroken segments only, see "Log analysis"; nothing is interpolated or up-sampled).
+Windowed (Hann), overlapped FFTs are averaged into cross spectra; a window never spans a logging gap,
+ground time or a masked sample. Because the data are taken in
 closed loop, the plant estimate uses the reference-driven ratio
 
 `H_meas(f) = S_ry / S_ru`  (coherence = min(γ²_ry, γ²_ru))
@@ -156,6 +158,26 @@ harmonics; the recommendation is `INS_HNTCH_FREQ` = fundamental, `BW` = FREQ/2, 
 plus an `INS_GYRO_FILTER` that the notch allows (≤ f0/3, ≤ 80 Hz). The configured and the
 recommended chains are evaluated as transfer functions and applied to the measured spectrum to
 predict the post-filter noise in 5-40 Hz and the phase lag at 10 Hz.
+
+**Data integrity** (audit 2026-10-17; `log/dfreader.js`, `log/integrity.js`, `engine/flightdata.js`; the C++
+edition does the same, `tools/compare-cpp.js` checks it):
+* The file must be a DataFlash `.bin` log: empty files, telemetry logs (`.tlog`), text / CSV and unknown files
+  are refused with the reason (the command line exits with code 3). FMT definitions are checked; every record
+  must be followed by the next record header, so damaged bytes are skipped and counted, not decoded as data.
+* Time stamps are cleaned per table and instance: repeated and out-of-order records are dropped, a clock reset
+  (two logs joined, a reboot) ends the usable part. A step longer than 2.5 typical intervals is a logging gap.
+* The rate data stay at their logged rate (e.g. 300 Hz); unbroken segments are analysed one after the other and
+  gaps are never filled in. Samples that are not numbers or impossible (|rate| > 5000 deg/s, |output| > 1000) are
+  masked. Every metric, spectrum and model uses airborne samples only (throttle above 60% of hover, 3 s after
+  lift-off and 2 s before touch-down left out; ArduPlane `CTUN.ThO` is in percent).
+* The window never spans a change of a tuning parameter (gains, filters, notch, loop rate, mixer, frame;
+  `STAT_*` and calibration values do not count) or the first 5 s after a fixed-wing / VTOL switch; the
+  parameter values in effect then are used. VTOL modes are 17-23 and 25 (THERMAL and AUTOLAND fly as a plane).
+* Peaks must be true local maxima; data logged too slowly to rule out aliasing get no oscillation verdict
+  and no notch. The dynamic notch is modelled at the logged gyro rate (`IMU.GHz`) and its operating point
+  (hover throttle, RPM, ESC, FFT) with the firmware's `FREQ x FM_RAT` floor and the Q fixed from `FREQ` / `BW`.
+* Everything left out is said in plain language in the result (gaps, damaged bytes, dropped records, logger
+  drops `DSF.Dp`, ground time, the window cut).
 
 ## 3. Limits to keep in mind
 
