@@ -6,9 +6,12 @@ multirotors, QuadPlane VTOLs, helicopters and fixed-wing planes of any size.
 It connects to the vehicle through Mission Planner's MAVLink mirror (or directly to a telemetry
 link or a SITL), watches the vehicle fly, identifies the airframe's response, computes gains
 with the same controller structure and rules ArduPilot uses, shows everything (graphs, margins,
-predicted vs measured step response, diagnostics with a grade), and can upload the gains in
-bounded steps with an oscillation watchdog that reverts automatically. The same analysis runs
-on `.bin` logs, including harmonic-notch design from raw gyro data.
+predicted vs measured step response, diagnostics with a grade), and writes the gains on the ground
+(disarmed). Writing to a flying vehicle is **off by default**: the switch **Allow changes in flight** is
+experimental and has been tested only in ArduPilot's simulator, never on a real aircraft. With it on, the
+gains go to the vehicle in bounded steps, every change is watched and the app tries to undo it when the
+vehicle starts to oscillate (see Safety). The same analysis runs on `.bin` logs, including harmonic-notch
+design from raw gyro data.
 
 ## Install or just run
 
@@ -30,13 +33,16 @@ Press **Start flight check**. The app connects, reads the vehicle, and then lead
 2. **Check-up (30 s, nothing written).** Tap the sticks. You get the issues per axis in plain words
    (sluggish, bouncy, oscillating, noisy D, motors at the limit, filters) and the exact parameter changes
    proposed, with the margins and the predicted response.
-3. **Tune in flight.** Press **Apply in flight** (or pick "Apply by itself" before starting). The gains
-   go to the flying vehicle in steps of at most 1.5x, each watched 4 s for oscillation and reverted by
-   itself if it trips; the app re-measures and repeats until the gains settle (at most 4 rounds per axis).
-4. **Filters.** The harmonic notch is set through the vehicle: ESC RPM tracking if the ESCs report RPM,
-   otherwise the autopilot's own 30 s FFT measurement (FFT-capable boards with FFT_ENABLE = 1). If
-   neither exists you are told to set it from a log later. The gains of all chosen axes are then checked once
-   more with the filter active.
+3. **Tune in flight** (only with **Allow changes in flight** on; otherwise press **Finish**, land and apply
+   the proposals on the ground). Press **Apply in flight** (or pick "Apply by itself" before starting). The
+   gains go to the flying vehicle in steps of at most 1.5x, each change watched for oscillation; if the vehicle
+   starts to oscillate the app pauses and undoes the change. The app re-measures and repeats until the gains
+   settle (at most 4 rounds per axis).
+4. **Filters** (also only with changes in flight on). The harmonic notch is set through the vehicle: ESC RPM
+   tracking if the ESCs report RPM, otherwise the autopilot's own 30 s FFT measurement (FFT-capable boards with
+   FFT_ENABLE = 1); every axis is watched for 10 s afterwards and the notch is switched back if the vehicle
+   starts to oscillate. If neither route exists you are told to set it from a log later. The gains of all chosen
+   axes are then checked once more with the filter active.
 5. **Overall check.** 30 s of normal flying with the final gains: grade per axis, vibration, hover
    throttle, notch state, and whether the gains could still move.
 6. **Land and save.** Land and disarm. The summary compares the check-up with the final check, lists
@@ -118,9 +124,29 @@ the filtered gyro and warns you.
 Keep a hand on the mode switch, tune in calm air at a safe height, one axis at a time, with a
 vehicle that already hovers (see the ArduPilot "setting up for tuning" page for MOT_THST_EXPO,
 hover throttle, PWM ranges and INS_GYRO_FILTER by prop size). The app changes only the rate
-PID / filter / angle-gain parameters of the chosen axes, `GCS_PID_MASK` and `*_SMAX`. ArduPilot
-saves parameter writes immediately, so **Restore original gains** (or the journal in
-`sessions\`) is the way back.
+PID / filter / angle-gain parameters of the chosen axes, the notch parameters, `GCS_PID_MASK` and
+`*_SMAX`. ArduPilot saves parameter writes immediately, so **Restore original gains** (or the journal
+in `sessions\`) is the way back.
+
+What protects the vehicle (2026-10-17 audit, R0 and R4):
+
+* **Nothing is written while the vehicle is armed** unless **Allow changes in flight** is on (off on every
+  start of the app; experimental, tested only in the simulator).
+* With it on: one change at a time (a single write lock); **Pause** and **Stop** stop before the next
+  parameter write, retries included. Before a change the vehicle must look calm.
+* An **oscillation monitor** checks roll, pitch and yaw four times a second while a session runs, on the slew-rate
+  signal ArduPilot's QuikTune uses (SRate above the limit) and Dmod below 0.9, sustained over more than half
+  of 2 s. Every in-flight change (gains, filters, the notch, notch values the autopilot writes itself) is watched
+  afterwards on the axes it affects (4 s; notch and filters 10 s), with an attitude-error check where the vehicle
+  sends its attitude target. A watch fails when the PID data stop, come in too sparse or the link drops.
+* On a trip the session pauses at once and the change is undone from evidence: when the 2 s before the change
+  were calm, back to the values just before it; otherwise, or if it still oscillates, back to the values the
+  session started with. No corrective write is larger than 1.5x, and the result is checked again. The message
+  says "oscillating" and what was written back; if nothing helps it says "land now".
+* An undo can fail (for example when the link is lost): watch the vehicle, not the app.
+* The local web interface only obeys its own page: requests must come from this PC's app window (Host / Origin
+  check), anything that changes something must be a POST with a random per-run token from the page, and text
+  from logs or the vehicle is shown as text, never as HTML.
 
 ## Testing without a vehicle (SITL)
 
@@ -129,6 +155,13 @@ firmware.ardupilot.org). `node sitl\pilot.js 5760 10` arms, takes off to 12 m an
 taps for 10 minutes. Connect AP Tuner to `127.0.0.1:5762` (TCP). Mission Planner can watch on
 5763. This is how the app was verified: a detuned SITL quad was identified, re-tuned axis by
 axis with auto-apply, each step held under the watchdog, and the session journaled.
+
+Safety regression tests: `node tools/sitl-f01.js --port <app port>` repeats the audit's F-01 case (the notch
+switched on in flight with high pitch gains; the app must switch it back and pause within 5 s of the onset),
+`node tools/flight-demo.js --port <app port>` flies a whole guided session and lists every pause and trip, and
+`node tools/osc-episodes.js <log.BIN>` lists the sustained oscillations in the simulator's own log. Unit tests:
+`npm test` (JavaScript, including a fake vehicle with 26 safety scenarios, the API security checks and the
+page-escaping check) and `cpp\build.cmd` (C++, the same scenarios).
 
 ## Demonstrations
 

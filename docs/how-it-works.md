@@ -128,20 +128,51 @@ ArduPilot's.
 
 `prepare` reads the needed parameters (per-name requests, light on radios), sets
 `GCS_PID_MASK = 7` and `SMAX` if needed, requests EXTRA1 and then `PID_TUNING` at 50 Hz
-(25 Hz planes) and `ATTITUDE` at 25 Hz. Per axis the state machine observes (30 s, needs
-excitation), analyses, proposes; with auto-apply it writes filters first, then P/I/D in
-multiplicative steps ≤ ×1.5 (D before P), watching 4 s after each step. The watchdog trips on
-`SRate` above the threshold (5 default; 3 for 50 kg, 1.5 for 100 kg), `Dmod` < 0.9, or a jump
-in oscillation-band error energy (≥ 3× the baseline and ≥ 8°/s RMS). It only judges samples
-from 0.5 s after the write on (ArduPilot's `SRate` looks back ~0.3 s and telemetry arrives late,
-so earlier samples still show the old gains). After a step that raised a gain it reverts to the
-last good set, then pauses; after a step that only lowered gains the oscillation was already
-there, so it goes on down to the proposed (lower) gains instead of back up, then pauses.
-Rounds repeat (at most four per axis) until the rate gains change by less than 10% and the angle
-gain by less than 15%, then the next axis.
-Everything written is journaled in `sessions/*.json` and **Restore original gains** rewrites the
-originals. A QuikTune-style ramp (same doubling time, back-off and limits as the Lua applet) is
-available as a fallback when no model can be identified.
+(25 Hz planes), `ATTITUDE` at 25 Hz and EXTENDED_STATUS (`NAV_CONTROLLER_OUTPUT`, the attitude
+target). No `PID_TUNING` sample is stored before the controller family (and so the unit) is known,
+and `prepare` empties the buffers. Per axis the state machine observes (30 s, needs excitation),
+analyses, proposes; with auto-apply it writes filters first, then P/I/D in multiplicative steps
+≤ ×1.5 (D before P), then the angle gain (also ≤ ×1.5 per write). Rounds repeat (at most four per
+axis) until the rate gains change by less than 10% and the angle gain by less than 15%, then the
+next axis. Everything written is journaled in `sessions/*.json` (requested and echoed value,
+armed or not) and **Restore original gains** rewrites the originals. A QuikTune-style ramp (same
+doubling time, back-off and limits as the Lua applet) is available as a fallback when no model can
+be identified.
+
+**In-flight safety layer** (2026-10-17 audit R0 / R4; the same in the C++ port):
+
+* *Opt-in.* While the vehicle is armed nothing is written unless `opts.inFlightWrites` is on (the
+  "Allow changes in flight" switch, off on every start). `Tuner.setParam` is the one place every write
+  goes through and checks it; housekeeping writes, restore and undo included.
+* *One writer.* Every write holds the single write lock (a job). Pause and Stop cancel a job before its
+  next `PARAM_SET`, link retries included (a cancelled write is read back and journaled as cancelled). A
+  second Apply, Start or Resume while a job runs is refused; the observe loop has a generation counter so
+  only one loop runs.
+* *Monitor.* Every 250 ms while a session is active, on every axis: a trip when more than half of the
+  last 2 s have `SRate` above the threshold (5 default; 3 for 50 kg, 1.5 for 100 kg) or `Dmod` below 0.9
+  (samples with `Dmod` ≤ 0 carry no slew data and never count). It does not rely on the spectral check,
+  which only runs on ≥ 80 Hz data. An analysis without a model while ≥ 5 % of the window shows these
+  signs is reported as "oscillating", never as "fly sharper stick inputs".
+* *Watch after every in-flight change* (gain steps, filter writes, the notch, notch values the autopilot's
+  FFT wrote itself), on the axes it affects (all axes for vehicle-wide parameters), for 4 s (notch and
+  filters 10 s) after a 0.5 s grace whose samples still describe the old values: any `SRate` above the
+  threshold, `Dmod` < 0.9, the spectral check, a sustained monitor trip on any axis, or an attitude error
+  above 10° for 0.8 s (`ATTITUDE` against the `NAV_CONTROLLER_OUTPUT` target) trips it. It fails closed:
+  a lost link, no PID sample for 1 s, or fewer than half the expected samples counts as a trip. Before a
+  change the vehicle must be calm (no trip sample in the last 2 s on any axis, up to 4 s of waiting) and
+  the affected axes must stream PID data with the slew-rate signal.
+* *Evidence-based revert.* On a trip the session pauses at once. If the 2 s before the change were calm,
+  the change is reverted (the set just before it, which was observed calm); otherwise, or if it still
+  oscillates after that, every value the session changed goes back to the session's starting values
+  (observed calm in the check-up). Gains and their filters move in steps of at most stepMax, 1 s apart;
+  the notch is switched off first. The result is checked (sustained criterion after 4 s); the message says
+  what was written back, or "land now". Without the opt-in, and without any in-flight write of the app in
+  this session, nothing is written: the pilot is told to land.
+
+The local server only obeys its own page: Host (and Origin when sent) must be 127.0.0.1 / localhost on its
+port, `Sec-Fetch-Site: cross-site` is refused, state-changing routes accept only POST with the per-run token
+the server writes into `index.html`, the page has a Content-Security-Policy, and `/api/setparam` is gone. The
+web UI escapes every text from logs and the vehicle.
 
 ### Log analysis and notch design (`engine/loganalysis.js`, `engine/notch.js`)
 
@@ -234,9 +265,9 @@ One flight, led by the app, on top of the Tuner and NotchLive:
 |---|---|---|
 | preflight | waits for armed + a tuning-friendly mode (copter: Stabilize, AltHold, PosHold, Loiter; VTOL: QStabilize, QHover, QLoiter; plane: FBWA, FBWB, Cruise) | nothing |
 | checkup | 30 s window per chosen axis, analyzeAxis as usual; issues in plain words (engine/issues.js) + the proposal | nothing |
-| review | the pilot presses Apply (or the session was started in auto mode) | nothing |
-| tuning | Tuner.start with autoApply; the check-up analysis is used directly for round 1 (useFreshResult), then the normal rounds until convergence (rate gains < 10%, angle gain < 15%, max 4 rounds per axis) | gains, in steps <= 1.5x under the watchdog |
-| filters | NotchLive: keep an existing notch; else ESC RPM tracking (mode 3); else the autopilot FFT tune (30 s hover); else advice for the log route | INS_HNTCH_* |
+| review | the pilot presses Apply (or the session was started in auto mode); with changes in flight off: Finish (apply on the ground) | nothing |
+| tuning | Tuner.start with autoApply; the check-up analysis is used directly for round 1 (useFreshResult), then the normal rounds until convergence (rate gains < 10%, angle gain < 15%, max 4 rounds per axis) | gains, in steps <= 1.5x, each change watched (needs the in-flight opt-in) |
+| filters | NotchLive: keep an existing notch; else ESC RPM tracking (mode 3); else the autopilot FFT tune (30 s hover); else advice for the log route; every axis watched 10 s, the notch switched back on a trip | INS_HNTCH_* (needs the opt-in) |
 | recheck | always: Tuner rounds again over all chosen axes with the filter active | gains if they moved > 10% |
 | overall | 30 s window: grades, tracking, oscillation, saturation, VIBRATION message, hover throttle re-read, notch state; verdict | nothing |
 | land | waits for disarm; the pilot can also finish early | nothing |
