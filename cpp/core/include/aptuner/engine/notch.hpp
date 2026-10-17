@@ -11,7 +11,8 @@
 #include "aptuner/core/cx.hpp"
 #include "aptuner/core/json.hpp"
 #include "aptuner/core/rules.hpp"
-#include "aptuner/engine/loganalysis.hpp"
+#include "aptuner/engine/analysis.hpp"
+#include "aptuner/engine/flightdata.hpp"
 #include "aptuner/log/dfreader.hpp"
 
 namespace aptuner::engine {
