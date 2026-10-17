@@ -1,0 +1,34 @@
+# Builds and tests the C++ version on Windows (MSVC), Linux (GCC) and macOS (Clang).
+name: cpp
+on:
+  push:
+    paths: ['cpp/**', '.github/workflows/cpp.yml']
+  pull_request:
+    paths: ['cpp/**', '.github/workflows/cpp.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-msvc, os: windows-latest, cxx: '', werror: 'OFF' }
+          - { name: linux-gcc, os: ubuntu-latest, cxx: g++, werror: 'ON' }
+          - { name: macos-clang, os: macos-latest, cxx: clang++, werror: 'ON' }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cxx }}" ]; then export CXX="${{ matrix.cxx }}"; fi
+          cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release -DAPTUNER_WARNINGS_AS_ERRORS=${{ matrix.werror }}
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
