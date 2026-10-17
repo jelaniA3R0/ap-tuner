@@ -1,0 +1,30 @@
+// Windows resources: program icon and version information.
+#include <winver.h>
+
+1 ICON "../../AP Tuner.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "AP Tuner contributors"
+      VALUE "FileDescription", "AP Tuner - ArduPilot rate PID and notch tuning"
+      VALUE "FileVersion", "0.1.0"
+      VALUE "InternalName", "aptuner"
+      VALUE "LegalCopyright", "MIT License"
+      VALUE "OriginalFilename", "aptuner.exe"
+      VALUE "ProductName", "AP Tuner"
+      VALUE "ProductVersion", "0.1.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

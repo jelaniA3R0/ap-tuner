@@ -102,6 +102,25 @@ std::vector<SerialPortInfo> listSerialPorts() {
   return out;
 }
 
+std::vector<SerialMapEntry> serialMap() {
+  std::vector<SerialMapEntry> out;
+#ifdef _WIN32
+  HKEY key;
+  if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+    for (DWORD i = 0;; i++) {
+      wchar_t name[256], data[256];
+      DWORD nl = 256, dl = sizeof data, type = 0;
+      if (RegEnumValueW(key, i, name, &nl, nullptr, &type, reinterpret_cast<BYTE*>(data), &dl) != ERROR_SUCCESS) break;
+      if (type == REG_SZ) out.push_back({narrow(data), narrow(name)});
+    }
+    RegCloseKey(key);
+  }
+#else
+  for (const auto& p : listSerialPorts()) out.push_back({p.port, p.port});
+#endif
+  return out;
+}
+
 bool processRunning(const std::string& exeName) {
   const std::string want = lower(exeName);
 #ifdef _WIN32

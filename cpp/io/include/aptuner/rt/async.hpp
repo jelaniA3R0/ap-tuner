@@ -5,6 +5,7 @@
 #pragma once
 
 #include <coroutine>
+#include <cstdio>
 #include <exception>
 #include <functional>
 #include <memory>

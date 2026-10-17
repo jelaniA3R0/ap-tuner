@@ -72,6 +72,7 @@ class Link : public rt::Emitter {
     std::uint64_t rx = 0, tx = 0, bytes = 0;
   };
   const Stats& stats() const { return stats_; }
+  const mavlink::Parser::Stats& parserStats() const { return parser_.stats(); }
 
  private:
   struct ParamReq;

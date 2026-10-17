@@ -29,9 +29,13 @@ aptuner/
   tests/     golden-result tests against the JavaScript version
 ```
 
-Dependencies: header-only, permissively licensed, vendored in the repo: cpp-httplib (MIT) for HTTP,
-nlohmann/json (MIT) for JSON. FFT, log reader, MAVLink and all math are our own code (already written once
-in JS). Build: CMake. Licence for the release: GPL-3.0 (same as ArduPilot) or MIT, the owner's choice.
+Dependencies: none. The HTTP + SSE server, JSON, FFT, log reader, MAVLink and all math are our own code
+(already written once in JS), so the release is three self-contained programs plus the web/ folder.
+Build: CMake + Ninja. Licence: MIT (same as the JavaScript version).
+
+As built (2026-10-17): toolchain B (llvm-mingw clang 23, CMake 4.4, Ninja 1.13 in `D:\toolchain`), static
+runtime, warnings as errors. The live side runs on one event-loop thread with C++20 coroutines; serial, TCP
+and HTTP threads only hand data to that loop, so the tuner logic has no locks.
 
 ## Phases
 
@@ -45,6 +49,11 @@ in JS). Build: CMake. Licence for the release: GPL-3.0 (same as ArduPilot) or MI
 | 5 | Validation flights (tools/osc-experiment equivalents), installer, single-file release | - | release v1.0 on GitHub |
 
 About 5,300 lines of JavaScript become roughly 8,000-10,000 lines of C++.
+
+Status (2026-10-17): phases 0-4 done and checked against the JavaScript version (golden tests for the math,
+identical grades / gains / .param files on 9 logs, SITL link and log download, the full SITL guided-flight
+demo against the C++ server). Phase 5: installer and release zip done; flights on real aircraft and the
+GitHub release are next.
 
 ## After the port: the universal tuner (200 g - 500 kg)
 

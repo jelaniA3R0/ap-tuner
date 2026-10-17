@@ -4,8 +4,9 @@ add_executable(aptuner-tests
   test_golden_core.cpp
   test_dfreader.cpp
   test_io.cpp
+  test_liveaxis.cpp
 )
-target_link_libraries(aptuner-tests PRIVATE aptuner_io)
+target_link_libraries(aptuner-tests PRIVATE aptuner_app)
 target_compile_definitions(aptuner-tests PRIVATE APTUNER_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
 
 add_test(NAME unit COMMAND aptuner-tests)

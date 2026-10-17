@@ -13,6 +13,12 @@ struct SerialPortInfo {
 };
 std::vector<SerialPortInfo> listSerialPorts();
 
+/** active serial ports from the registry (Windows): {port, dev} where dev is e.g. \Device\USBSER000 */
+struct SerialMapEntry {
+  std::string port, dev;
+};
+std::vector<SerialMapEntry> serialMap();
+
 /** true when a process with this executable name is running (case-insensitive, e.g. "MissionPlanner.exe") */
 bool processRunning(const std::string& exeName);
 /** number of running processes whose command line contains `needle` (Windows; 0 elsewhere) */
