@@ -118,7 +118,7 @@ class Tuner extends EventEmitter {
   async _prepare(confirm) {
     this.setState('preparing', 'reading parameters');
     // a new connection may be a different vehicle: drop everything cached from the previous one
-    if (this._preparedGen !== this.link.generation) { this._preparedGen = this.link.generation; this.params = {}; this.originals = {}; this.previous = {}; this.results = {}; this.lastGood = {}; this.prepared = false; this.endSession(); }
+    if (this._preparedGen !== this.link.generation) { this._preparedGen = this.link.generation; this.params = {}; this.originals = {}; this.previous = {}; this.results = {}; this.lastGood = {}; this.prepared = false; this.lastTrip = null; this.endSession(); }
     // samples buffered so far may be from another vehicle or in other units: none are kept until the family is known (F-91)
     this.family = null;
     for (const ax of AXES) this.axes[ax].clear();
@@ -830,6 +830,8 @@ class Tuner extends EventEmitter {
     const r = this.ramp; if (!r) { this.setState('observing', 'ramp ended'); return; }
     const la = this.axes[r.axis];
     const now = Date.now();
+    // in flight the ramp's own detector needs live data with the slew-rate signal: without it, stop (fail closed)
+    if (this._armed()) { const why = this._watchBlind(r.axis); if (why) { this.pause(`${r.axis}: ${why}: the ramp stopped (it cannot see an oscillation)`); return; } }
     if (!r.filtersSet) { await this.writeGains(r.axis, r.filters, 'QuikTune filter rule', job); r.filtersSet = true; return; }
     // pilot input pauses the ramp (QuikTune PILOT_INPUT_DELAY = 4 s)
     if (Math.abs(this.rc.roll) > 0.05 || Math.abs(this.rc.pitch) > 0.05 || Math.abs(this.rc.yaw) > 0.05) { r.lastPilot = now; }

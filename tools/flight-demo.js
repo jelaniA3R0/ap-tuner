@@ -32,7 +32,7 @@ const { api, snapshot, getToken } = require('./app-client')(PORT);
   await sleep(2000);
   const pilot = spawn(process.execPath, [path.join(SITL, 'pilot.js'), '--vehicle', vehicle, '--port', '5760', '--mode', 'random', '--minutes', String(minutes)], { cwd: ROOT, stdio: ['ignore', fs.openSync(path.join(RUN, 'pilot.log'), 'a'), fs.openSync(path.join(RUN, 'pilot.log'), 'a')], windowsHide: true });
   const cleanup = () => { try { pilot.kill(); } catch (e) { /* ignore */ } try { sitl.kill(); } catch (e) { /* ignore */ } };
-  const pauses = [], trips = [];
+  const pauses = [], trips = [], tStart = Date.now();
   try {
     await sleep(6000);
     // straight to the simulator (autoconnect could pick up a Mission Planner mirror of a real vehicle)
@@ -53,7 +53,7 @@ const { api, snapshot, getToken } = require('./app-client')(PORT);
       else if (f.info !== lastInfo && /tuning|recheck/.test(f.phase)) { log('   ', f.info); }
       lastInfo = f.info;
       const lt = s.monitor && s.monitor.lastTrip;
-      if (lt && lt.at !== lastTripAt) { lastTripAt = lt.at; trips.push({ at: new Date(lt.at).toISOString().slice(11, 19), source: lt.source, axis: lt.axis, reasons: lt.reasons }); log(`  TRIP (${lt.source}): ${(lt.reasons || []).join('; ')}`); }
+      if (lt && lt.at !== lastTripAt && lt.at >= tStart) { lastTripAt = lt.at; trips.push({ at: new Date(lt.at).toISOString().slice(11, 19), source: lt.source, axis: lt.axis, reasons: lt.reasons }); log(`  TRIP (${lt.source}): ${(lt.reasons || []).join('; ')}`); }
       // a paused session waits for the pilot: count the pause, then press Resume after 5 s (once nothing is being written)
       const paused = f.phase === 'paused' || /^paused/.test(f.info || '');
       if (paused && !inPause) { inPause = true; pauses.push({ at: new Date().toISOString().slice(11, 19), phase: f.phase === 'paused' ? f.resumePhase : f.phase, info: f.pausedInfo || f.info }); log(`  PAUSE ${pauses.length}: ${f.pausedInfo || f.info}`); }

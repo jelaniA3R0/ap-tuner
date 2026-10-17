@@ -405,6 +405,19 @@ test('ramp_needs_optin_while_armed', async () => {
   } finally { await S.done(); }
 });
 
+test('ramp_fails_closed_without_data', async () => {
+  const S = await setup({ armed: true, inFlight: true });
+  try {
+    S.tuner.params.ATC_RAT_RLL_FLTD = 0;
+    S.fv.streaming = false; await sleep(1200);   // no PID data: the ramp could not see an oscillation
+    S.tuner._startRamp('roll');
+    await S.tuner._rampStep();
+    assert.strictEqual(S.tuner.state, 'paused');
+    assert.match(S.tuner.stateInfo, /the ramp stopped/);
+    assert.strictEqual(S.fv.sets.length, 0, 'nothing written blind');
+  } finally { await S.done(); }
+});
+
 // ---------------- LiveAxis evidence ----------------
 test('slewstats_missing_extension_fields_not_bad', async () => {
   const { LiveAxis } = require('../src/engine/axis');

@@ -207,6 +207,7 @@ rt::Task<Json> Tuner::prepareInner(bool confirm) {
     results = Json::object();
     lastGood = Json::object();
     prepared = false;
+    lastTrip = Json();
     endSession();
   }
   // samples buffered so far may be from another vehicle or in other units: none are kept until the family is known (F-91)
@@ -1435,6 +1436,14 @@ rt::Task<void> Tuner::rampWrite(std::shared_ptr<Job> job) {
   Ramp& r = *ramp_;
   LiveAxis& la = axes[r.axis];
   const double now = Loop::now();
+  // in flight the ramp's own detector needs live data with the slew-rate signal: without it, stop (fail closed)
+  if (isArmed()) {
+    const std::string why = watchBlind(r.axis);
+    if (!why.empty()) {
+      pause(r.axis + ": " + why + ": the ramp stopped (it cannot see an oscillation)");
+      co_return;
+    }
+  }
   if (!r.filtersSet) {
     const std::string ax = r.axis;
     const Json fl = r.filters;

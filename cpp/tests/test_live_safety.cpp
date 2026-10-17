@@ -572,6 +572,21 @@ TEST(live_ramp_needs_optin_while_armed) {
   done(r);
 }
 
+TEST(live_ramp_fails_closed_without_data) {
+  Rig r = setup(true, true);
+  r.tuner->params.set("ATC_RAT_RLL_FLTD", 0);
+  r.fv->streaming = false;   // no PID data: the ramp could not see an oscillation
+  runFor(1200);
+  app::TunerTestAccess::startRamp(*r.tuner, "roll");
+  auto f = app::TunerTestAccess::rampStep(*r.tuner);
+  settle(f);
+  CHECK(errorOf(f).empty());
+  CHECK(r.tuner->state == "paused");
+  CHECK(has(r.tuner->stateInfo, "the ramp stopped"));
+  CHECK(r.fv->sets.empty());   // nothing written blind
+  done(r);
+}
+
 // ---------------- LiveAxis evidence
 
 TEST(live_slewstats_missing_extension_fields_not_bad) {
