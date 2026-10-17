@@ -13,6 +13,13 @@ add_library(aptuner_core STATIC
   src/timeid.cpp
   src/jsnum.cpp
   src/json.cpp
+  src/log/dfreader.cpp
+  src/engine/vehicle.cpp
+  src/engine/analysis.cpp
+  src/engine/loganalysis.cpp
+  src/engine/notch.cpp
+  src/engine/issues.cpp
+  src/engine/report.cpp
 )
 target_include_directories(aptuner_core
   PUBLIC

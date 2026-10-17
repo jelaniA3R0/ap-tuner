@@ -2,6 +2,7 @@ add_executable(aptuner-tests
   test_main.cpp
   test_build_info.cpp
   test_golden_core.cpp
+  test_dfreader.cpp
 )
 target_link_libraries(aptuner-tests PRIVATE aptuner_core)
 target_compile_definitions(aptuner-tests PRIVATE APTUNER_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
