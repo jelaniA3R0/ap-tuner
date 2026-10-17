@@ -124,10 +124,18 @@ Json axisIssues(const Json& r, core::Family family) {
       out.push(issue("ok", "Follows " + jsToFixed(t, 0) + "% of the demanded rate"));
   }
   if (judged && ms.isObject()) {
-    const double os = num(ms["overshootPct"]), rise = num(ms["riseTime"]);
-    if (os > 25) out.push(issue("warn", "Bouncy: overshoots " + jsToFixed(os, 0) + "% on a step"));
-    if (rise > (family == core::Family::Plane ? 0.6 : 0.15))
-      out.push(issue("warn", "Slow: " + jsToFixed(rise * 1000, 0) + " ms to answer a step"));
+    if (ms["settled"].isBool() && !ms["settled"].asBool()) {
+      const Json& st = r["measuredStep"]["t"];
+      const double win = st.isArray() && st.size() ? num(st[st.size() - 1]) : 0;
+      out.push(issue("warn", "The measured step response has not settled by the end of its " + jsToFixed(win, 1) +
+                                 " s window (a slow axis, or one that hardly answers), so rise time and overshoot are not "
+                                 "judged from it"));
+    } else {
+      const double os = num(ms["overshootPct"]), rise = num(ms["riseTime"]);
+      if (os > 25) out.push(issue("warn", "Bouncy: overshoots " + jsToFixed(os, 0) + "% on a step"));
+      if (rise > (family == core::Family::Plane ? 0.6 : 0.15))
+        out.push(issue("warn", "Slow: " + jsToFixed(rise * 1000, 0) + " ms to answer a step"));
+    }
   }
   if (num(d["saturationPct"]) > 2)
     out.push(issue("warn", "Motors or servos at their limit " + jsToFixed(num(d["saturationPct"]), 1) + "% of the time"));
