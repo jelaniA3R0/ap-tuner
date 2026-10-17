@@ -45,6 +45,7 @@ endif()
 configure_file(core/include/aptuner/version.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/aptuner/version.hpp @ONLY)
 
 add_subdirectory(core)
+add_subdirectory(io)
 add_subdirectory(cli)
 add_subdirectory(app)
 

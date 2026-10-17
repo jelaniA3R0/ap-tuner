@@ -43,6 +43,6 @@ Linux (GCC) and macOS (Clang).
 | 0 | toolchain, CMake skeleton, tests, CI | done |
 | 1 | core math (fft, spectra, step response, controller, plant fit, synthesis, time-domain fit, rules) | done: golden tests |
 | 2 | .bin reader, log analysis, notch, issues, analyze CLI | done: identical results on 9 logs (tools/compare-cpp.js) |
-| 3 | MAVLink, links (TCP / UDP / native serial), auto-connect, log download | |
+| 3 | MAVLink, links (TCP / UDP / native serial), auto-connect, log download | done: SITL link test (params, set + read-back, log download) |
 | 4 | live tuner, guided flight, ground tune, HTTP + SSE server, web UI | |
 | 5 | validation flights, installer, release | |
