@@ -7,9 +7,10 @@ const { FFT, hann } = require('./fft');
 /**
  * Average cross spectra between input x and output y (same length, uniformly sampled at fs).
  * windowSize power of two; overlap fraction (0.5 typical). minRms: skip windows with weak input.
+ * blocks: optional [[i0, i1)] of unbroken data; windows never straddle a block edge (gaps, ground time).
  * Returns { f, H:{re,im}, coh, Sxx, Syy, nWin }
  */
-function freqResponse(x, y, fs, windowSize = 512, overlap = 0.5, minRms = 0) {
+function freqResponse(x, y, fs, windowSize = 512, overlap = 0.5, minRms = 0, blocks = null) {
   const N = Math.min(x.length, y.length);
   const w = hann(windowSize);
   const fft = new FFT(windowSize);
@@ -18,7 +19,7 @@ function freqResponse(x, y, fs, windowSize = 512, overlap = 0.5, minRms = 0) {
   const step = Math.max(1, Math.round(windowSize * (1 - overlap)));
   let nWin = 0;
   const xr = new Float64Array(windowSize), xi = new Float64Array(windowSize), yr = new Float64Array(windowSize), yi = new Float64Array(windowSize);
-  for (let s = 0; s + windowSize <= N; s += step) {
+  for (const [b0, b1] of blocks || [[0, N]]) for (let s = b0; s + windowSize <= Math.min(b1, N); s += step) {
     // detrend (mean removal) + window
     let mx = 0, my = 0; for (let i = 0; i < windowSize; i++) { mx += x[s + i]; my += y[s + i]; } mx /= windowSize; my /= windowSize;
     let rms = 0;
@@ -49,8 +50,11 @@ function freqResponse(x, y, fs, windowSize = 512, overlap = 0.5, minRms = 0) {
   return { f, H: { re: Hre, im: Him }, coh, Sxx, Syy, nWin, windowSize, fs };
 }
 
-/** Welch power spectral density of one signal. Returns {f, psd (amplitude^2/Hz), amp (RMS amplitude per bin)} */
-function psd(x, fs, windowSize = 1024, overlap = 0.5) {
+/**
+ * Welch power spectral density of one signal. Returns {f, psd (amplitude^2/Hz), amp (RMS amplitude per bin)}
+ * blocks: optional [[i0, i1)] of unbroken data; windows never straddle a block edge.
+ */
+function psd(x, fs, windowSize = 1024, overlap = 0.5, blocks = null) {
   const w = hann(windowSize);
   const fft = new FFT(windowSize);
   const nb = windowSize / 2 + 1;
@@ -58,7 +62,7 @@ function psd(x, fs, windowSize = 1024, overlap = 0.5) {
   const step = Math.max(1, Math.round(windowSize * (1 - overlap)));
   let nWin = 0;
   const xr = new Float64Array(windowSize), xi = new Float64Array(windowSize);
-  for (let s = 0; s + windowSize <= x.length; s += step) {
+  for (const [b0, b1] of blocks || [[0, x.length]]) for (let s = b0; s + windowSize <= Math.min(b1, x.length); s += step) {
     let m = 0; for (let i = 0; i < windowSize; i++) m += x[s + i]; m /= windowSize;
     for (let i = 0; i < windowSize; i++) { xr[i] = (x[s + i] - m) * w[i]; xi[i] = 0; }
     fft.transform(xr, xi);
@@ -76,6 +80,13 @@ function psd(x, fs, windowSize = 1024, overlap = 0.5) {
   return { f, psd: S, amp, nWin, windowSize, fs };
 }
 
+/** number of Welch windows of windowSize (overlap fraction) that fit inside the blocks */
+function countWindows(blocks, windowSize, overlap = 0.5) {
+  const step = Math.max(1, Math.round(windowSize * (1 - overlap)));
+  let k = 0; for (const [b0, b1] of blocks) if (b1 - b0 >= windowSize) k += Math.floor((b1 - b0 - windowSize) / step) + 1;
+  return k;
+}
+
 /** Integrate PSD between f1 and f2 -> RMS */
 function bandRms(sp, f1, f2) {
   let e = 0; const df = sp.f[1] - sp.f[0];
@@ -83,4 +94,4 @@ function bandRms(sp, f1, f2) {
   return Math.sqrt(e);
 }
 
-module.exports = { freqResponse, psd, bandRms };
+module.exports = { freqResponse, psd, bandRms, countWindows };

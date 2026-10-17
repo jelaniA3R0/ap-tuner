@@ -36,8 +36,13 @@ function axisIssues(r, family) {
     else out.push({ level: 'ok', text: `Follows ${d.trackingPct.toFixed(0)}% of the demanded rate` });
   }
   if (judged && ms) {
-    if (ms.overshootPct > 25) out.push({ level: 'warn', text: `Bouncy: overshoots ${ms.overshootPct.toFixed(0)}% on a step` });
-    if (ms.riseTime > (family === 'plane' ? 0.6 : 0.15)) out.push({ level: 'warn', text: `Slow: ${(ms.riseTime * 1000).toFixed(0)} ms to answer a step` });
+    if (ms.settled === false) {
+      const win = r.measuredStep.t.length ? r.measuredStep.t[r.measuredStep.t.length - 1] : 0;
+      out.push({ level: 'warn', text: `The measured step response has not settled by the end of its ${win.toFixed(1)} s window (a slow axis, or one that hardly answers), so rise time and overshoot are not judged from it` });
+    } else {
+      if (ms.overshootPct > 25) out.push({ level: 'warn', text: `Bouncy: overshoots ${ms.overshootPct.toFixed(0)}% on a step` });
+      if (ms.riseTime > (family === 'plane' ? 0.6 : 0.15)) out.push({ level: 'warn', text: `Slow: ${(ms.riseTime * 1000).toFixed(0)} ms to answer a step` });
+    }
   }
   if (d.saturationPct > 2) out.push({ level: 'warn', text: `Motors or servos at their limit ${d.saturationPct.toFixed(1)}% of the time` });
   if (d.dOverP > 1.5) out.push({ level: 'warn', text: 'D term works harder than P (noisy gyro or too much D)' });

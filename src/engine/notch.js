@@ -3,55 +3,94 @@
 // (INS_LOG_BAT_MASK), IMU at the loop rate (LOG_BITMASK fast IMU). Produces the pre-filter spectrum,
 // the currently configured filter response, the predicted post-filter spectrum, detected peaks and
 // a recommended INS_HNTCH_* set with predicted result and phase lag at 10 Hz.
+// Only airborne gyro data are used, spectra are averaged over unbroken blocks (logging gaps and batch
+// boundaries are never joined), and post-filter data logged too slowly to rule out aliasing get no notch.
 'use strict';
 const { psd } = require('../dsp/spectra');
 const { splitByInstance } = require('../log/dfreader');
-const { C, gyroChain, harmonicNotch, biquadLpf, notchBaseFreq } = require('../model/controller');
+const { GAP_FACTOR, medianStep } = require('../log/integrity');
+const { C, gyroChain } = require('../model/controller');
 const { gyroChainFromParams } = require('./analysis');
-const { nextPow2 } = require('../dsp/fft');
+const { nextPow2, prevPow2 } = require('../dsp/fft');
+const { throttleStream, airborneIntervals, inIntervals, notchOperatingPoint } = require('./flightdata');
 
-/** pick the best gyro data for IMU instance 0 -> {fs, x, y, z, source, prefilter:boolean} */
-function gyroSamples(log, win) {
-  const inWin = (tUs) => !win || !win.tStart || (tUs / 1e6 >= win.tStart && tUs / 1e6 <= win.tEnd);
+const DEG = 57.2958;
+
+/** unbroken blocks [[i0, i1)] of a sample sequence: split where a sample was left out (index jump) or the time steps over a gap */
+function blocksOfSamples(t, idx) {
+  const blocks = []; if (!idx.length) return blocks;
+  const dt = medianStep(t);
+  let s = 0;
+  for (let k = 1; k < idx.length; k++) if (idx[k] !== idx[k - 1] + 1 || (dt > 0 && t[k] - t[k - 1] > GAP_FACTOR * dt)) { blocks.push([s, k]); s = k; }
+  blocks.push([s, idx.length]);
+  return blocks;
+}
+
+/** mean sample rate inside unbroken blocks (gaps excluded) */
+function blockRate(t, blocks) {
+  let num = 0, den = 0; for (const [a, b] of blocks) if (b - a >= 2) { num += b - a - 1; den += t[b - 1] - t[a]; }
+  return den > 0 ? +(num / den).toFixed(3) : 0;
+}
+
+/**
+ * Pick the best gyro data for the first IMU -> {fs, t, x, y, z, blocks, source, prefilter, batched}.
+ * Samples outside the window, outside the airborne stretches (air) or not finite are left out; the data are
+ * cut into unbroken blocks for the spectra.
+ */
+function gyroSamples(log, win, air = null) {
+  const inWin = tSec => !win || win.tStart === null || win.tStart === undefined || (tSec >= win.tStart && tSec <= win.tEnd);
+  const flying = tSec => !air || inIntervals(air.intervals, tSec);
+  const finite = (g, i) => Number.isFinite(g.GyrX[i]) && Number.isFinite(g.GyrY[i]) && Number.isFinite(g.GyrZ[i]);
+  const fromTable = (g, timeOf) => {
+    const idx = [], t = [];
+    for (let i = 0; i < g.n; i++) { const ts = timeOf(i); if (inWin(ts) && flying(ts) && finite(g, i)) { idx.push(i); t.push(ts); } }
+    const blocks = blocksOfSamples(t, idx);
+    return { idx, t: Float64Array.from(t), blocks, fs: blockRate(t, blocks), x: Float64Array.from(idx, i => g.GyrX[i] * DEG), y: Float64Array.from(idx, i => g.GyrY[i] * DEG), z: Float64Array.from(idx, i => g.GyrZ[i] * DEG) };
+  };
   // 1) raw gyro messages
   if (log.msgs.GYR && log.msgs.GYR.n > 2000) {
-    const g = splitByInstance(log.msgs.GYR, 'I')[0] || Object.values(splitByInstance(log.msgs.GYR, 'I'))[0];
-    const idx = []; for (let i = 0; i < g.n; i++) if (inWin(g.TimeUS[i])) idx.push(i);
-    if (idx.length > 2000) {
-      const t = idx.map(i => g.SampleUS ? g.SampleUS[i] / 1e6 : g.TimeUS[i] / 1e6);
-      const fs = estimateFs(t);
-      return { fs, t: Float64Array.from(t), x: Float64Array.from(idx, i => g.GyrX[i] * 57.2958), y: Float64Array.from(idx, i => g.GyrY[i] * 57.2958), z: Float64Array.from(idx, i => g.GyrZ[i] * 57.2958), source: 'GYR raw gyro (' + fs.toFixed(0) + ' Hz)', prefilter: true };
-    }
+    const split = splitByInstance(log.msgs.GYR, 'I');
+    const g = split[0] || Object.values(split)[0];
+    // INS_RAW_LOG_OPT bit 2: GYR holds the filtered gyro; bit 3 (pre and post filter): the first instance holds
+    // the raw gyro and the filtered copy is logged under instance + number of gyros
+    const opt = log.params.INS_RAW_LOG_OPT | 0;
+    const post = !!(opt & 4) && !(opt & 8);
+    const r = fromTable(g, i => (g.SampleUS ? g.SampleUS[i] : g.TimeUS[i]) / 1e6);
+    if (r.idx.length > 2000 && r.fs > 0) return { fs: r.fs, t: r.t, x: r.x, y: r.y, z: r.z, blocks: r.blocks, source: 'GYR ' + (post ? 'filtered' : 'raw') + ' gyro (' + r.fs.toFixed(0) + ' Hz' + (post ? ', post-filter: INS_RAW_LOG_OPT bit 2' : '') + ')', prefilter: !post };
   }
-  // 2) batch sampler
+  // 2) batch sampler: every batch is its own block (the sampler pauses and switches sensors between batches)
   if (log.msgs.ISBH && log.msgs.ISBD && log.msgs.ISBH.n > 2) {
     const h = log.msgs.ISBH, d = log.msgs.ISBD;
     // gyro batches: type 0 = accel, 1 = gyro
-    const hdr = {}; for (let i = 0; i < h.n; i++) if (h.type[i] === 1 && h.instance[i] === 0) hdr[h.N[i]] = { mul: h.mul[i], fs: h.smp_rate[i], t: h.TimeUS[i] };
-    const xs = [], ys = [], zs = []; let fs = 0; let pre = true;
+    const hdr = {}; for (let i = 0; i < h.n; i++) if (h.type[i] === 1 && h.instance[i] === 0) hdr[h.N[i]] = { mul: h.mul[i], fs: h.smp_rate[i], t: h.TimeUS[i] / 1e6 };
+    const xs = [], ys = [], zs = [], blocks = []; let fs = 0, cur = null, lastSeq = null, start = 0;
     for (let i = 0; i < d.n; i++) {
-      const H = hdr[d.N[i]]; if (!H || !inWin(H.t)) continue;
-      fs = H.fs; const mul = H.mul || 1;
-      for (let k = 0; k < 32; k++) { xs.push(d.x[i][k] / mul * 57.2958); ys.push(d.y[i][k] / mul * 57.2958); zs.push(d.z[i][k] / mul * 57.2958); }
+      const H = hdr[d.N[i]]; if (!H || !inWin(H.t) || !flying(H.t)) continue;
+      if (!fs) fs = H.fs;
+      if (H.fs !== fs) continue;
+      const seq = d.seqno ? d.seqno[i] : null;
+      // a new batch, or a missing record inside one, starts a new block
+      if (cur !== d.N[i] || (seq !== null && lastSeq !== null && seq !== lastSeq + 1)) { if (xs.length > start) blocks.push([start, xs.length]); start = xs.length; cur = d.N[i]; }
+      lastSeq = seq;
+      const mul = H.mul || 1;
+      for (let k = 0; k < 32; k++) { xs.push(d.x[i][k] / mul * DEG); ys.push(d.y[i][k] / mul * DEG); zs.push(d.z[i][k] / mul * DEG); }
     }
-    if (xs.length > 2000) {
-      const opt = log.params.INS_LOG_BAT_OPT | 0; pre = !(opt & 2);
-      return { fs, x: Float64Array.from(xs), y: Float64Array.from(ys), z: Float64Array.from(zs), source: 'IMU batch sampler (' + fs.toFixed(0) + ' Hz, ' + (pre ? 'pre' : 'post') + '-filter)', prefilter: pre, batched: true };
+    if (xs.length > start) blocks.push([start, xs.length]);
+    if (xs.length > 2000 && fs > 0) {
+      const opt = log.params.INS_LOG_BAT_OPT | 0; const pre = !(opt & 2);
+      return { fs, x: Float64Array.from(xs), y: Float64Array.from(ys), z: Float64Array.from(zs), blocks, source: 'IMU batch sampler (' + fs.toFixed(0) + ' Hz, ' + (pre ? 'pre' : 'post') + '-filter, ' + blocks.length + ' batches)', prefilter: pre, batched: true };
     }
   }
   // 3) IMU message (filtered gyro at the logging rate)
   if (log.msgs.IMU && log.msgs.IMU.n > 2000) {
     const im = splitByInstance(log.msgs.IMU, 'I')[0];
     if (im) {
-      const idx = []; for (let i = 0; i < im.n; i++) if (inWin(im.TimeUS[i])) idx.push(i);
-      const t = idx.map(i => im.TimeUS[i] / 1e6); const fs = estimateFs(t);
-      if (idx.length > 2000) return { fs, t: Float64Array.from(t), x: Float64Array.from(idx, i => im.GyrX[i] * 57.2958), y: Float64Array.from(idx, i => im.GyrY[i] * 57.2958), z: Float64Array.from(idx, i => im.GyrZ[i] * 57.2958), source: 'IMU message (' + fs.toFixed(0) + ' Hz, post-filter)', prefilter: false };
+      const r = fromTable(im, i => im.TimeUS[i] / 1e6);
+      if (r.idx.length > 2000 && r.fs > 0) return { fs: r.fs, t: r.t, x: r.x, y: r.y, z: r.z, blocks: r.blocks, source: 'IMU message (' + r.fs.toFixed(0) + ' Hz, post-filter)', prefilter: false };
     }
   }
   return null;
 }
-
-function estimateFs(t) { const d = []; for (let i = 1; i < Math.min(t.length, 5000); i++) { const x = t[i] - t[i - 1]; if (x > 0) d.push(x); } d.sort((a, b) => a - b); return d.length ? 1 / d[Math.floor(d.length / 2)] : 0; }
 
 /** find spectral peaks: local maxima with prominence over the local median */
 function findPeaks(f, amp, { fMin = 10, fMax = Infinity, maxPeaks = 6 } = {}) {
@@ -82,22 +121,45 @@ function harmonicFamily(peaks) {
   return best;
 }
 
-function analyzeNoise(log, params, family, win) {
-  const gs = gyroSamples(log, win);
-  if (!gs) return { available: false, reason: 'No gyro data at a usable rate. For notch setup log raw gyro: set INS_RAW_LOG_OPT = 9 (H7 boards) or INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 4, then fly 1-2 minutes.' };
+
+/**
+ * Gyro noise spectrum and notch recommendation over the analysed window.
+ * opts: { air (airborne stretches, null for planes), op (notch operating point) }; computed here from the log
+ * when not given.
+ */
+function analyzeNoise(log, params, family, win, opts = {}) {
+  let { air, op } = opts;
+  const w = win && win.tStart !== null && win.tStart !== undefined ? win : null;
+  if (air === undefined) { const thr = throttleStream(log, family); air = family !== 'plane' && thr ? airborneIntervals(thr, w ? w.tStart : -Infinity, w ? w.tEnd : Infinity) : null; }
+  if (op === undefined) op = notchOperatingPoint(log, family, w || { tStart: null, tEnd: null }, air);
+  const gs = gyroSamples(log, win, air);
+  if (!gs) return { available: false, reason: 'No gyro data at a usable rate' + (air ? ' while flying' : '') + '. For notch setup log raw gyro: set INS_RAW_LOG_OPT = 9 (H7 boards) or INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 4, then fly 1-2 minutes.' };
   const fs = gs.fs;
-  const winSize = Math.min(2048, nextPow2(fs * 1));
-  const spX = psd(gs.x, fs, winSize), spY = psd(gs.y, fs, winSize), spZ = psd(gs.z, fs, winSize);
+  const longest = gs.blocks.reduce((m, [a, b]) => Math.max(m, b - a), 0);
+  const winSize = Math.min(2048, nextPow2(fs * 1), prevPow2(longest));
+  if (winSize < 64) return { available: false, reason: `The gyro data have no unbroken stretch long enough for a spectrum (longest ${(longest / fs).toFixed(2)} s): the log has gaps or dropouts.` };
+  const spX = psd(gs.x, fs, winSize, 0.5, gs.blocks), spY = psd(gs.y, fs, winSize, 0.5, gs.blocks), spZ = psd(gs.z, fs, winSize, 0.5, gs.blocks);
   const f = Array.from(spX.f);
   const amp = f.map((_, i) => Math.sqrt((spX.amp[i] ** 2 + spY.amp[i] ** 2 + spZ.amp[i] ** 2) / 3));
-  const chain = gyroChainFromParams(params, { throttle: hoverThrottle(log, family) });
+  const chain = gyroChainFromParams(params, op);
+  const nUse = gs.blocks.reduce((s, [a, b]) => s + b - a, 0);
   const res = { available: true, source: gs.source, fs, prefilter: gs.prefilter, f: f.map(v => +v.toFixed(2)), amp: amp.map(v => +v.toPrecision(4)),
-    ampX: Array.from(spX.amp, v => +v.toPrecision(4)), ampY: Array.from(spY.amp, v => +v.toPrecision(4)), ampZ: Array.from(spZ.amp, v => +v.toPrecision(4)), chain };
+    ampX: Array.from(spX.amp, v => +v.toPrecision(4)), ampY: Array.from(spY.amp, v => +v.toPrecision(4)), ampZ: Array.from(spZ.amp, v => +v.toPrecision(4)), chain,
+    dataInfo: { seconds: nUse / fs, blocks: gs.blocks.length, longestBlockS: longest / fs, windows: spX.nWin, airborneOnly: !!air } };
   const fArr = Float64Array.from(f);
   const Hcur = C.abs(gyroChain(fArr, chain));
   res.currentFilterMag = Array.from(Hcur, v => +v.toPrecision(4));
   if (gs.prefilter) res.postCurrent = amp.map((a, i) => +(a * Hcur[i]).toPrecision(4));
   if (!gs.prefilter) res.note = 'Gyro data is post-filter (already filtered). Peaks you see here are what the controller sees. For a proper notch design, log raw gyro (INS_RAW_LOG_OPT = 9).';
+  const gyroHz = params.INS_GYRO_FILTER ?? 20;
+  // aliasing: filtered gyro sampled at the logging rate still holds what the gyro low-pass lets through above
+  // fs/2 (it is only 19 dB down at 3x its cut-off), and that folds to wrong, lower frequencies
+  if (!gs.prefilter && fs / 2 < 3 * (gyroHz > 0 ? gyroHz : 20)) {
+    res.aliasRisk = true; res.peaks = []; res.harmonics = null; res.consistency = [];
+    res.rmsBand = { pre: bandRms(f, amp, 5, Math.min(40, fs / 2)), postCurrent: null };
+    res.recommendation = `No notch recommended: the gyro data in this log are logged at only ${fs.toFixed(0)} Hz after the ${gyroHz} Hz gyro filter, which still lets through vibration above ${(fs / 2).toFixed(0)} Hz. That vibration folds down to wrong, lower frequencies (aliasing), so the peaks of this spectrum cannot be trusted. Log the gyro faster or before the filters (batch sampler INS_LOG_BAT_MASK = 1, or raw gyro logging INS_RAW_LOG_OPT = 9 on H7 boards), or use ESC telemetry RPM.`;
+    return res;
+  }
   // peaks on the analysed spectrum (pre-filter if available)
   const peaks = findPeaks(f, amp, { fMin: 8, fMax: fs * 0.48 });
   res.peaks = peaks.map(p => ({ f: +p.f.toFixed(1), amp: +p.amp.toPrecision(3), prominence: +p.prominence.toFixed(1), widthHz: +p.widthHz.toFixed(1) }));
@@ -107,19 +169,19 @@ function analyzeNoise(log, params, family, win) {
   res.rmsBand = { pre: bandRms(f, amp, 5, Math.min(40, fs / 2)), postCurrent: gs.prefilter ? bandRms(f, res.postCurrent, 5, Math.min(40, fs / 2)) : null };
   // consistency: does the peak show up in most parts of the flight? On post-filter data a single strong
   // part (a gust, a landing bump) or filter-shaped bumps can masquerade as a motor peak.
-  res.consistency = peakConsistency(gs, log, family, peaks);
+  res.consistency = peakConsistency(gs, peaks);
   const cons = res.consistency && fam ? res.consistency.find(c => Math.abs(c.f - fam.f0) < 0.01) : null;
   const unconfirmed = !gs.prefilter && fam && fam.f0 > 15 && (!cons || cons.windows < 5 || cons.share < 0.8);
   if (unconfirmed) {
     const list = (res.consistency || []).map(c => `${c.f.toFixed(1)} Hz in ${c.hits}/${c.windows} parts`).join(', ');
-    res.recommendation = `No notch recommended: the log only holds filtered gyro data (${gs.source}) and ${cons && cons.windows < 5 ? 'the flight is too short to check that the peaks repeat (' + cons.windows + ' airborne part(s) of 10 s; 5 needed)' : 'the peaks do not repeat through the flight (' + (list || 'no repeatable peak') + ')'}. A notch at the wrong frequency only adds delay. To find the motor noise properly, enable the batch sampler (INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 0: pre-filter gyro) or raw gyro logging (INS_RAW_LOG_OPT = 9 on H7 boards such as the Cube Orange+), or use ESC telemetry RPM (the notch then follows the motors directly), and fly 1-2 minutes of hover.`;
+    const short = cons && cons.windows < 5 ? (cons.windows === 0 && gs.blocks.length > 1 ? 'the gyro data have no unbroken airborne stretch of 10 s to check that the peaks repeat (the log has gaps or dropouts)' : 'the flight is too short to check that the peaks repeat (' + cons.windows + ' airborne part(s) of 10 s; 5 needed)') : null;
+    res.recommendation = `No notch recommended: the log only holds filtered gyro data (${gs.source}) and ${short || 'the peaks do not repeat through the flight (' + (list || 'no repeatable peak') + ')'}. A notch at the wrong frequency only adds delay. To find the motor noise properly, enable the batch sampler (INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 0: pre-filter gyro) or raw gyro logging (INS_RAW_LOG_OPT = 9 on H7 boards such as the Cube Orange+), or use ESC telemetry RPM (the notch then follows the motors directly), and fly 1-2 minutes of hover.`;
     res.notchUnconfirmed = { f0: +fam.f0.toFixed(1) };
   }
   // recommendation
   if (fam && fam.f0 > 15 && !unconfirmed) {
-    const thr = hoverThrottle(log, family) || 0;
-    const escRpm = escMeanRpm(log, win);
-    const rec = recommendNotch(fam, peaks, fs, params, thr, escRpm, family);
+    const thr = op.throttle || 0;
+    const rec = recommendNotch(fam, peaks, fs, params, thr, op.escRpm || null, family);
     const chainNew = Object.assign({}, chain, { notches: [rec.notchDef], gyroFilterHz: rec.gyroFilterHz });
     const Hnew = C.abs(gyroChain(fArr, chainNew));
     res.recommended = rec;
@@ -135,22 +197,20 @@ function analyzeNoise(log, params, family, win) {
 }
 
 /**
- * Split the gyro data into ~10 s parts (airborne parts only when throttle is known), find the peaks in each
- * and count, for every peak of the whole-flight spectrum, in how many parts it shows up (within 8% / 2 Hz).
+ * Cut the (airborne) gyro data into 10 s parts inside unbroken blocks, find the peaks in each and count, for
+ * every peak of the whole-flight spectrum, in how many parts it shows up (within 8% / 2 Hz).
  */
-function peakConsistency(gs, log, family, peaks) {
+function peakConsistency(gs, peaks) {
   if (!peaks || !peaks.length) return [];
   const fs = gs.fs, segN = Math.round(10 * fs), winSize = Math.min(1024, nextPow2(fs * 1));
-  const ct = family === 'vtol' && log.msgs.QTUN ? log.msgs.QTUN : log.msgs.CTUN;
-  const hov = hoverThrottle(log, family);
-  const thrAt = (() => { if (!gs.t || !ct || !ct.ThO || !hov) return null; let j = 0; return tSec => { const tu = tSec * 1e6; while (j < ct.n - 1 && ct.TimeUS[j + 1] <= tu) j++; return ct.ThO[j]; }; })();
   const parts = [];
-  for (let s0 = 0; s0 + segN <= gs.x.length; s0 += segN) {
-    if (thrAt && thrAt(gs.t[s0 + (segN >> 1)]) < 0.6 * hov) continue;   // on the ground / spooling
-    const sl = a => a.subarray(s0, s0 + segN);
-    const sx = psd(sl(gs.x), fs, winSize), sy = psd(sl(gs.y), fs, winSize), sz = psd(sl(gs.z), fs, winSize);
-    const f = Array.from(sx.f), amp = f.map((_, i) => Math.sqrt((sx.amp[i] ** 2 + sy.amp[i] ** 2 + sz.amp[i] ** 2) / 3));
-    parts.push(findPeaks(f, amp, { fMin: 8, fMax: fs * 0.48, maxPeaks: 8 }).map(p => p.f));
+  for (const [b0, b1] of gs.blocks) {
+    for (let s0 = b0; s0 + segN <= b1; s0 += segN) {
+      const sl = a => a.subarray(s0, s0 + segN);
+      const sx = psd(sl(gs.x), fs, winSize), sy = psd(sl(gs.y), fs, winSize), sz = psd(sl(gs.z), fs, winSize);
+      const f = Array.from(sx.f), amp = f.map((_, i) => Math.sqrt((sx.amp[i] ** 2 + sy.amp[i] ** 2 + sz.amp[i] ** 2) / 3));
+      parts.push(findPeaks(f, amp, { fMin: 8, fMax: fs * 0.48, maxPeaks: 8 }).map(p => p.f));
+    }
   }
   return peaks.map(p => {
     const tol = Math.max(2, 0.08 * p.f);
@@ -164,19 +224,6 @@ function bandRms(f, amp, f1, f2) { let e = 0; for (let i = 0; i < f.length; i++)
 function phaseLagAt(chain, fHz) {
   const H = gyroChain(Float64Array.from([fHz]), chain);
   return +(-Math.atan2(H.im[0], H.re[0]) * 180 / Math.PI).toFixed(1);
-}
-
-function hoverThrottle(log, family) {
-  const ct = family === 'vtol' && log.msgs.QTUN ? log.msgs.QTUN : log.msgs.CTUN;
-  if (!ct || !ct.ThO) return null;
-  const v = Array.from(ct.ThO).filter(x => x > 0.15).sort((a, b) => a - b);
-  return v.length ? v[Math.floor(v.length / 2)] : null;
-}
-
-function escMeanRpm(log, win) {
-  const e = log.msgs.ESC; if (!e || !e.RPM) return null;
-  let s = 0, c = 0; for (let i = 0; i < e.n; i++) if (e.RPM[i] > 100) { s += e.RPM[i]; c++; }
-  return c ? s / c : null;
 }
 
 /**

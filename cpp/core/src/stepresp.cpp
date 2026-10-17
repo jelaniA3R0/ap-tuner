@@ -44,7 +44,9 @@ StepResponse stepResponse(const double* target, const double* actual, std::size_
   Vec mean(stepLen, 0.0);
   int count = 0;
   Vec xr(nb), xi(nb), yr(nb), yi(nb), hr(nb), hi(nb);
-  for (std::size_t s = 0; s + windowSize <= N && count < opt.maxWindows; s += step) {
+  const Blocks all{{0, N}};
+  for (const auto& [b0, b1] : opt.blocks ? *opt.blocks : all)
+  for (std::size_t s = b0; s + windowSize <= std::min(b1, N) && count < opt.maxWindows; s += step) {
     double peak = 0;
     for (std::size_t i = 0; i < windowSize; i++) {
       const double a = std::fabs(target[s + i]);
@@ -90,18 +92,34 @@ std::optional<StepMetrics> stepMetrics(const Vec& t, const Vec& y) {
   if (y.empty()) return std::nullopt;
   const double nan = std::numeric_limits<double>::quiet_NaN();
   const std::size_t n = y.size();
-  const std::size_t tailStart = static_cast<std::size_t>(std::floor(static_cast<double>(n) * 0.7));
-  double sum = 0;
-  for (std::size_t i = tailStart; i < n; i++) sum += y[i];
-  double finalV = sum / static_cast<double>(n - tailStart);
-  if (finalV == 0 || std::isnan(finalV)) finalV = 1;   // JS: (...) || 1
+  const std::size_t k0 = static_cast<std::size_t>(std::floor(static_cast<double>(n) * 0.7));
+  auto mean = [&](std::size_t a, std::size_t b) {
+    double s = 0;
+    for (std::size_t i = a; i < b; i++) s += y[i];
+    return s / static_cast<double>(b - a);
+  };
+  const std::size_t tl = n - k0;
+  const double finalV = mean(k0, n);
   double peak = -std::numeric_limits<double>::infinity();
-  for (double v : y) peak = std::max(peak, v);   // Math.max(...y) (a NaN in y would make it NaN)
-  for (double v : y)
-    if (std::isnan(v)) peak = nan;
+  for (double v : y) peak = v > peak || std::isnan(v) ? v : peak;
+  const std::size_t third = std::max<std::size_t>(1, tl / 3);
+  const double drift = std::fabs(mean(n - third, n) - mean(k0, k0 + third));
+  double spread = 0;
+  for (std::size_t i = k0; i < n; i++) spread = std::max(spread, std::fabs(y[i] - finalV));
+  const bool settled = std::isfinite(finalV) && std::fabs(finalV) > 0.05 && drift <= 0.02 * std::fabs(finalV) &&
+                       spread <= 0.05 * std::fabs(finalV);
   StepMetrics m;
-  m.finalValue = finalV;
   m.peak = peak;
+  if (!settled) {
+    m.finalValue = std::isfinite(finalV) ? finalV : nan;
+    m.overshootPct = nan;
+    m.riseTime = nan;
+    m.settlingTime = nan;
+    m.oscillations = 0;
+    m.settled = false;
+    return m;
+  }
+  m.finalValue = finalV;
   m.overshootPct = finalV > 0 ? std::max(0.0, (peak - finalV) / finalV * 100) : 0;
   auto timeAt = [&](double frac) {
     for (std::size_t i = 0; i < n; i++)

@@ -99,8 +99,18 @@ function fitPlant(freqs, H, coh, { cohMin = null, nWin = 0, fMin = 0.3, fMax = 4
   const x = best.x;
   const p = { K: Math.exp(x[0]), a: Math.exp(x[1]), tau: Math.exp(x[2]), Td: Math.min(fixedTdMax, Math.max(0, x[3])) };
   p.cost = best.f; p.nBins = idx.length; p.fitBand = [fsub[0], fsub[fsub.length - 1]];
-  // fit quality: 1 at zero cost, ~0.5 at cost 0.3 (≈ 30% magnitude / 20° phase errors)
-  p.fitQuality = 1 / (1 + best.f / 0.3);
+  // fit quality from the weighted mean error (divided by the sum of the weights, so the same misfit gives the
+  // same quality whatever the coherence; dividing by the number of bins made low-coherence fits look better):
+  // 1 at zero error, ~0.5 at 0.3 (≈ 30% magnitude / 20° phase errors)
+  const G = evalPlant(fsub, p);
+  let e = 0, w = 0;
+  for (let k = 0; k < idx.length; k++) {
+    const em = Math.log(Math.hypot(G.re[k], G.im[k]) / (mag[k] || 1e-9));
+    let ep = Math.atan2(G.im[k], G.re[k]) - ph[k]; ep = Math.atan2(Math.sin(ep), Math.cos(ep));
+    e += wgt[k] * (em * em + 2 * ep * ep); w += wgt[k];
+  }
+  p.misfit = w > 0 ? e / w : Infinity;
+  p.fitQuality = 1 / (1 + p.misfit / 0.3);
   p.dcGain = p.K / p.a;              // deg/s per unit u in steady state
   p.bandwidthHz = Math.min(p.a, 1 / p.tau) / (2 * Math.PI);
   return p;

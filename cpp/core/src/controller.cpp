@@ -33,12 +33,21 @@ CVec biquad(const Vec& freqs, double fs, double b0, double b1, double b2, double
   return cx::div(num, den);
 }
 
+double notchQ(double center, double bw) {
+  const double octaves = std::log2(center / (center - bw / 2)) * 2;
+  return std::sqrt(std::pow(2.0, octaves)) / (std::pow(2.0, octaves) - 1);
+}
+
 CVec notch(const Vec& freqs, double fs, double center, double bw, double attDb) {
   const std::size_t n = freqs.size();
   if (!(center > 0.5 * bw) || !(center < 0.5 * fs)) return cx::one(n);
+  return notchAQ(freqs, fs, center, notchQ(center, bw), attDb);
+}
+
+CVec notchAQ(const Vec& freqs, double fs, double center, double Q, double attDb) {
+  const std::size_t n = freqs.size();
+  if (!(center > 0) || !(center < 0.5 * fs) || !(Q > 0)) return cx::one(n);
   const double A = std::pow(10.0, -attDb / 40);
-  const double octaves = std::log2(center / (center - bw / 2)) * 2;
-  const double Q = std::sqrt(std::pow(2.0, octaves)) / (std::pow(2.0, octaves) - 1);
   const double omega = 2 * kPi * center / fs, alpha = std::sin(omega) / (2 * Q);
   const double b0 = 1 + alpha * A * A, b1 = -2 * std::cos(omega), b2 = 1 - alpha * A * A;
   const double a0 = 1 + alpha, a1 = b1, a2 = 1 - alpha;
@@ -49,20 +58,23 @@ CVec harmonicNotch(const Vec& freqs, double fs, const NotchDef& nd) {
   CVec H = cx::one(freqs.size());
   if (!nd.enable || !(nd.freq > 0)) return H;
   const int composite = (nd.opts & 1) ? 2 : (nd.opts & 16) ? 3 : 1;
+  // the firmware fixes Q and the spread of double / triple notches from the configured FREQ / BW
+  const double f0 = nd.refFreq > 0 ? nd.refFreq : nd.freq, b0 = nd.refFreq > 0 && nd.refBw > 0 ? nd.refBw : nd.bw;
+  if (!(f0 > 0.5 * b0 / composite)) return H;
+  const double Q = notchQ(f0, b0 / composite), spread = b0 / (32 * f0);
   for (int h = 0; h < 8; h++) {
     if (!(nd.hmncs & (1 << h))) continue;
     const double mul = h + 1;
     double center = nd.freq * mul;
     const double bwh = nd.bw * mul;
     const double nyq = fs * 0.48, bwl = bwh * 0.52;
-    const double spread = bwh / (32 * center);
     center = std::min(std::max(center, bwl), nyq);
     for (int c = 0; c < nd.chained; c++) {
-      if (composite != 2 && center < nyq) H = cx::mul(H, notch(freqs, fs, center, bwh / composite, nd.att));
+      if (composite != 2 && center < nyq) H = cx::mul(H, notchAQ(freqs, fs, center, Q, nd.att));
       if (composite > 1) {
         const double lo = center * (1 - spread), hi = center * (1 + spread);
-        if (lo < nyq) H = cx::mul(H, notch(freqs, fs, lo, bwh / composite, nd.att));
-        if (hi < nyq) H = cx::mul(H, notch(freqs, fs, hi, bwh / composite, nd.att));
+        if (lo < nyq) H = cx::mul(H, notchAQ(freqs, fs, lo, Q, nd.att));
+        if (hi < nyq) H = cx::mul(H, notchAQ(freqs, fs, hi, Q, nd.att));
       }
     }
   }
@@ -71,15 +83,16 @@ CVec harmonicNotch(const Vec& freqs, double fs, const NotchDef& nd) {
 
 double notchBaseFreq(const NotchParams& p, const NotchOp& op) {
   const int mode = p.mode;
-  const double refOr1 = p.ref != 0 && !std::isnan(p.ref) ? p.ref : 1;   // JS: (p.ref || 1)
-  if (mode == 0) return p.freq;
+  if (mode == 0 || !(p.ref > 0)) return p.freq;
+  const double fmRat = p.fmRat.value_or(1.0), floor = p.freq * fmRat;
   if (mode == 1) {
     const double thr = std::max(0.0, op.throttle.has_value() ? *op.throttle : p.ref);
-    return p.freq * std::max(p.fmRat.value_or(1.0), std::sqrt(thr / refOr1));
+    return p.freq * std::max(fmRat, std::sqrt(thr / p.ref));
   }
-  if (mode == 2 || mode == 5) return std::max(op.rpm / 60, p.freq) * refOr1;
-  if (mode == 3) return std::max(op.escRpm / 60, p.freq) * refOr1;
-  if (mode == 4) return std::max(op.fftHz != 0 ? op.fftHz : p.freq, p.freq) * refOr1;
+  if (mode == 2) return op.rpm > 0 ? std::max(floor, op.rpm / 60 * p.ref) : floor;
+  if (mode == 5) return op.rpm2 > 0 ? std::max(floor, op.rpm2 / 60 * p.ref) : floor;
+  if (mode == 3) return op.escRpm > 0 ? std::max(floor, op.escRpm / 60 * p.ref) : floor;
+  if (mode == 4) return op.fftHz > 0 ? std::max(floor, op.fftHz) : floor;
   return p.freq;
 }
 
