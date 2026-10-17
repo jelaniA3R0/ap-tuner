@@ -12,6 +12,9 @@ add_library(aptuner_app STATIC
 )
 target_include_directories(aptuner_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aptuner_app PUBLIC aptuner_io)
+if(WIN32)
+  target_link_libraries(aptuner_app PUBLIC bcrypt)   # BCryptGenRandom: the per-run API token
+endif()
 
 add_executable(aptuner app_main.cpp)
 target_link_libraries(aptuner PRIVATE aptuner_app)

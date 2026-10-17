@@ -94,9 +94,10 @@ double LiveAxis::excitation(double seconds) const {
 Watchdog LiveAxis::watchdog(double seconds, double oscSmax, double bandRmsDegs, double dmodMinLim, std::optional<double> since) const {
   Watchdog w;
   const double cut = since ? std::max(lastTs - seconds, *since) : lastTs - seconds;
+  // Dmod <= 0 means the PID_TUNING extension fields are missing (they decode as 0): no slew-limiter information
   for (std::size_t k = t.size(); k-- > 0 && t[k] >= cut;) {
     if (srate[k] > w.srateMax) w.srateMax = srate[k];
-    if (dmod[k] < w.dmodMin) w.dmodMin = dmod[k];
+    if (dmod[k] > 0 && dmod[k] < w.dmodMin) w.dmodMin = dmod[k];
     w.samples++;
   }
   if (w.srateMax > oscSmax) w.reasons.push_back("slew rate " + core::jsToFixed(w.srateMax, 1) + " > " + core::jsToString(oscSmax));
@@ -129,6 +130,29 @@ Watchdog LiveAxis::watchdog(double seconds, double oscSmax, double bandRmsDegs, 
 void LiveAxis::setBaseline() {
   const Watchdog w = watchdog(5, 1e9, 1e9, -1);
   baselineOsc = (w.bandRms != 0 && !std::isnan(w.bandRms)) ? w.bandRms : 0.5;   // JS: w.bandRms || 0.5
+}
+
+SlewStats LiveAxis::slewStats(double seconds, double oscSmax, double dmodMinLim, std::optional<double> since, std::optional<double> now) const {
+  SlewStats s;
+  double cut = (now ? *now : lastTs) - seconds;
+  if (since && *since > cut) cut = *since;
+  for (std::size_t i = t.size(); i-- > 0 && t[i] >= cut;) {
+    const double ti = t[i], sr = srate[i], dm = dmod[i];
+    if (now && ti > *now) continue;
+    s.n++;
+    if (std::isnan(s.last)) s.last = ti;
+    s.first = ti;
+    if (!(dm > 0)) s.noSlew++;
+    if (sr > s.srateMax) s.srateMax = sr;
+    if (dm > 0 && dm < s.dmodMin) s.dmodMin = dm;
+    if (sr > oscSmax || (dm > 0 && dm < dmodMinLim)) {
+      s.bad++;
+      if (std::isnan(s.badLast)) s.badLast = ti;
+      s.badFirst = ti;
+    }
+  }
+  s.frac = s.n ? static_cast<double>(s.bad) / s.n : 0;
+  return s;
 }
 
 }  // namespace aptuner::app

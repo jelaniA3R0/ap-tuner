@@ -40,4 +40,7 @@ inline std::string pathStr(const std::filesystem::path& p) { const auto u = p.u8
 std::string readText(const std::string& path);
 bool writeText(const std::string& path, const std::string& data);
 
+/** `bytes` random bytes from the operating system's cryptographic generator, as lower-case hex */
+std::string randomHex(std::size_t bytes);
+
 }  // namespace aptuner::app

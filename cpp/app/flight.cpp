@@ -51,7 +51,10 @@ const std::vector<std::string>& goodModes(const std::string& family) {
   return kCopterModes;   // copter, heli and unknown
 }
 
-FlightSession::FlightSession(io::Link& link, Tuner& tuner, NotchLive& notch) : link_(link), tuner_(tuner), notch_(notch) { reset(); }
+FlightSession::FlightSession(io::Link& link, Tuner& tuner, NotchLive& notch) : link_(link), tuner_(tuner), notch_(notch) {
+  reset();
+  tuner_.on("trip", [this](const Json& t) { onTrip(t); });
+}
 
 void FlightSession::reset() {
   phase_ = "idle";
@@ -65,8 +68,24 @@ void FlightSession::reset() {
   gainsStart_ = Json();
   journalStart_ = 0;
   tFlying_ = 0;
+  tripPause_ = false;
   if (timer_) Loop::main().clear(timer_);
   timer_ = 0;
+}
+
+bool FlightSession::inFlight() const { return tuner_.opts["inFlightWrites"].asBool(); }
+
+void FlightSession::onTrip(const Json& t) {
+  if (!kRunning.count(phase_)) return;
+  std::string text;
+  for (const auto& r : t["reasons"].arr()) text += (text.empty() ? "" : "; ") + r.strOr("");
+  if (phase_ == "land") {
+    note("bad", "oscillation while landing: " + text);
+    return;
+  }
+  note("bad", "oscillation: " + text);
+  tripPause_ = true;
+  pauseFlight("oscillation: " + text);
 }
 
 std::string FlightSession::family() const { return tuner_.family ? core::familyName(*tuner_.family) : ""; }
@@ -98,11 +117,14 @@ Json FlightSession::gainsNow() const { return tuner_.snapshot()["gains"]; }
 void FlightSession::start(const Json& opts) {
   if (!tuner_.prepared) throw rt::Error("read the vehicle first");
   if (kRunning.count(phase_)) throw rt::Error("a flight session is already running");
+  if (opts["auto"].asBool() && !inFlight())
+    throw rt::Error("\"Apply by itself\" writes in flight: turn on \"Allow changes in flight\" first (experimental, tested only in the simulator)");
   reset();
   for (const auto& [k, v] : opts.items()) opts_.set(k, v);
   tuner_.opts.set("axes", opts_["axes"]);
   tuner_.opts.set("preset", opts_["preset"]);
   tuner_.opts.set("autoApply", true);
+  tuner_.beginSession();
   gainsStart_ = gainsNow();
   journalStart_ = tuner_.journal.size();
   setPhase("preflight", "arm, take off and hover at a safe height");
@@ -120,6 +142,18 @@ void FlightSession::cont() {
   if (phase_ == "review") {
     if (!checkup_.isObject() || !checkup_["summary"]["anyProposal"].asBool())
       throw rt::Error("nothing to apply yet: repeat the check-up with sharper stick taps");
+    if (!inFlight()) {
+      // nothing may be written in flight: the check-up is the result (apply it on the ground), or the final check
+      if (checkup_["summary"]["changes"].numOr(0) != 0) {
+        note("warn", "changes in flight are off, so nothing was written: land, then apply the proposals on the ground (Advanced view) or use the Telemetry + USB tab");
+        finish("check-up only: changes in flight are off");
+        return;
+      }
+      filters_ = Json::obj({{"done", true}, {"result", "off"}});
+      note("warn", "changes in flight are off: the filter step is skipped");
+      startOverall();
+      return;
+    }
     startTuning();
     return;
   }
@@ -150,8 +184,10 @@ void FlightSession::resume() {
     if (tuner_.state == "paused") tuner_.resume();
     return;
   }
+  if (!tuner_.writing().empty()) throw rt::Error("the app is still reverting (" + tuner_.writing() + "): wait until it has finished");
   const std::string p = resumePhase_.empty() ? "checkup" : resumePhase_;
   pausedInfo_ = Json();
+  tripPause_ = false;
   if (p == "tuning" || p == "recheck") {
     setPhase(p, "continuing");
     tuner_.resume();
@@ -216,6 +252,7 @@ rt::Task<void> FlightSession::step() {
         tuner_.opts.set("axes", opts_["axes"]);
         tuner_.opts.set("preset", opts_["preset"]);
         tuner_.opts.set("autoApply", true);
+        tuner_.beginSession();   // the values to go back to are those of the controller now flown
         gainsStart_ = gainsNow();
         note("ok", "QuadPlane in " + modeName + ": tuning the " + (want == "vtol" ? "hover (Q_A_*)" : "fixed-wing") + " gains");
         co_return;
@@ -327,12 +364,26 @@ rt::Task<void> FlightSession::step() {
     co_return;
   }
   if (phase_ == "filters") {
-    // after the filter step the gains are always checked again (all chosen axes), filter changed or not
-    if (filters_.isObject() && filters_["done"].asBool()) startRecheck();
+    // after the filter step the gains are always checked again (all chosen axes), filter changed or not;
+    // without in-flight changes there is nothing to re-tune: straight to the final check
+    if (filters_.isObject() && filters_["done"].asBool()) {
+      if (!inFlight())
+        startOverall();
+      else
+        startRecheck();
+    }
     co_return;
   }
   if (phase_ == "land") {
     if (!armed) finish("landed");
+    co_return;
+  }
+  if (phase_ == "paused") {
+    // after a trip the tuner's message says what was reverted and what to do next
+    if (tripPause_ && tuner_.state == "paused") {
+      pausedInfo_ = tuner_.stateInfo;
+      info_ = tuner_.stateInfo;
+    }
     co_return;
   }
 }
@@ -346,7 +397,7 @@ void FlightSession::startTuning() {
 rt::Task<void> FlightSession::startFilters() {
   setPhase("filters", "checking the notch filter options");
   filters_ = Json::obj({{"started", Loop::now()}, {"done", false}});
-  std::string failed;
+  std::string failed, failedCode;
   try {
     const Json st = co_await notch_.status();
     filters_.set("status", Json::obj({{"notchActive", st["notchActive"]}, {"mode", st["mode"]}, {"esc", st["escTelemetry"]}, {"fft", st["fftCapable"]},
@@ -354,7 +405,11 @@ rt::Task<void> FlightSession::startFilters() {
     if (st["notchActive"].asBool()) {
       filters_.set("result", "kept");
       note("ok", "notch filter already configured (mode " + core::jsToString(st["mode"].numOr(0)) + ", " + fmt4(st["current"]["INS_HNTCH_FREQ"]) + " Hz): kept");
+    } else if (!inFlight()) {
+      filters_.set("result", "off");
+      note("warn", "changes in flight are off: the notch filter was not changed (set it on the ground, from a log)");
     } else if (st["escProposal"].isObject()) {
+      info_ = "setting the notch to the ESC RPM; every axis is watched for oscillation for a few seconds";
       const Json a = co_await notch_.applyEsc();
       filters_.set("result", "esc");
       filters_.set("applied", a);
@@ -368,25 +423,32 @@ rt::Task<void> FlightSession::startFilters() {
     } else if (st["fftCapable"].asBool() && st["fftEnabled"].asBool() && link_.vehicle()["armed"].asBool()) {
       info_ = "measuring the motor noise with the autopilot FFT: hold a steady hover for 30 s, sticks centred";
       co_await notch_.startFftTune();
-      co_await rt::sleep(30000);
+      // 30 s of measuring; a pause, stop or trip ends it early (the tune is stopped either way)
+      for (int i = 0; i < 120 && phase_ == "filters" && tuner_.state != "paused"; i++) co_await rt::sleep(250);
       const Json r = co_await notch_.stopFftTune();
       const bool ok = r["ok"].asBool();
-      filters_.set("result", ok ? "fft" : "none");
+      const bool reverted = r["held"].isBool() && !r["held"].asBool();
+      filters_.set("result", ok ? "fft" : reverted ? "reverted" : "none");
       filters_.set("applied", r["changed"]);
       note(ok ? "ok" : "warn", ok ? "the autopilot measured its motor noise and wrote the notch filter"
-                                  : "the FFT measurement wrote nothing (it needs a steadier hover): set the notch from a log after landing");
+                               : reverted ? "the notch the autopilot wrote made the vehicle oscillate and was reverted"
+                                          : "the FFT measurement wrote nothing (it needs a steadier hover): set the notch from a log after landing");
     } else {
       filters_.set("result", "none");
       note("warn", st["fftCapable"].asBool()
                        ? "no ESC RPM telemetry, and the autopilot FFT is off (enable it and reboot on the ground): set the notch from a log after landing"
                        : "no in-flight route for the notch on this autopilot (no ESC RPM, no FFT): set it from a log after landing");
     }
+  } catch (const rt::Error& e) {
+    failed = e.what();
+    failedCode = e.code();
   } catch (const std::exception& e) {
     failed = e.what();
   }
   if (!failed.empty()) {
-    filters_.set("result", "none");
-    note("warn", "filter step failed: " + failed);
+    const bool reverted = failedCode == "reverted";
+    filters_.set("result", reverted ? "reverted" : "none");
+    note(reverted ? "bad" : "warn", (reverted ? "" : "filter step failed: ") + failed);
   }
   filters_.set("done", true);
 }
@@ -561,6 +623,7 @@ Json FlightSession::snapshot() const {
                     {"armed", v.isObject() && v["armed"].asBool()},
                     {"modeOk", modeOk()},
                     {"goodModes", goodModesText()},
+                    {"inFlight", inFlight()},
                     {"pausedInfo", pausedInfo_},
                     {"resumePhase", resumePhase_.empty() ? Json() : Json(resumePhase_)},
                     {"checkup", block(checkup_)},

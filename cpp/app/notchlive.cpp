@@ -102,17 +102,20 @@ rt::Task<Json> NotchLive::status() {
 rt::Task<Json> NotchLive::applyEsc() {
   const Json st = co_await status();
   if (!st["escProposal"].isObject()) throw rt::Error("no ESC RPM telemetry seen in the last 20 s");
-  for (const auto& [k, v] : st["escProposal"].items())
-    if (!(tuner_.params[k] == v)) co_await tuner_.setParam(k, v.num(), "notch: ESC RPM tracking");
+  // in flight: watched on every axis and reverted if the vehicle starts to oscillate
+  const bool held = co_await tuner_.applyFilterChange(st["escProposal"], "notch: ESC RPM tracking");
+  if (!held) throw rt::Error("the notch was not kept: " + (tuner_.stateInfo.empty() ? std::string("see the messages") : tuner_.stateInfo), "reverted");
   co_return st["escProposal"];
 }
 
 rt::Task<Json> NotchLive::enableFft() {
-  const double v = co_await tuner_.setParam("FFT_ENABLE", 1, "notch: enable in-flight FFT");
-  co_return Json::obj({{"FFT_ENABLE", v}, {"rebootNeeded", true}});
+  const bool held = co_await tuner_.applyFilterChange(Json::obj({{"FFT_ENABLE", 1}}), "notch: enable in-flight FFT");
+  if (!held) throw rt::Error("FFT_ENABLE was not kept: " + (tuner_.stateInfo.empty() ? std::string("see the messages") : tuner_.stateInfo), "reverted");
+  co_return Json::obj({{"FFT_ENABLE", tuner_.params["FFT_ENABLE"]}, {"rebootNeeded", true}});
 }
 
 rt::Task<Json> NotchLive::reboot() {
+  if (!link_.alive()) throw rt::Error("no vehicle heartbeat: connect first");
   if (link_.vehicle()["armed"].asBool()) throw rt::Error("refusing to reboot an armed vehicle");
   Json r;
   try {
@@ -127,8 +130,11 @@ rt::Task<Json> NotchLive::startFftTune() {
   if (!link_.vehicle()["armed"].asBool()) throw rt::Error("the vehicle must be flying (armed, steady hover)");
   const Json st = co_await status();
   if (!st["fftEnabled"].asBool()) throw rt::Error("FFT_ENABLE is 0: enable it and reboot first");
-  if (st["mode"].numOr(0) != 1) co_await tuner_.setParam("INS_HNTCH_MODE", 1, "notch: throttle tracking mode for the FFT tune");
-  if (!(jv(tuner_.params, "INS_HNTCH_ENABLE") > 0)) co_await tuner_.setParam("INS_HNTCH_ENABLE", 1, "notch: enable");
+  Json want = Json::object();
+  if (!(jv(tuner_.params, "INS_HNTCH_ENABLE") > 0)) want.set("INS_HNTCH_ENABLE", 1);
+  if (st["mode"].numOr(0) != 1) want.set("INS_HNTCH_MODE", 1);
+  if (want.size() && !(co_await tuner_.applyFilterChange(want, "notch: throttle tracking for the FFT tune")))
+    throw rt::Error("the notch was not kept: " + (tuner_.stateInfo.empty() ? std::string("see the messages") : tuner_.stateInfo), "reverted");
   fftMessages_ = Json::array();
   Json r;
   try {
@@ -158,16 +164,19 @@ rt::Task<Json> NotchLive::stopFftTune() {
   for (const auto& k : kNotchParams)
     if (got[k].isNumber() && !(got[k] == before[k])) changed.set(k, Json::obj({{"from", before[k]}, {"to", got[k]}}));
   for (const auto& [k, c] : changed.items())
-    tuner_.journal.push(Json::obj({{"t", Loop::now()}, {"name", k}, {"from", c["from"]}, {"to", c["to"]}, {"reason", "written by the autopilot FFT notch tune"}}));
+    tuner_.journal.push(Json::obj({{"t", Loop::now()}, {"name", k}, {"from", c["from"]}, {"to", c["to"]}, {"reason", "written by the autopilot FFT notch tune"},
+                                   {"armed", link_.vehicle()["armed"].asBool()}}));
   tuner_.saveSession();
   const Json msgs = lastN(fftMessages_, 8);
   tune_ = Json::obj({{"done", true}, {"result", r["result"]}, {"changed", changed}, {"messages", msgs}});
+  // what the autopilot wrote in flight is watched like the app's own changes (reverted on a trip)
+  const bool held = co_await tuner_.watchExternalChange(changed, "written by the autopilot FFT notch tune");
   bool selected = false;
   for (const auto& m : fftMessages_.arr())
     if (m["text"].strOr("").find("selected") != std::string::npos) selected = true;
   Json current = Json::object();
   for (const auto& k : kNotchParams) current.set(k, tuner_.params[k]);
-  co_return Json::obj({{"ok", changed.size() > 0 || selected}, {"changed", changed}, {"messages", msgs}, {"current", current}});
+  co_return Json::obj({{"ok", held && (changed.size() > 0 || selected)}, {"held", held}, {"changed", changed}, {"messages", msgs}, {"current", current}});
 }
 
 }  // namespace aptuner::app

@@ -296,7 +296,6 @@ test('f44_revert_fails_then_session_start_restored', async () => {
     propose(S.tuner, 'pitch', { P: 0.21, I: 0.21 });
     // this step starts an oscillation that a revert of the step alone does not stop (only P <= 0.15 is calm)
     S.fv.onSet = (name, v) => { if (name === 'ATC_RAT_PIT_P') S.fv.slew.pitch = v > 0.15 ? 9 : 0.5; };
-    S.tuner.state = 'proposed';
     const ok = await S.tuner.applyProposal('pitch');
     assert.strictEqual(ok, false);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_PIT_P - 0.135) < 1e-6, 'escalated to the session start values');

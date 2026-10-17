@@ -27,7 +27,7 @@ class FlightSession extends EventEmitter {
     this.phase = 'idle'; this.since = Date.now(); this.info = '';
     this.opts = { axes: ['roll', 'pitch'], preset: 'normal', auto: false, observeSeconds: 30 };
     this.checkup = null; this.filters = null; this.overall = null; this.summary = null; this.notes = [];
-    this.pausedInfo = null; this.resumePhase = null; this.gainsStart = null; this.journalStart = 0; this._tFlying = 0;
+    this.pausedInfo = null; this.resumePhase = null; this.gainsStart = null; this.journalStart = 0; this._tFlying = 0; this._tripPause = false;
     if (this._timer) clearTimeout(this._timer); this._timer = null;
   }
 

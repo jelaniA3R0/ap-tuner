@@ -5,8 +5,14 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 #include "aptuner/core/jsnum.hpp"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 namespace aptuner::app {
 
@@ -104,6 +110,25 @@ bool writeText(const std::string& path, const std::string& data) {
   if (!f) return false;
   f << data;
   return static_cast<bool>(f);
+}
+
+std::string randomHex(std::size_t bytes) {
+  std::string raw(bytes, 0);
+#ifdef _WIN32
+  if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(raw.data()), static_cast<ULONG>(raw.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+    throw std::runtime_error("no random numbers from the system");
+#else
+  std::ifstream f("/dev/urandom", std::ios::binary);
+  if (!f.read(raw.data(), static_cast<std::streamsize>(raw.size()))) throw std::runtime_error("no random numbers from the system");
+#endif
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  for (const char c : raw) {
+    const auto b = static_cast<unsigned char>(c);
+    out += hex[b >> 4];
+    out += hex[b & 15];
+  }
+  return out;
 }
 
 }  // namespace aptuner::app

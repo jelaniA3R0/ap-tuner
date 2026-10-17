@@ -1,6 +1,7 @@
 #include "server.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -92,6 +93,10 @@ bool processAlive(std::intptr_t handle) {
 #endif
 }
 
+const char* const kPageCsp =
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+    "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 namespace {
 
 const std::map<std::string, std::string> kMime{{".html", "text/html; charset=utf-8"}, {".js", "text/javascript"}, {".css", "text/css"},
@@ -102,8 +107,56 @@ HttpResponse jsonResp(int code, const Json& j) {
   HttpResponse r;
   r.status = code;
   r.body = j.dump();
+  r.headers.push_back({"X-Content-Type-Options", "nosniff"});
   return r;
 }
+
+// API routes that only read: GET, no token. Everything else under /api/ changes state: POST + token.
+const std::set<std::string> kReadRoutes{"/api/events", "/api/ports", "/api/presets", "/api/notch/status", "/api/live/rows", "/api/live/param",
+                                        "/api/log/list", "/api/log/param", "/api/ground/result", "/api/ground/state", "/api/ground/file"};
+
+std::string lower(std::string s) {
+  std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return s;
+}
+
+/** constant-time comparison (the time does not tell how much of a guessed token was right) */
+bool sameToken(const std::string& a, const std::string& b) {
+  if (a.size() != b.size() || b.empty()) return false;
+  unsigned char d = 0;
+  for (std::size_t i = 0; i < a.size(); i++) d = static_cast<unsigned char>(d | (static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i])));
+  return d == 0;
+}
+}  // namespace
+
+std::optional<HttpResponse> gateRequest(const HttpRequest& req, int port, const std::string& token) {
+  const std::string p = std::to_string(port);
+  const std::string host = lower(req.header("host"));
+  if (host != "127.0.0.1:" + p && host != "localhost:" + p) return jsonResp(403, Json::obj({{"error", "forbidden: unknown Host"}}));
+  if (req.headers.count("origin")) {
+    const std::string origin = lower(req.header("origin"));
+    if (origin != "http://127.0.0.1:" + p && origin != "http://localhost:" + p) return jsonResp(403, Json::obj({{"error", "forbidden: request from another site"}}));
+  }
+  if (req.header("sec-fetch-site") == "cross-site") return jsonResp(403, Json::obj({{"error", "forbidden: request from another site"}}));
+  if (req.path.rfind("/api/", 0) != 0) return std::nullopt;
+  const bool write = !kReadRoutes.count(req.path) || (req.path == "/api/log/param" && req.param("save") == "1");
+  if (!write) {
+    if (req.method == "GET" || req.method == "HEAD") return std::nullopt;
+    HttpResponse r = jsonResp(405, Json::obj({{"error", "use GET"}}));
+    r.headers.push_back({"Allow", "GET"});
+    return r;
+  }
+  if (req.method != "POST") {
+    HttpResponse r = jsonResp(405, Json::obj({{"error", "this request changes something: it must be a POST"}}));
+    r.headers.push_back({"Allow", "POST"});
+    return r;
+  }
+  if (!sameToken(req.header("x-aptuner-token"), token))
+    return jsonResp(403, Json::obj({{"error", "missing or wrong app token: reload the page (the app may have been restarted)"}}));
+  return std::nullopt;
+}
+
+namespace {
 
 Json listLogs(const std::string& sessions) {
   std::vector<fs::path> dirs{fs::path("D:\\")};
@@ -179,6 +232,7 @@ Json sanitizeOpts(const Json& b) {
   if (b.has("allowRamp")) o.set("allowRamp", b["allowRamp"].asBool());
   if (b["stepMax"].numOr(0) != 0) o.set("stepMax", std::max(1.1, std::min(2.0, b["stepMax"].numOr(1.5))));
   if (b["watchSeconds"].numOr(0) != 0) o.set("watchSeconds", std::max(2.0, std::min(15.0, b["watchSeconds"].numOr(4))));
+  if (b.has("inFlightWrites")) o.set("inFlightWrites", b["inFlightWrites"].isBool() && b["inFlightWrites"].asBool());
   return o;
 }
 
@@ -186,7 +240,7 @@ Json sanitizeOpts(const Json& b) {
 class App {
  public:
   explicit App(const AppOptions& o)
-      : opts_(o), tuner(link, pathStr(fsPath(o.sessionsDir))), notch(link, tuner), flight(link, tuner, notch), ground(link, o.sessionsDir) {
+      : opts_(o), token_(randomHex(24)), tuner(link, pathStr(fsPath(o.sessionsDir))), notch(link, tuner), flight(link, tuner, notch), ground(link, o.sessionsDir) {
     link.on("status", [this](const Json& s) { tuner.log("link", s.strOr("")); });
     tuner.on("log", [this](const Json& e) { hub.publish("log", e.dump()); });
     tuner.on("state", [this](const Json& s) { hub.publish("state", s.dump()); });
@@ -199,6 +253,15 @@ class App {
 
   void startTimers() {
     Loop::main().setInterval(250, [this] { publishSnapshot(); });
+    tuner.startMonitor();
+  }
+
+  /** the tuner options from a request; turning the in-flight opt-in on or off is logged */
+  void setOpts(const Json& body) {
+    const Json o = sanitizeOpts(body);
+    if (o.has("inFlightWrites") && o["inFlightWrites"].asBool() != tuner.opts["inFlightWrites"].asBool())
+      tuner.log("tuner", o["inFlightWrites"].asBool() ? "changes in flight turned ON (experimental, tested only in the simulator)" : "changes in flight turned off");
+    for (const auto& [k, v] : o.items()) tuner.opts.set(k, v);
   }
 
   void publishSnapshot() {
@@ -310,7 +373,7 @@ class App {
       co_return jsonResp(200, j);
     }
     if (path == "/api/start" || path == "/api/options") {
-      for (const auto& [k, v] : sanitizeOpts(body).items()) tuner.opts.set(k, v);
+      setOpts(body);
       if (path == "/api/start") tuner.start();
       co_return ok(Json::obj({{"opts", tuner.opts}}));
     }
@@ -343,11 +406,7 @@ class App {
       const std::string ax = body["axis"].isString() ? body["axis"].str() : tuner.currentAxis();
       co_return jsonResp(200, tuner.analyze(ax, body["seconds"].numOr(0)));
     }
-    if (path == "/api/setparam") {
-      if (!body["name"].isString()) co_return jsonResp(400, Json::obj({{"error", "name"}}));
-      const double v = co_await tuner.setParam(body["name"].str(), body["value"].numOr(std::nan("")), "manual");
-      co_return ok(Json::obj({{"value", v}}));
-    }
+    // (no /api/setparam: arbitrary parameter writes are not offered, F-05)
     if (path == "/api/presets") {
       Json p = Json::object();
       for (const auto& pr : core::kPresets)
@@ -362,7 +421,7 @@ class App {
     if (path == "/api/notch/fft/start") co_return ok(co_await notch.startFftTune());
     if (path == "/api/notch/fft/stop") co_return ok(co_await notch.stopFftTune());
     if (path == "/api/flight/start") {
-      for (const auto& [k, v] : sanitizeOpts(body).items()) tuner.opts.set(k, v);
+      setOpts(body);
       flight.start(Json::obj({{"axes", tuner.opts["axes"]}, {"preset", tuner.opts["preset"]}, {"auto", body["auto"].asBool()},
                               {"observeSeconds", tuner.opts["observeSeconds"]}}));
       co_return ok(Json::obj({{"flight", flight.snapshot()}}));
@@ -535,6 +594,10 @@ class App {
   }
 
   void handle(const HttpRequest& req, HttpConnection& c) {
+    if (auto refused = gateRequest(req, opts_.port, token_)) {
+      c.send(*refused);
+      return;
+    }
     if (req.path == "/api/events") {
       // replay the latest analyses, as the JavaScript server did
       std::promise<std::vector<std::string>> pr;
@@ -596,12 +659,27 @@ class App {
     HttpResponse r;
     const std::string ext = pathStr(file.extension());
     r.contentType = kMime.count(ext) ? kMime.at(ext) : "application/octet-stream";
-    r.filePath = pathStr(file);
-    r.headers.push_back({"Cache-Control", "no-cache"});
+    if (ext == ".html") {
+      // the page carries this run's token (only a page served from here can read it) and a strict CSP
+      std::string html = readText(pathStr(file));
+      const std::string mark = "__APTUNER_TOKEN__";
+      const auto at = html.find(mark);
+      if (at != std::string::npos) html.replace(at, mark.size(), token_);
+      r.body = std::move(html);
+      r.headers.push_back({"Cache-Control", "no-store"});
+      r.headers.push_back({"Content-Security-Policy", kPageCsp});
+      r.headers.push_back({"X-Frame-Options", "DENY"});
+      r.headers.push_back({"Referrer-Policy", "no-referrer"});
+    } else {
+      r.filePath = pathStr(file);
+      r.headers.push_back({"Cache-Control", "no-cache"});
+    }
+    r.headers.push_back({"X-Content-Type-Options", "nosniff"});
     c.send(r);
   }
 
   AppOptions opts_;
+  std::string token_;   // per run; the app page gets it, other pages cannot read it
   io::Link link;
   Tuner tuner;
   NotchLive notch;

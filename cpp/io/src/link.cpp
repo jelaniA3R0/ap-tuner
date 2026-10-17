@@ -16,6 +16,7 @@ struct Link::ParamReq {
   int type = 9;
   double timeoutMs = 1500;
   int retries = 4;
+  std::function<bool()> keepGoing;
   rt::Promise<double> p;
 };
 
@@ -91,6 +92,21 @@ void Link::disconnect() {
   }
   connected_ = false;
   opts_ = Json();
+}
+
+void Link::attachTransport(std::unique_ptr<Transport> t, const std::string& description) {
+  disconnect();
+  opts_ = Json::obj({{"kind", "test"}});
+  generation_++;
+  serialOpened_ = false;
+  parser_ = mavlink::Parser();
+  lastHeartbeatAt_ = 0;
+  heartbeat_ = Json();
+  vehicle_ = Json();
+  description_ = description;
+  transport_ = std::move(t);
+  connected_ = true;
+  startHeartbeat();
 }
 
 void Link::startHeartbeat() {
@@ -172,6 +188,12 @@ void Link::send(const std::string& name, const Json& fields) {
 }
 
 void Link::paramAttempt(const std::shared_ptr<ParamReq>& req, int n) {
+  if (req->isSet && req->keepGoing && !req->keepGoing()) {
+    auto it = pending_.find(req->name);
+    if (it != pending_.end() && it->second.empty()) pending_.erase(it);
+    req->p.reject(req->name + " not written: cancelled", n > 0 ? "cancelled-sent" : "cancelled");
+    return;
+  }
   const std::uint64_t wid = nextWaiter_++;
   const std::uint64_t timer = Loop::main().setTimeout(req->timeoutMs, [this, req, wid, n] {
     auto it = pending_.find(req->name);
@@ -208,7 +230,7 @@ rt::Future<double> Link::requestParam(const std::string& name, double timeoutMs,
   return req->p.future();
 }
 
-rt::Future<double> Link::setParam(const std::string& name, double value, double timeoutMs, int retries) {
+rt::Future<double> Link::setParam(const std::string& name, double value, double timeoutMs, int retries, std::function<bool()> keepGoing) {
   auto req = std::make_shared<ParamReq>();
   req->name = name;
   req->isSet = true;
@@ -217,6 +239,7 @@ rt::Future<double> Link::setParam(const std::string& name, double value, double 
   req->type = known != params_.end() ? known->second.type : 9;
   req->timeoutMs = timeoutMs;
   req->retries = retries;
+  req->keepGoing = std::move(keepGoing);
   paramAttempt(req, 0);
   return req->p.future();
 }

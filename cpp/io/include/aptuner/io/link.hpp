@@ -37,6 +37,9 @@ class Link : public rt::Emitter {
   /** opts: {kind: "tcp" | "udp" | "udpin" | "serial", host, port, baud} (serial: port is the COM name) */
   void connect(const Json& opts);
   void disconnect();
+  /** a connection on a given transport (tests: a fake vehicle); bytes come in through feed() */
+  void attachTransport(std::unique_ptr<Transport> t, const std::string& description = "test transport");
+  void feed(const std::vector<std::uint8_t>& data) { rx(data); }
 
   void send(const std::string& name, const Json& fields);
   /** request one parameter; resolves to its value (rejects on timeout) */
@@ -44,8 +47,12 @@ class Link : public rt::Emitter {
   /** many parameters with a small concurrency; result: {name: value | null} */
   rt::Future<Json> requestParams(const std::vector<std::string>& names, int concurrency = 3,
                                  std::function<void(int, int)> onProgress = nullptr);
-  /** set a parameter and wait for the echo; resolves to the value the vehicle reports */
-  rt::Future<double> setParam(const std::string& name, double value, double timeoutMs = 1500, int retries = 3);
+  /** set a parameter and wait for the echo; resolves to the value the vehicle reports.
+      keepGoing (optional): checked before every PARAM_SET, retries included; when it returns false nothing more is sent
+      and the future rejects with code "cancelled" (nothing was sent) or "cancelled-sent" (an earlier attempt was sent
+      and may have reached the vehicle) */
+  rt::Future<double> setParam(const std::string& name, double value, double timeoutMs = 1500, int retries = 3,
+                              std::function<bool()> keepGoing = nullptr);
   /** MAV_CMD_SET_MESSAGE_INTERVAL (511) */
   void setMessageRate(int msgId, double hz);
   /** legacy REQUEST_DATA_STREAM (works through older firmware and the Mission Planner mirror) */

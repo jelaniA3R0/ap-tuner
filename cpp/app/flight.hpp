@@ -51,6 +51,8 @@ class FlightSession : public rt::Emitter {
   Json verdict(const Json& ov) const;
   void finish(const std::string& reason);
   Json gainsNow() const;
+  bool inFlight() const;
+  void onTrip(const Json& t);
 
   io::Link& link_;
   Tuner& tuner_;
@@ -60,6 +62,15 @@ class FlightSession : public rt::Emitter {
   Json opts_, checkup_, filters_, overall_, summary_, notes_ = Json::array(), pausedInfo_, gainsStart_;
   std::size_t journalStart_ = 0;
   std::uint64_t timer_ = 0;
+  bool tripPause_ = false;
+
+ public:
+  // test access (the JavaScript tests set these fields directly)
+  void setPhaseForTest(const std::string& p, const Json& checkup) {
+    phase_ = p;
+    checkup_ = checkup;
+  }
+  const std::string& phase() const { return phase_; }
 };
 
 }  // namespace aptuner::app
