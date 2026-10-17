@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 
 #include "aptuner/core/controller.hpp"
@@ -9,6 +10,7 @@
 #include "aptuner/core/jsnum.hpp"
 #include "aptuner/core/spectra.hpp"
 #include "aptuner/engine/analysis.hpp"
+#include "aptuner/log/integrity.hpp"
 
 namespace aptuner::engine {
 
@@ -18,45 +20,30 @@ namespace {
 
 constexpr double kGyroDeg = 57.2958;   // the JavaScript version scales gyro rad/s by this constant
 
-bool inWin(const Window& win, double tUs) {
-  if (!win.tStart || *win.tStart == 0) return true;
-  const double t = tUs / 1e6;
-  return t >= *win.tStart && t <= win.tEnd.value_or(std::nan(""));
-}
-
-double estimateFs(const Vec& t) {
-  Vec d;
-  for (std::size_t i = 1; i < std::min<std::size_t>(t.size(), 5000); i++) {
-    const double x = t[i] - t[i - 1];
-    if (x > 0) d.push_back(x);
-  }
-  std::sort(d.begin(), d.end());
-  return d.empty() ? 0 : 1 / d[d.size() / 2];
-}
-
-std::optional<double> hoverThrottle(const log::LogData& log, Family family) {
-  const log::MsgTable* q = log.msg("QTUN");
-  const log::MsgTable* ct = family == Family::Vtol && q ? q : log.msg("CTUN");
-  if (!ct || !ct->col("ThO")) return std::nullopt;
-  Vec v;
-  for (double x : *ct->col("ThO"))
-    if (x > 0.15) v.push_back(x);
-  std::sort(v.begin(), v.end());
-  if (v.empty()) return std::nullopt;
-  return v[v.size() / 2];
-}
-
-std::optional<double> escMeanRpm(const log::LogData& log) {
-  const log::MsgTable* e = log.msg("ESC");
-  if (!e || !e->col("RPM")) return std::nullopt;
-  double s = 0, c = 0;
-  for (double r : *e->col("RPM"))
-    if (r > 100) {
-      s += r;
-      c++;
+/** unbroken blocks [i0, i1) of a sample sequence: split where a sample was left out (index jump) or the time steps over a gap */
+Blocks blocksOfSamples(const Vec& t, const std::vector<std::size_t>& idx) {
+  Blocks blocks;
+  if (idx.empty()) return blocks;
+  const double dt = log::medianStep(t);
+  std::size_t s = 0;
+  for (std::size_t k = 1; k < idx.size(); k++)
+    if (idx[k] != idx[k - 1] + 1 || (dt > 0 && t[k] - t[k - 1] > log::kGapFactor * dt)) {
+      blocks.emplace_back(s, k);
+      s = k;
     }
-  if (c == 0) return std::nullopt;
-  return s / c;
+  blocks.emplace_back(s, idx.size());
+  return blocks;
+}
+
+/** mean sample rate inside unbroken blocks (gaps excluded) */
+double blockRate(const Vec& t, const Blocks& blocks) {
+  double num = 0, den = 0;
+  for (const auto& [a, b] : blocks)
+    if (b - a >= 2) {
+      num += static_cast<double>(b - a - 1);
+      den += t[b - 1] - t[a];
+    }
+  return den > 0 ? jsRoundFixed(num / den, 3) : 0;
 }
 
 /** RMS over a band of an amplitude spectrum (amp^2 / 2 per bin), rounded to 3 decimals as the JavaScript did */
@@ -85,34 +72,25 @@ struct Consistency {
   double share = 0;
 };
 
-std::vector<Consistency> peakConsistency(const GyroSamples& gs, const log::LogData& log, Family family,
-                                         const std::vector<Peak>& peaks) {
+/**
+ * Cut the (airborne) gyro data into 10 s parts inside unbroken blocks, find the peaks in each and count, for every
+ * peak of the whole-flight spectrum, in how many parts it shows up (within 8% / 2 Hz).
+ */
+std::vector<Consistency> peakConsistency(const GyroSamples& gs, const std::vector<Peak>& peaks) {
   std::vector<Consistency> out;
   if (peaks.empty()) return out;
   const double fs = gs.fs;
   const std::size_t segN = static_cast<std::size_t>(jsRound(10 * fs));
   const std::size_t winSize = std::min<std::size_t>(1024, nextPow2(fs * 1));
-  const log::MsgTable* q = log.msg("QTUN");
-  const log::MsgTable* ct = family == Family::Vtol && q ? q : log.msg("CTUN");
-  const auto hov = hoverThrottle(log, family);
-  const bool useThr = !gs.t.empty() && ct && ct->col("ThO") && hov && *hov != 0;
-  std::size_t j = 0;
-  auto thrAt = [&](double tSec) {
-    const Vec& tUs = *ct->col("TimeUS");
-    const Vec& thO = *ct->col("ThO");
-    const double tu = tSec * 1e6;
-    while (j + 1 < ct->n && tUs[j + 1] <= tu) j++;
-    return thO[j];
-  };
   std::vector<std::vector<double>> parts;
-  for (std::size_t s0 = 0; segN > 0 && s0 + segN <= gs.x.size(); s0 += segN) {
-    if (useThr && thrAt(gs.t[s0 + (segN >> 1)]) < 0.6 * *hov) continue;   // on the ground / spooling
-    const Psd sx = psd(gs.x.data() + s0, segN, fs, winSize), sy = psd(gs.y.data() + s0, segN, fs, winSize),
-              sz = psd(gs.z.data() + s0, segN, fs, winSize);
-    std::vector<double> fl;
-    for (const Peak& p : findPeaks(sx.f, combinedAmp(sx, sy, sz), 8, fs * 0.48, 8)) fl.push_back(p.f);
-    parts.push_back(std::move(fl));
-  }
+  for (const auto& [b0, b1] : gs.blocks)
+    for (std::size_t s0 = b0; segN > 0 && s0 + segN <= b1; s0 += segN) {
+      const Psd sx = psd(gs.x.data() + s0, segN, fs, winSize), sy = psd(gs.y.data() + s0, segN, fs, winSize),
+                sz = psd(gs.z.data() + s0, segN, fs, winSize);
+      std::vector<double> fl;
+      for (const Peak& p : findPeaks(sx.f, combinedAmp(sx, sy, sz), 8, fs * 0.48, 8)) fl.push_back(p.f);
+      parts.push_back(std::move(fl));
+    }
   for (const Peak& p : peaks) {
     const double tol = std::max(2.0, 0.08 * p.f);
     int hits = 0;
@@ -197,94 +175,121 @@ Json roundedArray(const Vec& v, int precision) {
 
 }  // namespace
 
-std::optional<GyroSamples> gyroSamples(const log::LogData& log, const Window& win) {
+std::optional<GyroSamples> gyroSamples(const log::LogData& log, const Window& win, const std::optional<Airborne>& air) {
+  const auto inWin = [&](double tSec) { return !win.tStart || (tSec >= *win.tStart && tSec <= win.tEnd.value_or(0)); };
+  const auto flying = [&](double tSec) { return !air || inIntervals(air->intervals, tSec); };
+  // samples of a gyro table in the window, airborne and finite, cut into unbroken blocks (tUs: its time column)
+  const auto fromTable = [&](const log::MsgTable& g, const Vec& tUs) -> std::optional<GyroSamples> {
+    const Vec* gx = g.col("GyrX");
+    const Vec* gy = g.col("GyrY");
+    const Vec* gz = g.col("GyrZ");
+    if (!gx || !gy || !gz) return std::nullopt;
+    std::vector<std::size_t> idx;
+    GyroSamples gs;
+    for (std::size_t i = 0; i < g.n; i++) {
+      const double ts = tUs[i] / 1e6;
+      if (inWin(ts) && flying(ts) && std::isfinite((*gx)[i]) && std::isfinite((*gy)[i]) && std::isfinite((*gz)[i])) {
+        idx.push_back(i);
+        gs.t.push_back(ts);
+      }
+    }
+    gs.blocks = blocksOfSamples(gs.t, idx);
+    gs.fs = blockRate(gs.t, gs.blocks);
+    for (std::size_t i : idx) {
+      gs.x.push_back((*gx)[i] * kGyroDeg);
+      gs.y.push_back((*gy)[i] * kGyroDeg);
+      gs.z.push_back((*gz)[i] * kGyroDeg);
+    }
+    return gs;
+  };
   // 1) raw gyro messages
   const log::MsgTable* gyr = log.msg("GYR");
   if (gyr && gyr->n > 2000) {
-    auto split = log::splitByInstance(*gyr, "I");
+    const auto split = log::splitByInstance(*gyr, "I");
     const log::MsgTable* g = split.count(0) ? &split.at(0) : (split.empty() ? nullptr : &split.begin()->second);
-    if (g && g->col("TimeUS")) {
-      std::vector<std::size_t> idx;
-      const Vec& tUs = *g->col("TimeUS");
-      for (std::size_t i = 0; i < g->n; i++)
-        if (inWin(win, tUs[i])) idx.push_back(i);
-      if (idx.size() > 2000) {
-        const Vec* sUs = g->col("SampleUS");
-        GyroSamples gs;
-        for (std::size_t i : idx) gs.t.push_back(sUs ? (*sUs)[i] / 1e6 : tUs[i] / 1e6);
-        gs.fs = estimateFs(gs.t);
-        for (std::size_t i : idx) {
-          gs.x.push_back((*g->col("GyrX"))[i] * kGyroDeg);
-          gs.y.push_back((*g->col("GyrY"))[i] * kGyroDeg);
-          gs.z.push_back((*g->col("GyrZ"))[i] * kGyroDeg);
-        }
-        gs.source = "GYR raw gyro (" + jsToFixed(gs.fs, 0) + " Hz)";
-        gs.prefilter = true;
-        return gs;
+    // INS_RAW_LOG_OPT bit 2: GYR holds the filtered gyro; bit 3 (pre and post filter): the first instance holds the
+    // raw gyro and the filtered copy is logged under instance + number of gyros
+    const int opt = log.params.intOf("INS_RAW_LOG_OPT");
+    const bool post = (opt & 4) && !(opt & 8);
+    const Vec* tcol = g ? (g->col("SampleUS") ? g->col("SampleUS") : g->col("TimeUS")) : nullptr;
+    if (g && tcol) {
+      auto r = fromTable(*g, *tcol);
+      if (r && r->x.size() > 2000 && r->fs > 0) {
+        r->source = std::string("GYR ") + (post ? "filtered" : "raw") + " gyro (" + jsToFixed(r->fs, 0) + " Hz" +
+                    (post ? ", post-filter: INS_RAW_LOG_OPT bit 2" : "") + ")";
+        r->prefilter = !post;
+        return r;
       }
     }
   }
-  // 2) batch sampler
+  // 2) batch sampler: every batch is its own block (the sampler pauses and switches sensors between batches)
   const log::MsgTable* h = log.msg("ISBH");
   const log::MsgTable* d = log.msg("ISBD");
-  if (h && d && h->n > 2 && h->col("type") && h->col("instance") && h->col("N") && d->col("N")) {
+  if (h && d && h->n > 2 && h->col("type") && h->col("instance") && h->col("N") && h->col("mul") && h->col("smp_rate") &&
+      h->col("TimeUS") && d->col("N")) {
     struct Hdr {
       double mul, fs, t;
     };
+    // gyro batches: type 0 = accel, 1 = gyro
     std::map<double, Hdr> hdr;
     const Vec &ht = *h->col("type"), &hi = *h->col("instance"), &hn = *h->col("N"), &hm = *h->col("mul"),
               &hr = *h->col("smp_rate"), &hT = *h->col("TimeUS");
     for (std::size_t i = 0; i < h->n; i++)
-      if (ht[i] == 1 && hi[i] == 0) hdr[hn[i]] = {hm[i], hr[i], hT[i]};
-    GyroSamples gs;
-    double fs = 0;
-    const Vec& dn = *d->col("N");
-    auto xs = d->i16.find("x"), ys = d->i16.find("y"), zs = d->i16.find("z");
+      if (ht[i] == 1 && hi[i] == 0) hdr[hn[i]] = {hm[i], hr[i], hT[i] / 1e6};
+    const auto xs = d->i16.find("x"), ys = d->i16.find("y"), zs = d->i16.find("z");
     if (xs != d->i16.end() && ys != d->i16.end() && zs != d->i16.end()) {
+      GyroSamples gs;
+      double fs = 0;
+      std::optional<double> cur, lastSeq;
+      std::size_t start = 0;
+      const Vec& dn = *d->col("N");
+      const Vec* seqno = d->col("seqno");
       for (std::size_t i = 0; i < d->n; i++) {
-        auto it = hdr.find(dn[i]);
-        if (it == hdr.end() || !inWin(win, it->second.t)) continue;
-        fs = it->second.fs;
-        const double mul = it->second.mul != 0 ? it->second.mul : 1;
-        for (int k = 0; k < 32; k++) {
-          gs.x.push_back(xs->second[i][static_cast<std::size_t>(k)] / mul * kGyroDeg);
-          gs.y.push_back(ys->second[i][static_cast<std::size_t>(k)] / mul * kGyroDeg);
-          gs.z.push_back(zs->second[i][static_cast<std::size_t>(k)] / mul * kGyroDeg);
+        const auto it = hdr.find(dn[i]);
+        if (it == hdr.end()) continue;
+        const Hdr& H = it->second;
+        if (!inWin(H.t) || !flying(H.t)) continue;
+        if (fs == 0 || std::isnan(fs)) fs = H.fs;
+        if (H.fs != fs) continue;
+        const std::optional<double> seq = seqno ? std::optional<double>((*seqno)[i]) : std::nullopt;
+        // a new batch, or a missing record inside one, starts a new block
+        if (!cur || *cur != dn[i] || (seq && lastSeq && *seq != *lastSeq + 1)) {
+          if (gs.x.size() > start) gs.blocks.emplace_back(start, gs.x.size());
+          start = gs.x.size();
+          cur = dn[i];
+        }
+        lastSeq = seq;
+        const double mul = H.mul != 0 && !std::isnan(H.mul) ? H.mul : 1;
+        for (std::size_t k = 0; k < 32; k++) {
+          gs.x.push_back(xs->second[i][k] / mul * kGyroDeg);
+          gs.y.push_back(ys->second[i][k] / mul * kGyroDeg);
+          gs.z.push_back(zs->second[i][k] / mul * kGyroDeg);
         }
       }
-    }
-    if (gs.x.size() > 2000) {
-      const int opt = log.params.intOf("INS_LOG_BAT_OPT");
-      const bool pre = !(opt & 2);
-      gs.fs = fs;
-      gs.source = "IMU batch sampler (" + jsToFixed(fs, 0) + " Hz, " + (pre ? "pre" : "post") + "-filter)";
-      gs.prefilter = pre;
-      gs.batched = true;
-      return gs;
+      if (gs.x.size() > start) gs.blocks.emplace_back(start, gs.x.size());
+      if (gs.x.size() > 2000 && fs > 0) {
+        const int opt = log.params.intOf("INS_LOG_BAT_OPT");
+        const bool pre = !(opt & 2);
+        gs.fs = fs;
+        gs.source = "IMU batch sampler (" + jsToFixed(fs, 0) + " Hz, " + (pre ? "pre" : "post") + "-filter, " +
+                    jsToString(static_cast<double>(gs.blocks.size())) + " batches)";
+        gs.prefilter = pre;
+        gs.batched = true;
+        return gs;
+      }
     }
   }
   // 3) IMU message (filtered gyro at the logging rate)
   const log::MsgTable* imu = log.msg("IMU");
   if (imu && imu->n > 2000) {
-    auto split = log::splitByInstance(*imu, "I");
-    if (split.count(0)) {
+    const auto split = log::splitByInstance(*imu, "I");
+    if (split.count(0) && split.at(0).col("TimeUS")) {
       const log::MsgTable& im = split.at(0);
-      const Vec& tUs = *im.col("TimeUS");
-      std::vector<std::size_t> idx;
-      for (std::size_t i = 0; i < im.n; i++)
-        if (inWin(win, tUs[i])) idx.push_back(i);
-      GyroSamples gs;
-      for (std::size_t i : idx) gs.t.push_back(tUs[i] / 1e6);
-      gs.fs = estimateFs(gs.t);
-      if (idx.size() > 2000) {
-        for (std::size_t i : idx) {
-          gs.x.push_back((*im.col("GyrX"))[i] * kGyroDeg);
-          gs.y.push_back((*im.col("GyrY"))[i] * kGyroDeg);
-          gs.z.push_back((*im.col("GyrZ"))[i] * kGyroDeg);
-        }
-        gs.source = "IMU message (" + jsToFixed(gs.fs, 0) + " Hz, post-filter)";
-        gs.prefilter = false;
-        return gs;
+      auto r = fromTable(im, *im.col("TimeUS"));
+      if (r && r->x.size() > 2000 && r->fs > 0) {
+        r->source = "IMU message (" + jsToFixed(r->fs, 0) + " Hz, post-filter)";
+        r->prefilter = false;
+        return r;
       }
     }
   }
@@ -332,22 +337,42 @@ std::optional<HarmonicFamily> harmonicFamily(const std::vector<Peak>& peaks) {
   return best;
 }
 
-Json analyzeNoise(const log::LogData& log, const log::Params& params, Family family, const Window& win) {
-  const auto gsOpt = gyroSamples(log, win);
+Json analyzeNoise(const log::LogData& log, const log::Params& params, Family family, const Window& win, const NoiseOpts* opts) {
+  std::optional<Airborne> air;
+  NotchOp op;
+  if (opts) {
+    air = opts->air;
+    op = opts->op;
+  } else {
+    const bool hasWin = win.tStart.has_value();
+    const auto thr = throttleStream(log, family);
+    const double inf = std::numeric_limits<double>::infinity();
+    if (family != Family::Plane && thr)
+      air = airborneIntervals(*thr, hasWin ? *win.tStart : -inf, hasWin ? win.tEnd.value_or(0) : inf);
+    op = notchOperatingPoint(log, family, hasWin ? win : Window{}, air);
+  }
+  const auto gsOpt = gyroSamples(log, win, air);
   if (!gsOpt)
     return Json::obj({{"available", false},
-                      {"reason", "No gyro data at a usable rate. For notch setup log raw gyro: set INS_RAW_LOG_OPT = 9 "
-                                 "(H7 boards) or INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 4, then fly 1-2 minutes."}});
+                      {"reason", std::string("No gyro data at a usable rate") + (air ? " while flying" : "") +
+                                     ". For notch setup log raw gyro: set INS_RAW_LOG_OPT = 9 (H7 boards) or "
+                                     "INS_LOG_BAT_MASK = 1, INS_LOG_BAT_OPT = 4, then fly 1-2 minutes."}});
   const GyroSamples& gs = *gsOpt;
   const double fs = gs.fs;
-  const std::size_t winSize = std::min<std::size_t>(2048, nextPow2(fs * 1));
-  const Psd spX = psd(gs.x, fs, winSize), spY = psd(gs.y, fs, winSize), spZ = psd(gs.z, fs, winSize);
+  std::size_t longest = 0;
+  for (const auto& [a, b] : gs.blocks) longest = std::max(longest, b - a);
+  const std::size_t winSize = std::min({std::size_t{2048}, nextPow2(fs * 1), prevPow2(static_cast<double>(longest))});
+  if (winSize < 64)
+    return Json::obj({{"available", false},
+                      {"reason", "The gyro data have no unbroken stretch long enough for a spectrum (longest " +
+                                     jsToFixed(static_cast<double>(longest) / fs, 2) + " s): the log has gaps or dropouts."}});
+  const Psd spX = psd(gs.x, fs, winSize, 0.5, &gs.blocks), spY = psd(gs.y, fs, winSize, 0.5, &gs.blocks),
+            spZ = psd(gs.z, fs, winSize, 0.5, &gs.blocks);
   const Vec& f = spX.f;
   const Vec amp = combinedAmp(spX, spY, spZ);
-  NotchOp op;
-  const auto hovThr = hoverThrottle(log, family);
-  if (hovThr) op.throttle = *hovThr;
   const GyroChain chain = gyroChainFromParams(params, op);
+  std::size_t nUse = 0;
+  for (const auto& [a, b] : gs.blocks) nUse = nUse + b - a;
   Json fJ = Json::array();
   for (double v : f) fJ.push(jsRoundFixed(v, 2));
   Json res = Json::obj({{"available", true},
@@ -359,7 +384,12 @@ Json analyzeNoise(const log::LogData& log, const log::Params& params, Family fam
                         {"ampX", roundedArray(spX.amp, 4)},
                         {"ampY", roundedArray(spY.amp, 4)},
                         {"ampZ", roundedArray(spZ.amp, 4)},
-                        {"chain", gyroChainJson(chain)}});
+                        {"chain", gyroChainJson(chain)},
+                        {"dataInfo", Json::obj({{"seconds", static_cast<double>(nUse) / fs},
+                                                {"blocks", gs.blocks.size()},
+                                                {"longestBlockS", static_cast<double>(longest) / fs},
+                                                {"windows", spX.nWin},
+                                                {"airborneOnly", air.has_value()}})}});
   const Vec Hcur = cx::abs(gyroChain(f, chain));
   res.set("currentFilterMag", roundedArray(Hcur, 4));
   Vec postCurrent;
@@ -370,6 +400,24 @@ Json analyzeNoise(const log::LogData& log, const log::Params& params, Family fam
     res.set("note",
             "Gyro data is post-filter (already filtered). Peaks you see here are what the controller sees. For a "
             "proper notch design, log raw gyro (INS_RAW_LOG_OPT = 9).");
+  }
+  const double gyroHz = params.getOr("INS_GYRO_FILTER", 20);
+  const double fTop = std::min(40.0, fs / 2);
+  // aliasing: filtered gyro sampled at the logging rate still holds what the gyro low-pass lets through above fs/2
+  // (it is only 19 dB down at 3x its cut-off), and that folds to wrong, lower frequencies
+  if (!gs.prefilter && fs / 2 < 3 * (gyroHz > 0 ? gyroHz : 20)) {
+    res.set("aliasRisk", true);
+    res.set("peaks", Json::array());
+    res.set("harmonics", Json());
+    res.set("consistency", Json::array());
+    res.set("rmsBand", Json::obj({{"pre", ampBandRms(f, amp, 5, fTop)}, {"postCurrent", Json()}}));
+    res.set("recommendation",
+            "No notch recommended: the gyro data in this log are logged at only " + jsToFixed(fs, 0) + " Hz after the " +
+                jsToString(gyroHz) + " Hz gyro filter, which still lets through vibration above " + jsToFixed(fs / 2, 0) +
+                " Hz. That vibration folds down to wrong, lower frequencies (aliasing), so the peaks of this spectrum "
+                "cannot be trusted. Log the gyro faster or before the filters (batch sampler INS_LOG_BAT_MASK = 1, or raw "
+                "gyro logging INS_RAW_LOG_OPT = 9 on H7 boards), or use ESC telemetry RPM.");
+    return res;
   }
   // peaks on the analysed spectrum (pre-filter if available)
   const std::vector<Peak> peaks = findPeaks(f, amp, 8, fs * 0.48);
@@ -390,11 +438,11 @@ Json analyzeNoise(const log::LogData& log, const log::Params& params, Family fam
     res.set("harmonics", Json());
   }
   // control-band noise (what matters for the D term): RMS in 5-40 Hz pre and post filter
-  const double fTop = std::min(40.0, fs / 2);
   res.set("rmsBand", Json::obj({{"pre", ampBandRms(f, amp, 5, fTop)},
                                 {"postCurrent", gs.prefilter ? Json(ampBandRms(f, postCurrent, 5, fTop)) : Json()}}));
-  // consistency: does the peak show up in most parts of the flight?
-  const std::vector<Consistency> cons = peakConsistency(gs, log, family, peaks);
+  // consistency: does the peak show up in most parts of the flight? On post-filter data a single strong part (a
+  // gust, a landing bump) or filter-shaped bumps can masquerade as a motor peak.
+  const std::vector<Consistency> cons = peakConsistency(gs, peaks);
   Json consJ = Json::array();
   for (const auto& c : cons)
     consJ.push(Json::obj({{"f", c.f}, {"hits", c.hits}, {"windows", c.windows}, {"share", c.share}}));
@@ -412,11 +460,15 @@ Json analyzeNoise(const log::LogData& log, const log::Params& params, Family fam
     for (std::size_t i = 0; i < cons.size(); i++)
       list += (i ? ", " : "") + jsToFixed(cons[i].f, 1) + " Hz in " + std::to_string(cons[i].hits) + "/" +
               std::to_string(cons[i].windows) + " parts";
-    const std::string why =
-        cf && cf->windows < 5
-            ? "the flight is too short to check that the peaks repeat (" + std::to_string(cf->windows) +
-                  " airborne part(s) of 10 s; 5 needed)"
-            : "the peaks do not repeat through the flight (" + (list.empty() ? std::string("no repeatable peak") : list) + ")";
+    std::string why;
+    if (cf && cf->windows < 5)
+      why = cf->windows == 0 && gs.blocks.size() > 1
+                ? "the gyro data have no unbroken airborne stretch of 10 s to check that the peaks repeat (the log has gaps "
+                  "or dropouts)"
+                : "the flight is too short to check that the peaks repeat (" + std::to_string(cf->windows) +
+                      " airborne part(s) of 10 s; 5 needed)";
+    else
+      why = "the peaks do not repeat through the flight (" + (list.empty() ? std::string("no repeatable peak") : list) + ")";
     res.set("recommendation",
             "No notch recommended: the log only holds filtered gyro data (" + gs.source + ") and " + why +
                 ". A notch at the wrong frequency only adds delay. To find the motor noise properly, enable the batch "
@@ -426,8 +478,10 @@ Json analyzeNoise(const log::LogData& log, const log::Params& params, Family fam
     res.set("notchUnconfirmed", Json::obj({{"f0", jsRoundFixed(fam->f0, 1)}}));
   }
   if (fam && fam->f0 > 15 && !unconfirmed) {
-    const double thr = hovThr ? *hovThr : 0;
-    const NotchRec rec = recommendNotch(*fam, peaks, params, thr, escMeanRpm(log), family);
+    // operating point of the analysed airborne time: op.throttle || 0, op.escRpm || null
+    const double thr = op.throttle && *op.throttle != 0 && !std::isnan(*op.throttle) ? *op.throttle : 0;
+    const std::optional<double> esc = op.escRpm != 0 && !std::isnan(op.escRpm) ? std::optional<double>(op.escRpm) : std::nullopt;
+    const NotchRec rec = recommendNotch(*fam, peaks, params, thr, esc, family);
     GyroChain chainNew = chain;
     chainNew.notches = {rec.def};
     chainNew.gyroFilterHz = rec.gyroFilterHz;

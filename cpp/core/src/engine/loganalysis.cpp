@@ -916,7 +916,10 @@ Json analyzeLog(log::LogData& log, const std::string& file, const AnalyzeLogOpti
     }
     out.at("axes").set(axisName(axis), res);
   }
-  out.set("noise", analyzeNoise(log, params, fam, win));
+  NoiseOpts noiseOpts;
+  noiseOpts.air = air;
+  noiseOpts.op = op;
+  out.set("noise", analyzeNoise(log, params, fam, win, &noiseOpts));
   return out;
 }
 
