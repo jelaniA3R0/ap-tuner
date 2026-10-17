@@ -168,21 +168,25 @@ TEST(golden_stepresp) {
   CHECK(static_cast<double>(sr.count) == j["count"].num());
   CHECK_VEC(sr.t, j["t"].toVec(), 1e-15);
   CHECK_VEC(sr.mean, j["mean"].toVec(), 1e-8);
+  // JSON null (a metric that is not reported because the response has not settled) compares as NaN
+  const auto jn = [](const Json& v) { return v.isNull() ? std::nan("") : v.num(); };
   const auto m = stepMetrics(sr.t, sr.mean);
   CHECK(m.has_value());
   if (m) {
-    CHECK_REL(m->finalValue, j["metrics"]["finalValue"].num(), 1e-8);
-    CHECK_REL(m->overshootPct, j["metrics"]["overshootPct"].num(), 1e-6);
-    CHECK_NEAR(m->riseTime, j["metrics"]["riseTime"].num(), 1e-12);
-    CHECK_NEAR(m->settlingTime, j["metrics"]["settlingTime"].num(), 1e-12);
+    CHECK_REL(m->finalValue, jn(j["metrics"]["finalValue"]), 1e-8);
+    CHECK_REL(m->overshootPct, jn(j["metrics"]["overshootPct"]), 1e-6);
+    CHECK_NEAR(m->riseTime, jn(j["metrics"]["riseTime"]), 1e-12);
+    CHECK_NEAR(m->settlingTime, jn(j["metrics"]["settlingTime"]), 1e-12);
     CHECK(static_cast<double>(m->oscillations) == j["metrics"]["oscillations"].num());
+    CHECK(m->settled == j["metrics"]["settled"].asBool());
   }
   const auto h = stepMetrics(j["handT"].toVec(), j["handY"].toVec());
   CHECK(h.has_value());
   if (h) {
-    CHECK_REL(h->overshootPct, j["handMetrics"]["overshootPct"].num(), 1e-10);
-    CHECK_NEAR(h->riseTime, j["handMetrics"]["riseTime"].num(), 1e-12);
-    CHECK_NEAR(h->settlingTime, j["handMetrics"]["settlingTime"].num(), 1e-12);
+    CHECK_REL(h->overshootPct, jn(j["handMetrics"]["overshootPct"]), 1e-10);
+    CHECK_NEAR(h->riseTime, jn(j["handMetrics"]["riseTime"]), 1e-12);
+    CHECK_NEAR(h->settlingTime, jn(j["handMetrics"]["settlingTime"]), 1e-12);
+    CHECK(h->settled == j["handMetrics"]["settled"].asBool());
   }
   CHECK(!stepMetrics({}, {}).has_value());
 }
@@ -238,6 +242,7 @@ TEST(golden_plant) {
     CHECK_REL(fit->Td, e["Td"].num(), 1e-5);
     CHECK_REL(fit->cost, e["cost"].num(), 1e-5);
     CHECK(static_cast<double>(fit->nBins) == e["nBins"].num());
+    CHECK_REL(fit->misfit, e["misfit"].num(), 1e-6);
     CHECK_REL(fit->fitQuality, e["fitQuality"].num(), 1e-8);
   }
   const auto ros = nelderMead(

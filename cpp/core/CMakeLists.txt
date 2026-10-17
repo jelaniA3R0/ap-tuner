@@ -14,6 +14,7 @@ add_library(aptuner_core STATIC
   src/jsnum.cpp
   src/json.cpp
   src/log/dfreader.cpp
+  src/log/integrity.cpp
   src/engine/vehicle.cpp
   src/engine/analysis.cpp
   src/engine/loganalysis.cpp
