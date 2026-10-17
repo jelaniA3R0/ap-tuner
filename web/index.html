@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AP Tuner</title>
+<link rel="icon" href="icon.png">
+<link rel="stylesheet" href="vendor/uPlot.min.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.png" alt=""><div><b>AP Tuner</b><small>ArduPilot tuning, made simple</small></div></div>
+  <nav class="views">
+    <button data-view="flight" class="active">Flight</button>
+    <button data-view="ground">Telemetry + USB</button>
+    <button data-view="live">Advanced</button>
+    <button data-view="log">Log file</button>
+    <button data-view="help">Help</button>
+  </nav>
+  <div class="connbox">
+    <div class="chip" id="connChip"><span class="dot"></span><span id="connText">Not connected</span></div>
+    <button id="btnConnect" class="btn primary">Connect</button>
+    <button id="btnDisconnect" class="btn ghost hidden">Disconnect</button>
+  </div>
+</header>
+
+<main>
+<!-- ======================= FLIGHT ======================= -->
+<section id="view-flight" class="view active">
+  <div class="flight">
+    <aside class="rail" id="frail">
+      <div class="ph" data-ph="setup"><span class="n">1</span><div>Connect &amp; read<small>vehicle and settings</small></div></div>
+      <div class="ph" data-ph="checkup"><span class="n">2</span><div>Check-up<small>issues, proposed changes</small></div></div>
+      <div class="ph" data-ph="tuning"><span class="n">3</span><div>Tune in flight<small>PIDs applied step by step</small></div></div>
+      <div class="ph" data-ph="filters"><span class="n">4</span><div>Filters<small>notch, then re-check</small></div></div>
+      <div class="ph" data-ph="overall"><span class="n">5</span><div>Overall check<small>how good is it now</small></div></div>
+      <div class="ph" data-ph="land"><span class="n">6</span><div>Land &amp; save<small>summary, parameter file</small></div></div>
+    </aside>
+    <div class="stage">
+      <div class="hero" id="fhero">
+        <div class="hero-top">
+          <div style="flex:1;min-width:0"><div class="eyebrow" id="fphase">Ready</div><h2 id="ftitle">Flight check</h2><p id="finfo" class="muted">Connect, then press Start: the app reads the vehicle and leads you through one flight.</p></div>
+          <div class="chips" id="fchips"></div>
+        </div>
+        <div class="progress" style="margin-top:12px"><i id="fprog"></i></div>
+        <div class="row" id="fbtns" style="margin-top:12px"></div>
+      </div>
+      <div id="fsetup" class="cards cols-3" style="margin-top:12px">
+        <div class="card"><h4>Feel</h4><div class="seg" id="fpresetSeg" style="margin-top:6px"><button data-preset="conservative">Smooth</button><button data-preset="normal" class="active">Normal</button><button data-preset="aggressive">Sporty</button></div><p class="explain" id="fpresetExplain">Normal: the margins ArduPilot's own tuners aim for.</p></div>
+        <div class="card"><h4>Axes and size</h4><div class="row" style="margin-top:6px"><label class="check"><input type="checkbox" class="fax" value="roll" checked>roll</label><label class="check"><input type="checkbox" class="fax" value="pitch" checked>pitch</label><label class="check"><input type="checkbox" class="fax" value="yaw">yaw</label></div><div class="seg" id="fsizeSeg" style="margin-top:8px"><button data-size="small">Small</button><button data-size="medium" class="active">Medium</button><button data-size="large">Large</button><button data-size="heavy">Heavy</button></div><p class="explain">Size sets how sensitive the oscillation detector is.</p></div>
+        <div class="card"><h4>After the check-up</h4><label class="switch" id="fswAsk" style="margin-top:6px"><input type="radio" name="fmode" value="ask" checked><div><b>Show me first</b><span>You see the issues and the proposed changes, then press Apply in flight.</span></div></label><label class="switch" id="fswAuto" style="margin-top:8px"><input type="radio" name="fmode" value="auto"><div><b>Apply by itself</b><span>The changes go to the vehicle right after the check-up, in small watched steps.</span></div></label></div>
+      </div>
+      <div class="banner" style="margin-top:12px"><div class="ico">📡</div><div><b>Flying on a telemetry radio?</b><span>A radio is too slow for tuning in the air. Use the <a href="#" onclick="document.querySelector('nav.views button[data-view=ground]').click();return false">Telemetry + USB</a> tab: fly 30 s, land, plug in USB, and the app writes the gains on the ground.</span></div></div>
+      <div id="fbody" style="margin-top:12px"></div>
+      <div class="chart" id="chFlight" style="margin-top:12px"><h4>Rate demanded (dashed) vs actual, deg/s</h4></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= LIVE (advanced) ======================= -->
+<section id="view-live" class="view">
+  <div class="stepper">
+    <div class="step" data-step="connect"><span class="num">1</span><div>Connect<small>find the vehicle</small></div></div>
+    <div class="step" data-step="vehicle"><span class="num">2</span><div>Vehicle<small>read settings</small></div></div>
+    <div class="step" data-step="tune"><span class="num">3</span><div>Tune<small>fly and apply</small></div></div>
+    <div class="step" data-step="notch"><span class="num">4</span><div>Notch filter<small>motor noise</small></div></div>
+    <div class="step" data-step="save"><span class="num">5</span><div>Save<small>parameter file</small></div></div>
+  </div>
+
+  <article class="panel open" id="p-connect">
+    <header><span class="num">1</span><h2>Connect to your vehicle</h2><span class="status" id="st-connect">waiting</span><span class="chev">›</span></header>
+    <div class="body">
+      <div class="cards cols-2">
+        <div class="card">
+          <h3>Automatic</h3>
+          <p class="muted">Press <b>Connect</b>. The app looks for Mission Planner's MAVLink mirror, a simulator, and the USB or telemetry ports on this PC, and stops at the first vehicle that answers.</p>
+          <div class="row" style="margin-top:10px"><button id="btnAuto" class="btn primary lg">Connect</button><span id="autoText" class="muted"></span></div>
+          <ul class="list" id="autoList"></ul>
+        </div>
+        <div class="card">
+          <h3>Using Mission Planner at the same time?</h3>
+          <p class="muted">Keep flying with Mission Planner as usual and let it mirror the data stream to AP Tuner:</p>
+          <ol class="small" style="padding-left:18px;color:var(--muted)">
+            <li>In Mission Planner press <b>Ctrl+F</b>, then click <b>Mavlink</b> (left column).</li>
+            <li>In the <b>SerialOutput - Mavlink</b> window pick <b>TCP Host - 14550</b>, tick <b>Write access</b>, press <b>Connect</b>, OK the port box.</li>
+            <li>Press <b>Connect</b> here.</li>
+          </ol>
+          <details><summary class="muted small" style="cursor:pointer">Connection options (manual)</summary>
+            <div class="row" style="margin-top:10px">
+              <label class="field">Type<select id="kind"><option value="tcp">TCP client</option><option value="udp">UDP client</option><option value="udpin">UDP listen</option><option value="serial">USB / telemetry port</option></select></label>
+              <label class="field">Host<input id="host" value="127.0.0.1" size="12"></label>
+              <label class="field">Port<input id="port" value="14550" size="7"></label>
+              <label class="field">Serial port<select id="serial"><option value="">(refresh)</option></select></label>
+              <label class="field">Baud<select id="baud"><option>115200</option><option>57600</option><option>921600</option><option>230400</option><option>38400</option></select></label>
+              <button id="btnPorts" class="btn ghost">Refresh ports</button>
+              <button id="btnManual" class="btn">Connect manually</button>
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  </article>
+
+  <article class="panel" id="p-vehicle">
+    <header><span class="num">2</span><h2>Read the vehicle</h2><span class="status" id="st-vehicle">waiting for connection</span><span class="chev">›</span></header>
+    <div class="body">
+      <div class="cards cols-2">
+        <div class="card">
+          <h3>Vehicle</h3>
+          <div class="kv" id="vehicleKv"><b>type</b><span>-</span></div>
+          <h4 style="margin-top:14px">What are you tuning?</h4>
+          <div class="seg" id="sizeSeg" style="margin-top:6px">
+            <button data-size="small">Small <span class="muted">(≤7" props)</span></button>
+            <button data-size="medium" class="active">Medium <span class="muted">(8-15")</span></button>
+            <button data-size="large">Large <span class="muted">(16-25")</span></button>
+            <button data-size="heavy">Heavy <span class="muted">(>25", >50 kg)</span></button>
+          </div>
+          <p class="explain">Sets how sensitive the oscillation detector is (bigger aircraft oscillate more slowly).</p>
+          <div class="row" style="margin-top:12px"><button id="btnPrepare" class="btn primary lg">Read vehicle settings</button><span id="prepText" class="muted"></span></div>
+        </div>
+        <div class="card">
+          <h3>Setup check</h3>
+          <p class="muted small">From ArduPilot's "setting up for tuning" guide. Warnings do not block tuning, but they explain a poor result.</p>
+          <ul class="list" id="checkList"><li class="muted">Read the vehicle first.</li></ul>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>Current gains</h3><div id="gainsNow" class="muted">-</div></div>
+    </div>
+  </article>
+
+  <article class="panel" id="p-tune">
+    <header><span class="num">3</span><h2>Tune in flight</h2><span class="status" id="st-tune">waiting</span><span class="chev">›</span></header>
+    <div class="body">
+      <div class="cards cols-3" style="margin-top:12px">
+        <div class="card">
+          <h4>Feel</h4>
+          <div class="seg" id="presetSeg" style="margin-top:6px"><button data-preset="conservative">Smooth</button><button data-preset="normal" class="active">Normal</button><button data-preset="aggressive">Sporty</button></div>
+          <p class="explain" id="presetExplain">Normal: the margins ArduPilot's own tuners aim for.</p>
+          <h4 style="margin-top:10px">Axes</h4>
+          <div class="row" style="margin-top:6px"><label class="check"><input type="checkbox" class="ax" value="roll" checked>roll</label><label class="check"><input type="checkbox" class="ax" value="pitch" checked>pitch</label><label class="check"><input type="checkbox" class="ax" value="yaw">yaw</label></div>
+        </div>
+        <div class="card">
+          <h4>How to apply</h4>
+          <label class="switch" id="swAdvise" style="margin-top:6px"><input type="radio" name="mode" value="advise" checked><div><b>Advise me</b><span>The app proposes; nothing is written until you press Apply on an axis.</span></div></label>
+          <label class="switch" id="swAuto" style="margin-top:8px"><input type="radio" name="mode" value="auto"><div><b>Auto-apply</b><span>Writes each proposal in small steps while watching for oscillation, reverts by itself, and continues to the next axis.</span></div></label>
+        </div>
+        <div class="card">
+          <h4>Session</h4>
+          <div class="row" style="margin-top:6px"><button id="btnStart" class="btn good lg">Start</button><button id="btnPause" class="btn">Pause</button><button id="btnResume" class="btn">Resume</button><button id="btnStop" class="btn ghost">Stop</button></div>
+          <div class="row" style="margin-top:10px"><button id="btnRestore" class="btn danger">Restore original gains</button></div>
+          <p class="explain">Changes are capped at 2× per round, written in steps of at most 1.5× and watched 4 s each. Any oscillation reverts to the last good gains.</p>
+        </div>
+      </div>
+      <div class="banner" id="tuneBanner"><div class="ico">🛈</div><div><b id="tuneState">Not started</b><span id="tuneInfo">Press Start, then fly in Stabilize / AltHold (plane: FBWA) and give short, sharp stick taps every few seconds.</span><div class="progress" style="margin-top:8px;width:320px"><i id="tuneProg"></i></div></div></div>
+      <div class="cards cols-2">
+        <div class="chart" id="chAtt"><h4>Rate demanded vs actual (deg/s)</h4></div>
+        <div class="chart" id="chOsc"><h4>Oscillation detector (slew rate) · Dmod</h4></div>
+      </div>
+      <div class="cards cols-auto" id="axesPanel" style="margin-top:12px"></div>
+    </div>
+  </article>
+
+  <article class="panel" id="p-notch">
+    <header><span class="num">4</span><h2>Notch filter (motor noise)</h2><span class="status" id="st-notch">optional</span><span class="chev">›</span></header>
+    <div class="body">
+      <p class="muted">Motors shake the gyro at their rotation frequency. A harmonic notch removes that noise so the rate loop can be tuned tighter. The app sets it up through the autopilot itself, because plain telemetry is too slow to carry the noise.</p>
+      <div class="row" style="margin:10px 0"><button id="btnNotchStatus" class="btn primary">Check what is possible</button><span id="notchText" class="muted"></span></div>
+      <div class="cards cols-2" id="notchCards"></div>
+      <div class="card" id="fftFlow" style="margin-top:12px; display:none">
+        <h3>In-flight FFT notch tune</h3>
+        <ol class="small muted" style="padding-left:18px">
+          <li>Enable the autopilot's FFT (one-time, needs a reboot while disarmed).</li>
+          <li>Take off and hold a steady hover, sticks centred.</li>
+          <li>Press <b>Start measuring</b>, wait 30 s, press <b>Stop &amp; read result</b>. The autopilot writes the notch itself.</li>
+        </ol>
+        <div class="row"><button id="btnFftEnable" class="btn">1. Enable FFT</button><button id="btnReboot" class="btn">Reboot (disarmed only)</button><button id="btnFftStart" class="btn good">Start measuring</button><span id="fftTimer" class="big" style="font-variant-numeric:tabular-nums"></span><button id="btnFftStop" class="btn primary">Stop &amp; read result</button></div>
+        <div id="fftResult" class="muted" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </article>
+
+  <article class="panel" id="p-save">
+    <header><span class="num">5</span><h2>Review and save</h2><span class="status" id="st-save">-</span><span class="chev">›</span></header>
+    <div class="body">
+      <div class="row between" style="margin:10px 0"><p class="muted">Everything the vehicle has now, compared with what it had when you connected. Changed rows are highlighted.</p><div class="row"><button id="btnRefreshRows" class="btn ghost">Refresh</button><a id="btnDownloadLive" class="btn primary" href="/api/live/param" download>Download parameter file</a></div></div>
+      <div id="liveRows"></div>
+      <div class="cards cols-2" style="margin-top:12px">
+        <div class="card"><h3>Parameter journal</h3><div id="journal" class="scroll"></div></div>
+        <div class="card"><h3>Messages</h3><div id="messages" class="scroll"></div></div>
+      </div>
+    </div>
+  </article>
+</section>
+
+<!-- ======================= LOG ======================= -->
+<!-- ======================= TELEMETRY + USB ======================= -->
+<section id="view-ground" class="view">
+  <div class="flight">
+    <aside class="rail" id="grail">
+      <div class="ph" data-ph="connect"><span class="n">1</span><div>Connect<small>over telemetry (mirror)</small></div></div>
+      <div class="ph" data-ph="fly"><span class="n">2</span><div>Fly 30 s<small>stick taps, nothing written</small></div></div>
+      <div class="ph" data-ph="land"><span class="n">3</span><div>Land<small>and disarm</small></div></div>
+      <div class="ph" data-ph="usb"><span class="n">4</span><div>Plug in USB<small>log read at full rate</small></div></div>
+      <div class="ph" data-ph="review"><span class="n">5</span><div>Review<small>issues, proposed gains</small></div></div>
+      <div class="ph" data-ph="write"><span class="n">6</span><div>Write<small>on the ground, with undo</small></div></div>
+    </aside>
+    <div class="stage">
+      <div class="hero">
+        <div class="hero-top">
+          <div style="flex:1;min-width:0"><div class="eyebrow" id="gphase">Ready</div><h2 id="gtitle">Telemetry + USB</h2><p id="ginfo" class="muted"></p></div>
+          <div class="chips" id="gchips"></div>
+        </div>
+        <div class="progress" style="margin-top:12px"><i id="gprog"></i></div>
+        <div class="row" id="gbtns" style="margin-top:12px"></div>
+      </div>
+      <div id="gsetup" class="cards cols-2" style="margin-top:12px">
+        <div class="card"><h4>Axes</h4><div class="row" style="margin-top:6px"><label class="check"><input type="checkbox" class="gax" value="roll" checked>roll</label><label class="check"><input type="checkbox" class="gax" value="pitch" checked>pitch</label><label class="check"><input type="checkbox" class="gax" value="yaw">yaw</label></div><p class="explain">Tap the sticks of these axes during the 30 s.</p></div>
+        <div class="card"><h4>Feel</h4><p class="explain">Uses the feel chosen on the Flight tab (Smooth / Normal / Sporty).</p></div>
+      </div>
+      <div id="gbody" style="margin-top:12px"></div>
+    </div>
+  </div>
+</section>
+
+<section id="view-log" class="view">
+  <div class="cards cols-2">
+    <div class="card">
+      <h2>Analyse a flight log</h2>
+      <p class="muted">Drop a <code>.bin</code> log from the autopilot's SD card (or downloaded with Mission Planner). You get a report per axis, the notch filter design if raw gyro data is in the log, and a parameter file to load in Mission Planner.</p>
+      <div class="drop" id="drop"><div class="big">Drop a .bin log here</div><div class="muted">or click to choose a file</div><input type="file" id="file" accept=".bin,.BIN" class="hidden"></div>
+      <div class="row" style="margin-top:10px">
+        <label class="field">Feel<select id="logPreset"><option value="conservative">Smooth</option><option value="normal" selected>Normal</option><option value="aggressive">Sporty</option></select></label>
+        <label class="field">Vehicle<select id="logFamily"><option value="">detect from the log</option><option value="copter">copter</option><option value="vtol">QuadPlane (VTOL part)</option><option value="plane">plane</option><option value="heli">helicopter</option></select></label>
+        <span id="logBusy" class="muted"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Recent logs on this PC</h3>
+      <div class="row"><button id="btnLogBrowse" class="btn">Find logs</button><input id="logPath" placeholder="or paste a path: D:\flight.bin" style="flex:1"><button id="btnLogAnalyze" class="btn primary">Analyse</button></div>
+      <div id="logList" class="filelist" style="margin-top:8px"></div>
+    </div>
+  </div>
+  <div id="logResult" style="margin-top:14px"></div>
+</section>
+
+<!-- ======================= HELP ======================= -->
+<section id="view-help" class="view">
+  <div class="card help">
+    <h2>How to use AP Tuner</h2>
+    <h3>Flight tab: one guided flight (recommended)</h3>
+    <ol>
+      <li><b>Connect and read.</b> Press <b>Start flight check</b>. The app connects, reads the vehicle and runs the setup check. Take off and hover in Stabilize, AltHold or PosHold (QuadPlane: QStabilize / QHover / QLoiter; plane: FBWA).</li>
+      <li><b>Check-up (30 s, nothing written).</b> Tap the sticks. You get the issues per axis in plain words (sluggish, bouncy, oscillating, noisy D, motors at the limit…) and the exact parameter changes proposed, with the margins and the predicted response.</li>
+      <li><b>Tune in flight.</b> Press <b>Apply in flight</b> (or choose "Apply by itself" before starting). The gains go to the flying vehicle in steps of at most 1.5×, each watched 4 s for oscillation and reverted by itself if it trips. The app re-measures and repeats until the gains settle (at most 4 rounds per axis).</li>
+      <li><b>Filters.</b> The harmonic notch is set through the vehicle: ESC RPM tracking if the ESCs report RPM, otherwise the autopilot's own 30 s FFT measurement (FFT-capable boards with FFT_ENABLE = 1). If neither exists, you are told to set it from a log later. The gains of all chosen axes are then checked once more with the filter active.</li>
+      <li><b>Overall check.</b> 30 s of normal flying with the final gains: grade per axis, vibration, hover throttle, notch state, and whether the gains could still move.</li>
+      <li><b>Land and save.</b> Land and disarm. The summary compares the check-up with the final check, lists every write, and the parameter file is one click away.</li>
+    </ol>
+    <p>You can stop at any point; the Advanced tab keeps <b>Undo</b> per axis and <b>Restore original gains</b>.</p>
+    <h3>Telemetry + USB tab: for vehicles on a telemetry radio</h3>
+    <ol>
+      <li>Connect Mission Planner over the radio as usual and turn on its mirror: <b>Ctrl+F</b> → <b>Mavlink</b> → <b>TCP Host - 14550</b> → tick <b>Write access</b> → Connect. Press <b>Start</b> in AP Tuner.</li>
+      <li>Take off and hover (QuadPlane: QStabilize / QHover / QLoiter). The 30 s capture starts by itself: short, sharp stick taps. Nothing is written in the air; the radio only marks the time.</li>
+      <li>Land and disarm, then plug the USB cable into the autopilot (Mission Planner can stay on the radio). The app finds the port, downloads only the marked 30 s of the log at full rate and analyses it.</li>
+      <li>Tick the changes and press <b>Write to the autopilot</b>. The old values go to an UNDO file first and every value is read back. Fly again and repeat until no change is proposed.</li>
+    </ol>
+    <p>No telemetry at all? Press <b>No telemetry: go straight to USB</b> after the flight: the longest hover in the log is used.</p>
+    <h3>Advanced tab: live tuning, step by step</h3>
+    <ol>
+      <li><b>Connect.</b> Press Connect; the app finds the vehicle by itself (Mission Planner mirror, simulator, USB or telemetry port). With Mission Planner open: Ctrl+F → <b>Mavlink</b> → <b>TCP Host - 14550</b>, tick <b>Write access</b>, Connect.</li>
+      <li><b>Read the vehicle.</b> Reads the tuning parameters and runs the setup check. It asks before setting the two housekeeping values it needs (PID telemetry on, slew limit non-zero).</li>
+      <li><b>Tune.</b> Choose the feel and axes, press Start, fly in Stabilize / AltHold (planes: FBWA) with short sharp stick taps. After each 30 s window you get a proposal with the predicted and measured response. Press Apply, or switch on Auto-apply.</li>
+      <li><b>Notch filter.</b> Check what is possible: ESC RPM tracking (best, if your ESCs report RPM), the autopilot's in-flight FFT (Cube Orange class boards), or a log with raw gyro data.</li>
+      <li><b>Save.</b> Download the parameter file for your records, or load it on another aircraft of the same build.</li>
+    </ol>
+    <h3>How do I know it will not apply wrong gains?</h3>
+    <ul>
+      <li>Nothing is written unless you press Apply (or switch Auto-apply on). The only exceptions are the two housekeeping values in step 2, and it asks first.</li>
+      <li>Every proposal is derived from what the vehicle actually did: it fits a physical model to the measured response and refuses to propose when the measurement is weak (and tells you why).</li>
+      <li>Before writing, you see the exact parameters, the margins (gain margin, phase margin, sensitivity peak) and the predicted step response next to the measured one.</li>
+      <li>Changes are capped at 2× per round, written in steps of at most 1.5× and watched 4 s each by an oscillation detector (the same slew-rate signal ArduPilot's QuikTune uses). Any sign of oscillation reverts to the last good gains and pauses.</li>
+      <li><b>Undo</b> per axis and <b>Restore original gains</b> are always available, and every write is journaled in the <code>sessions</code> folder.</li>
+    </ul>
+    <h3>What the maths does</h3>
+    <p>From demanded rate, actual rate and the PID output it measures the bare airframe response (actuator → gyro) with a feedback-safe spectral estimator and fits <code>G(s) = K·e<sup>−s·Td</sup> / ((s + a)(τs + 1))</code>: K is how hard the motors turn the aircraft, a the aerodynamic damping, τ the motor lag, Td the delay. It then searches P and D against ArduPilot's exact AC_PID structure (target/error/D filters, the gyro low-pass, notches, loop rate) for the best disturbance rejection within the chosen margins, and sets I, FF, filters and the angle gain with ArduPilot's own rules (I = P on roll/pitch, I = 0.1 P on yaw, plane I = FF, FLTT = FLTD = INS_GYRO_FILTER/2, plane FF from the AUTOTUNE event method). Copter gains are computed per rad/s, so the numbers are directly ArduPilot's.</p>
+    <h3>Telemetry speed</h3>
+    <p>A copter's rate loop needs about 50 Hz of PID data for a trustworthy model: USB, Wi-Fi/Ethernet links and fast radios give that. A 57600 baud radio gives about 15 Hz, enough for diagnostics and cautious proposals; use the Log file tab for the precise work. Planes are slower, so 25 Hz is fine for feed-forward and the time constant.</p>
+    <h3>Notch filter from a log</h3>
+    <p>Set <code>INS_RAW_LOG_OPT = 9</code> (Cube Orange / H7 boards) or <code>INS_LOG_BAT_MASK = 1</code>, <code>INS_LOG_BAT_OPT = 4</code>, fly 1-2 minutes including a steady hover, then analyse the log. You see the noise spectrum, the recommended <code>INS_HNTCH_*</code> values, the predicted result and the phase lag. Clear the logging option afterwards.</p>
+    <h3>Testing without a vehicle</h3>
+    <p>In the <code>sitl</code> folder run <code>run-sitl.cmd</code>, then <code>fly test quad.cmd</code>; press Connect here. The simulated quad takes off and taps the sticks for you.</p>
+    <h3>Safety</h3>
+    <p>Tune in calm air at a safe height, one axis at a time, with a vehicle that already hovers. Keep a hand on the mode switch. The app changes only the rate PID / filter / angle-gain parameters of the chosen axes, the notch parameters in step 4, <code>GCS_PID_MASK</code> and <code>*_SMAX</code>.</p>
+  </div>
+</section>
+<footer class="foot">AP Tuner · built on the ArduPilot control structure and tuning rules · charts by uPlot (MIT)</footer>
+</main>
+
+<div id="modal"><div class="box"><h3 id="modalTitle"></h3><div id="modalBody"></div><div class="actions"><button class="btn ghost" id="modalNo">Cancel</button><button class="btn primary" id="modalYes">OK</button></div></div></div>
+<div id="toasts"></div>
+
+<script src="vendor/uPlot.iife.min.js"></script>
+<script src="app.js"></script>
+<script src="flight.js"></script>
+<script src="ground.js"></script>
+</body>
+</html>

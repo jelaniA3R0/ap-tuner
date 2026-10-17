@@ -1,0 +1,12 @@
+23:27:22 measurement link alive on port 5772
+23:28:32 start: P=0.13500000536441803 D=0.003599999938160181 FLTD=10
+23:28:41 P=0.135  high-freq error 1.98 deg/s  SRate max 0.75  Dmod min 1.00
+23:28:50 P=0.170  high-freq error 1.80 deg/s  SRate max 0.83  Dmod min 1.00
+23:28:59 P=0.200  high-freq error 1.40 deg/s  SRate max 0.80  Dmod min 1.00
+23:29:08 P=0.230  high-freq error 0.91 deg/s  SRate max 0.81  Dmod min 1.00
+23:29:17 P=0.270  high-freq error 1.29 deg/s  SRate max 0.91  Dmod min 1.00
+23:29:26 P=0.310  high-freq error 0.83 deg/s  SRate max 0.90  Dmod min 1.00
+23:29:35 P=0.360  high-freq error 1.11 deg/s  SRate max 1.61  Dmod min 1.00
+23:29:45 P=0.420  high-freq error 107.88 deg/s  SRate max 79.77  Dmod min 1.00
+23:29:45 oscillation detected, stopping the sweep
+23:29:45 restored P; results in D:\AP Tuner\sitl\run-osc\results.json

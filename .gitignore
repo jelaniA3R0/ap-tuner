@@ -1,0 +1,18 @@
+# bundled runtimes and simulator binaries (downloaded / copied, not source)
+node/
+sitl/*.exe
+sitl/*.dll
+sitl/run*/
+sitl/*.log
+
+# generated results and user data
+demo/
+sessions/
+
+# C++ build output
+cpp/build/
+build/
+
+# editor / assistant settings
+.claude/
+.vscode/

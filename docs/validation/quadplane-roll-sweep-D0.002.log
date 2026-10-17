@@ -1,0 +1,10 @@
+23:47:52 measurement link alive on port 5772
+23:48:36 quadplane start: P=0.05999999865889549 D=0.0020000000949949026 FLTD=10
+23:48:45 P=0.108  high-freq error 0.70 deg/s  SRate max 0.17  Dmod min 1.00  (315 samples)
+23:48:54 P=0.135  high-freq error 0.51 deg/s  SRate max 0.18  Dmod min 1.00  (315 samples)
+23:49:03 P=0.170  high-freq error 0.44 deg/s  SRate max 0.19  Dmod min 1.00  (315 samples)
+23:49:12 P=0.200  high-freq error 0.24 deg/s  SRate max 0.18  Dmod min 1.00  (316 samples)
+23:49:21 P=0.230  high-freq error 0.40 deg/s  SRate max 0.27  Dmod min 1.00  (316 samples)
+23:49:30 P=0.270  high-freq error 71.39 deg/s  SRate max 79.36  Dmod min 0.58  (315 samples)
+23:49:30 oscillation detected, stopping the sweep
+23:49:30 restored P; results in D:\AP Tuner\sitl\run-osc\results.json
