@@ -239,10 +239,10 @@ class Link extends EventEmitter {
   /** other vehicles heard in the last 10 s: [{sysid, compid, type}] */
   othersSeen() { const now = Date.now(); return [...this.others.values()].filter(o => now - o.lastSeen < 10000).map(o => ({ sysid: o.sysid, compid: o.compid, type: o.type })); }
 
-  /** the autopilot's time since boot going back by more than 3 s is a reboot */
+  /** the autopilot's time since boot going back (by more than 0.5 s: it only ever counts up while it runs) is a reboot */
   _bootClock(ms, now) {
     const b = this.boot;
-    if (b.ms !== null && ms + 3000 < b.ms + (now - b.at)) {
+    if (b.ms !== null && ms + 500 < b.ms) {
       b.count++;
       this._rejectPending('the autopilot rebooted', 'rebooted');
       if (this.autopilot) this._prevAutopilot = this.autopilot;
@@ -278,6 +278,12 @@ class Link extends EventEmitter {
       if (++n < 6) this._apTimer = setTimeout(ask, 1000);
     };
     ask();
+  }
+  /** forget AUTOPILOT_VERSION and ask again (after a reboot: another board UID then counts as another vehicle) */
+  refreshAutopilot() {
+    if (this.autopilot) this._prevAutopilot = this.autopilot;
+    this.autopilot = null;
+    this._requestAutopilotVersion();
   }
   /** resolves with AUTOPILOT_VERSION once known, or null after ms */
   async waitAutopilot(ms = 3000) {

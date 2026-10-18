@@ -109,9 +109,10 @@ let txnSeq = 0;
  * anything is written), then written in order, each verified. The first failure stops the set and everything written
  * so far goes back to its value from before, newest first, each verified. Never throws; resolves
  *   {txn, ok, aborted, stale, cancelled, rows: [result], rollback: [result], rolledBack, uncertain: [{name, holds, why}]}
- * items: [{name, to, expect?, reason?}]; journal(kind, data); afterPreRead([{name, before}]) may throw to stop.
+ * items: [{name, to, expect?, reason?}]; journal(kind, data); afterPreRead([{name, before}]) may throw to stop;
+ * timeoutMs / retries / readRetries: per message (the defaults suit a telemetry radio).
  */
-async function runTransaction(link, items, { journal = null, keepGoing = null, afterPreRead = null, ctx = {} } = {}) {
+async function runTransaction(link, items, { journal = null, keepGoing = null, afterPreRead = null, ctx = {}, timeoutMs = 1500, retries = 3, readRetries = 2 } = {}) {
   const txn = ctx.txn || ++txnSeq;
   const out = { txn, ok: false, aborted: null, stale: [], cancelled: false, rows: [], rollback: [], rolledBack: false, uncertain: [] };
   const J = (kind, data) => (journal ? journal(kind, Object.assign({ txn }, ctx, data)) : true);
@@ -120,7 +121,7 @@ async function runTransaction(link, items, { journal = null, keepGoing = null, a
   const pre = [];
   for (const it of items) {
     let before, error = null;
-    try { before = await link.requestParam(it.name, 1500, 2); } catch (e) { error = e; }
+    try { before = await link.requestParam(it.name, timeoutMs, readRetries); } catch (e) { error = e; }
     pre.push({ it, before, error });
     if (error) break;
   }
@@ -149,7 +150,7 @@ async function runTransaction(link, items, { journal = null, keepGoing = null, a
       const r = { name: it.name, requested: it.to, sent: undefined, type: known.type, before, holds: before, status: 'unchanged', ok: true, error: null, note: null, reason: it.reason };
       out.rows.push(r); J('write', r); continue;
     }
-    const r = await verifiedSet(link, it.name, it.to, { before, keepGoing });
+    const r = await verifiedSet(link, it.name, it.to, { before, keepGoing, timeoutMs, retries, readRetries });
     r.reason = it.reason;
     out.rows.push(r); J('write', r);
     if (r.cancelled && !CHANGED.has(r.status)) { out.cancelled = true; break; }
@@ -162,7 +163,7 @@ async function runTransaction(link, items, { journal = null, keepGoing = null, a
   for (const r of out.rows.slice().reverse()) {
     if (!CHANGED.has(r.status) || (r.status === 'verified' && sameF32(r.holds, r.before))) continue;
     if (link.generation !== gen0) { out.uncertain.push({ name: r.name, holds: r.holds, why: 'the connection changed during the write: check it after reconnecting' }); continue; }
-    const rb = await verifiedSet(link, r.name, r.before, { before: r.holds });
+    const rb = await verifiedSet(link, r.name, r.before, { before: r.holds, timeoutMs, retries, readRetries });
     rb.rollbackOf = r.status;
     out.rollback.push(rb); J('rollback', rb);
     if (!rb.ok) out.uncertain.push({ name: r.name, holds: rb.holds, why: writeText(rb) });
@@ -186,8 +187,10 @@ function txnText(t) {
 /**
  * The reboot workflow for values that take effect only after a reboot (F-35): only disarmed; MAV_CMD_PREFLIGHT_REBOOT
  * (246) must be acknowledged by the target; the autopilot has to go away (heartbeat gap, closed connection or its
- * boot clock going back) and come back (a closed connection is reopened: USB, TCP); it must be the same vehicle (ids,
- * frame type, board UID and firmware where known); then every expected value is read fresh and compared exactly.
+ * boot clock going back) and come back (a closed connection is reopened: USB, TCP). The restart must be proven: the
+ * boot clock went back on the same connection, or the autopilot's time since boot is shorter than the time since the
+ * command (a lost heartbeat alone proves nothing). Then it must be the same vehicle (ids, frame type, board UID and
+ * firmware where known) and every expected value is read fresh and compared exactly.
  * expect: [{name, value}]. Never throws; resolves {ok, reason, rebooted, rows: [{name, expect, holds, ok}], identity}.
  */
 async function rebootAndVerify(link, expect, { journal = null, ctx = {}, timeoutMs = 60000, onInfo = null } = {}) {
@@ -199,20 +202,29 @@ async function rebootAndVerify(link, expect, { journal = null, ctx = {}, timeout
   const id0 = link.identity(); const opts0 = link.opts; const boot0 = link.boot.count; const gen0 = link.generation;
   const types = Object.fromEntries(expect.map(e => [e.name, (link.params.get(e.name) || {}).type]));
   J('reboot', { phase: 'request', identity: id0, expect });
-  let ack;
+  let ack; const tCmd = Date.now();
   try { ack = await link.commandAck(246, [1], 3000); } catch (e) { return fail('no answer to the reboot command: ' + e.message); }
   if (ack.result !== 0) return fail(`the autopilot refused to reboot (result ${ack.result})`);
   info('rebooting: the autopilot restarts, this takes a few seconds');
   const t0 = Date.now(); let gone = false, lastTry = 0;
   while (Date.now() - t0 < timeoutMs) {
     await sleep(200);
-    if (!gone && (link.generation !== gen0 || link.boot.count > boot0 || !link.connected || Date.now() - link.lastHeartbeatAt > 2500)) { gone = true; info('the autopilot is restarting'); }
+    if (!gone && (link.generation !== gen0 || link.boot.count > boot0 || !link.connected || Date.now() - link.lastHeartbeatAt > 1500)) { gone = true; info('the autopilot is restarting'); }
     // USB and TCP close on a reboot: open the same connection again until it answers
     if (gone && !link.connected && opts0 && opts0.kind !== 'test' && Date.now() - lastTry > 2500) { lastTry = Date.now(); try { link.connect(opts0); } catch (e) { /* not back yet */ } }
     if (gone && link.alive && Date.now() - link.lastHeartbeatAt < 1500) break;
   }
   if (!gone) return fail('the autopilot did not restart (its heartbeat never stopped)');
   if (!link.alive) return fail(`the autopilot did not come back within ${Math.round(timeoutMs / 1000)} s: reconnect it, then check the values`);
+  // proof of the restart: the boot clock went back, or the time since boot is shorter than the time since the command
+  const tBack = Date.now();
+  link.setMessageRate(2, 2);   // SYSTEM_TIME: the boot clock (the rates asked for before the reboot are gone)
+  while (Date.now() - tBack < 3000 && !(link.boot.count > boot0 && link.generation === gen0) && !(link.boot.ms !== null && link.boot.at >= tBack)) await sleep(100);
+  const uptime = link.boot.ms !== null && link.boot.at >= tBack ? link.boot.ms + (Date.now() - link.boot.at) : null;
+  const proven = (link.generation === gen0 && link.boot.count > boot0) || (uptime !== null && uptime < Date.now() - tCmd + 2000);
+  if (!proven) return fail(uptime === null ? 'the restart could not be confirmed (the autopilot sends no time since boot): power it off and on, then check the values' : `the autopilot did not restart (it has been running for ${Math.round(uptime / 1000)} s)`);
+  // who answers now: AUTOPILOT_VERSION again (a board with another UID is another vehicle)
+  link.refreshAutopilot();
   await link.waitAutopilot(3000);
   const id1 = link.identity();
   if (!sameVehicle(id0, id1)) return fail('a different vehicle answered after the reboot: ' + identityText(id1), { identity: id1 });

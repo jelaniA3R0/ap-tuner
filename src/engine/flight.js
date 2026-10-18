@@ -146,7 +146,8 @@ class FlightSession extends EventEmitter {
         }
         const hoverName = this.family === 'vtol' ? 'Q_M_THST_HOVER' : 'MOT_THST_HOVER';
         const hover = (this.family === 'plane') ? null : await this.link.requestParam(hoverName).catch(() => this.tuner.params[hoverName]);
-        this.overall = { results: res, summary, gains: JSON.parse(JSON.stringify(this.tuner.snapshot().gains)), vibe: this.tuner.vibe || null, hover, notch: this.tuner.params.INS_HNTCH_ENABLE > 0, t: Date.now() };
+        const notchPending = (this.tuner.rebootPending || []).some(p => /^INS_HNTCH_/.test(p.name));
+        this.overall = { results: res, summary, gains: JSON.parse(JSON.stringify(this.tuner.snapshot().gains)), vibe: this.tuner.vibe || null, hover, notch: this.tuner.params.INS_HNTCH_ENABLE > 0 && !notchPending, notchPending, t: Date.now() };
         this.overall.verdict = this._verdict(this.overall);
         this.setPhase('land', this.overall.verdict.ok ? 'all good: land when you are ready' : 'land when you are ready; the list shows what still needs attention'); return;
       }
@@ -185,7 +186,11 @@ class FlightSession extends EventEmitter {
       this.filters.status = { notchActive: st.notchActive, mode: st.mode, esc: st.escTelemetry, fft: st.fftCapable, fftEnabled: st.fftEnabled, freq: st.current.INS_HNTCH_FREQ };
       if (st.notchActive) { this.filters.result = 'kept'; this.note('ok', `notch filter already configured (mode ${st.mode}, ${st.current.INS_HNTCH_FREQ} Hz): kept`); }
       else if (!this.inFlight) { this.filters.result = 'off'; this.note('warn', 'changes in flight are off: the notch filter was not changed (set it on the ground, from a log)'); }
-      else if (st.escProposal) {
+      else if (st.escProposal && this.notch.rebootOnly(st.escProposal).length) {
+        // values that act only after a reboot cannot be checked in the air: the notch is set on the ground (F-35)
+        this.filters.result = 'ground';
+        this.note('warn', `the ESC RPM notch changes ${this.notch.rebootOnly(st.escProposal).join(', ')}, which take effect only after a reboot: after landing set it in the Notch panel (disarmed), then reboot`);
+      } else if (st.escProposal) {
         this.info = 'setting the notch to the ESC RPM; every axis is watched for oscillation for a few seconds';
         const a = await this.notch.applyEsc(); this.filters.result = 'esc'; this.filters.applied = a; this.note('ok', 'notch filter set to track the ESC RPM: ' + Object.entries(a).map(([k, v]) => k.replace('INS_HNTCH_', '') + ' ' + v).join(', '));
       } else if (st.fftCapable && st.fftEnabled && this.link.vehicle && this.link.vehicle.armed) {
@@ -230,7 +235,7 @@ class FlightSession extends EventEmitter {
     }
     if (ov.vibe) { const v = ov.vibe; const vib = Math.max(v.x, v.y, v.z); const good = vib < 30 && v.clip === 0; if (!good) ok = false; items.push({ ok: good, text: `vibration ${vib.toFixed(0)} (ArduPilot: below 30 is good)` + (v.clip ? `, ${v.clip} accelerometer clips` : '') }); }
     if (ov.hover !== null && ov.hover !== undefined) { const good = ov.hover > 0.2 && ov.hover < 0.7; items.push({ ok: good, text: `hover throttle ${ov.hover.toFixed(2)}` + (good ? ' (normal range)' : ' (outside 0.2 to 0.7: check the thrust-to-weight ratio)') }); }
-    items.push({ ok: ov.notch, text: ov.notch ? 'harmonic notch filter active' : 'no harmonic notch filter yet: set it from a log after landing' });
+    items.push({ ok: ov.notch, text: ov.notch ? 'harmonic notch filter active' : ov.notchPending ? 'harmonic notch filter set, but it takes effect only after a reboot (Notch panel, disarmed)' : 'no harmonic notch filter yet: set it from a log after landing' });
     if (!ov.notch) { /* a missing notch is advice, not a failure of this flight */ }
     return { ok, items };
   }

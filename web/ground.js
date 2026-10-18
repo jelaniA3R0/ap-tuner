@@ -1,8 +1,8 @@
 /* AP Tuner: the "Telemetry + USB" screen (fly on telemetry, write over USB after landing). Uses helpers from app.js. */
 'use strict';
 const G_ORDER = ['connect', 'fly', 'land', 'usb', 'review', 'write'];
-const G_OF = { idle: 'connect', flight: 'fly', capture: 'fly', captured: 'land', usb: 'usb', download: 'usb', review: 'review', writing: 'write', done: 'write', stopped: 'connect', error: null };
-const G_TITLE = { idle: 'Telemetry + USB', flight: 'Take off and hover', capture: 'Capturing 30 s', captured: 'Captured: land now', usb: 'Plug in the USB cable', download: 'Reading the flight log', review: 'What the app found', writing: 'Writing', done: 'Written', stopped: 'Stopped', error: 'Something went wrong' };
+const G_OF = { idle: 'connect', flight: 'fly', capture: 'fly', captured: 'land', usb: 'usb', download: 'usb', review: 'review', writing: 'write', rebooting: 'write', done: 'write', stopped: 'connect', error: null };
+const G_TITLE = { idle: 'Telemetry + USB', flight: 'Take off and hover', capture: 'Capturing 30 s', captured: 'Captured: land now', usb: 'Plug in the USB cable', download: 'Reading the flight log', review: 'What the app found', writing: 'Writing', rebooting: 'Rebooting the autopilot', done: 'Written', stopped: 'Stopped', error: 'Something went wrong' };
 const gAxes = () => $$('.gax:checked').map(x => x.value);
 let gLastPhase = null, gLastKey = '';
 
@@ -18,16 +18,24 @@ const gStart = guard(async () => {
 });
 const gUsb = (useSaved) => guard(async () => { await api('ground/usb', { useSaved }); toast('Plug the USB cable into the autopilot', 'ok'); });
 const gWrite = guard(async () => {
-  const g = snap.ground; const names = $$('.grow:checked').map(x => x.value);
+  const g = snap.ground; const names = $('.grow:checked').map(x => x.value);
   if (!names.length) { toast('Tick at least one change', 'bad'); return; }
-  const rows = g.rows.filter(r => names.includes(r.name)).map(r => `<tr class="changed"><td>${esc(r.name)}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`).join('');
-  const ok = await modal('Write these values to the autopilot?', `<p class="muted">The vehicle must stay disarmed. The current values are saved to an UNDO file first, and every value is read back after writing.</p><table class="gains"><tr><th>parameter</th><th>now</th><th>new</th></tr>${rows}</table>`, { yes: 'Write to the autopilot' });
+  if (!g.proposal) { toast('Nothing reviewed yet', 'bad'); return; }
+  const rows = g.rows.filter(r => names.includes(r.name)).map(r => `<tr class="changed"><td>${esc(r.name)}${r.reboot ? ' <span class="warn small">(acts after a reboot)</span>' : ''}</td><td>${f3(r.vehicle)}</td><td>${f3(r.value)}</td></tr>`).join('');
+  const ok = await modal('Write these values to the autopilot?', `<p class="muted">The vehicle must stay disarmed. Every value is read again first (if one changed since this review, nothing is written), the values from before are saved to an UNDO file, and every value is read back after writing. If one does not hold, everything written goes back to its value from before.</p><table class="gains"><tr><th>parameter</th><th>now</th><th>new</th></tr>${rows}</table><p class="muted small">For ${esc(g.identityText || '')} · list ${esc(g.proposal.id)} · ${esc(String(g.proposal.hash).slice(0, 8))}</p>`, { yes: 'Write to the autopilot' });
   if (!ok) return;
-  const r = await api('ground/write', { names });
-  const bad = r.results.filter(x => !x.ok).length;
-  toast(bad ? `${bad} value(s) need attention` : 'All values written and read back', bad ? 'bad' : 'ok');
+  const r = await api('ground/write', { names, id: g.proposal.id, hash: g.proposal.hash });
+  const bad = r.results.filter(x => !x.ok && x.status !== 'unchanged' && x.status !== 'after reboot').length;
+  toast(bad ? `${bad} value(s) did not hold: see the list` : 'All values written and read back', bad ? 'bad' : 'ok');
 });
-const gUndo = guard(async () => { if (await modal('Write the previous values back?', '<p>Every value this session changed goes back to what it was before.</p>', { yes: 'Undo' })) { await api('ground/undo', {}); toast('Previous values written back', 'ok'); } });
+const gUndo = guard(async () => { if (await modal('Write the previous values back?', '<p>Every value this session changed goes back to what it was before. Each one is read back; anything that does not go back is listed.</p>', { yes: 'Undo' })) { await api('ground/undo', {}); toast('Undo finished: see the list', 'ok'); } });
+const gRecheck = guard(async () => { await api('ground/recheck', {}); toast('Values read again from the autopilot', 'ok'); });
+const gReboot = guard(async () => {
+  const g = snap.ground; const names = [...(g.rebootPending || []).map(x => x.name), ...(g.afterReboot || []).map(x => x.name)];
+  if (!(await modal('Reboot the autopilot now?', `<p>Only disarmed, on the ground, USB plugged in. ${esc(names.join(', '))} take effect only after a reboot. The app waits for the autopilot to come back, checks that it is the same one and reads every value written here again${(g.afterReboot || []).length ? '; then it writes the notch values that only appear once the notch is on' : ''}.</p>`, { yes: 'Reboot', danger: true }))) return;
+  const r = await api('ground/reboot', {});
+  toast(r.ok ? 'Rebooted: the values were read back' : 'Reboot: ' + (r.reason || 'see the list'), r.ok ? 'ok' : 'bad');
+});
 const gStop = guard(async () => { await api('ground/stop', {}); });
 
 function gButtons(g) {
@@ -35,8 +43,10 @@ function gButtons(g) {
   const add = (label, cls, fn) => box.appendChild(fbtn(label, cls, fn));
   switch (g.phase) {
     case 'idle': case 'stopped': case 'error': case 'done':
-      add(g.phase === 'done' ? 'Start another flight' : 'Start', 'primary lg', gStart);
-      if (g.phase === 'done' && g.writes.some(w => w.ok && !w.same && !w.undone)) add('Undo (write the old values back)', '', gUndo);
+      if (g.phase === 'done' && ((g.rebootPending || []).length || (g.afterReboot || []).length)) add('Reboot the autopilot and check', 'good lg', gReboot);
+      add(g.phase === 'done' ? 'Start another flight' : 'Start', g.phase === 'done' ? '' : 'primary lg', gStart);
+      if (g.phase === 'done' && g.writes.some(w => w.changed && w.undo !== 'undone')) add('Undo (write the old values back)', '', gUndo);
+      if (g.phase === 'done') add('Read the values again', 'ghost', gRecheck);
       if (g.savedMark && g.phase !== 'done') add(`Landed already: use the 30 s marked at ${new Date(g.savedMark.savedAt).toLocaleTimeString()}`, '', gUsb(true));
       if (g.phase !== 'done') add('No telemetry: go straight to USB', 'ghost', gUsb(false));
       break;
@@ -44,7 +54,8 @@ function gButtons(g) {
     case 'capture': add('Stop', 'ghost', gStop); break;
     case 'captured': add('Landed: go to USB', 'primary', gUsb(false)); add('Capture again', '', guard(() => api('ground/again', {}))); add('Stop', 'ghost', gStop); break;
     case 'usb': case 'download': add('Stop', 'ghost', gStop); break;
-    case 'review': if (g.rows.length) add('Write to the autopilot', 'good lg', gWrite); add('Stop', 'ghost', gStop); break;
+    case 'review': if (g.rows.some(r => !r.blocked && !r.same)) add('Write to the autopilot', 'good lg', gWrite); add('Read the values again', 'ghost', gRecheck); add('Stop', 'ghost', gStop); break;
+    case 'writing': case 'rebooting': break;
     default: add('Stop', 'ghost', gStop);
   }
 }
@@ -60,17 +71,31 @@ function gAxisCard(ax, a) {
     ${rows ? `<table class="gains"><tr><th>gain</th><th>in the log</th><th>new</th><th>change</th></tr>${rows}</table>${bars}` : ''}</div>`;
 }
 function gRowsTable(g) {
-  let group = null; let html = '<table class="gains"><tr><th></th><th>parameter</th><th>on the autopilot now</th><th>new</th></tr>';
+  let group = null; let html = '<table class="gains"><tr><th></th><th>parameter</th><th>in the log</th><th>on the autopilot now</th><th>new</th><th></th></tr>';
   for (const r of g.rows) {
-    if (r.group !== group) { group = r.group; html += `<tr><td colspan="4" class="muted small" style="padding-top:8px">${esc(group)}</td></tr>`; }
-    html += `<tr class="changed"><td><input type="checkbox" class="grow" value="${esc(r.name)}" checked></td><td>${esc(r.name)}</td><td>${f3(r.vehicle ?? r.from)}</td><td>${f3(r.value)}</td></tr>`;
+    if (r.group !== group) { group = r.group; html += `<tr><td colspan="6" class="muted small" style="padding-top:8px">${esc(group)}</td></tr>`; }
+    const can = !r.blocked && !r.same;
+    const notes = [r.reason ? esc(r.reason) : '', r.reboot ? '<span class="warn">acts only after a reboot</span>' : '', r.deferred ? '<span class="warn">written after the reboot (it appears once the notch is on)</span>' : '',
+      ...(r.warnings || []).map(w => `<span class="warn">${esc(w)}</span>`), r.same ? 'already set' : '', r.blocked ? `<span class="bad">cannot be written: ${esc(r.blocked)}</span>` : ''].filter(Boolean).join(' · ');
+    html += `<tr class="${can ? 'changed' : ''}"><td><input type="checkbox" class="grow" value="${esc(r.name)}" ${can ? 'checked' : 'disabled'}></td><td>${esc(r.name)}<div class="muted small">${esc(r.label || '')}</div></td><td>${f3(r.from)}</td><td>${f3(r.vehicle)}</td><td>${f3(r.value)}</td><td class="small">${notes}</td></tr>`;
   }
   return html + '</table>';
+}
+/** the outcome of every row, as the autopilot holds it (never "read back" for a value that did not hold) */
+function gWritesTable(g) {
+  const cls = w => w.status === 'verified' || w.status === 'unchanged' ? 'changed' : '';
+  const state = w => {
+    const main = w.status === 'verified' ? '✓ read back' : w.status === 'unchanged' ? 'already set' : w.status === 'after reboot' ? `<span class="warn">${esc(w.text)}</span>` : `<span class="bad">${esc(w.text || w.status)}</span>`;
+    const undo = w.undo ? (w.undo === 'undone' ? ` · undone: ${esc(w.undoText || '')}` : ` · <span class="bad">undo: ${esc(w.undoText || w.undo)}</span>`) : '';
+    const rb = w.afterReboot ? ` · ${/read back/.test(w.afterReboot) ? esc(w.afterReboot) : '<span class="bad">' + esc(w.afterReboot) + '</span>'}` : '';
+    return main + (w.reboot && w.status === 'verified' && !w.afterReboot ? ' · <span class="warn">acts after a reboot</span>' : '') + rb + undo;
+  };
+  return `<table class="gains"><tr><th>parameter</th><th>before</th><th>on the autopilot</th><th></th></tr>${g.writes.map(w => `<tr class="${cls(w)}"><td>${esc(w.name)}</td><td>${f3(w.from)}</td><td>${f3(w.undo === 'undone' ? w.undoHolds : w.to)}</td><td class="small">${state(w)}</td></tr>`).join('')}</table>`;
 }
 const fileLinks = g => ['undo', 'param', 'bin'].filter(k => g.files && g.files[k]).map(k => `<a class="btn ghost" href="/api/ground/file?which=${k}" download>${k === 'undo' ? 'UNDO file' : k === 'param' ? 'Written values (.param)' : 'Log slice (.bin)'}</a>`).join('');
 
 function gBody(g) {
-  const key = g.phase + ':' + (g.writes || []).length + ':' + (g.result ? g.result.family : '') + ':' + (g.error || '');
+  const key = g.phase + ':' + JSON.stringify((g.writes || []).map(w => [w.status, w.undo, w.afterReboot])) + ':' + (g.proposal ? g.proposal.id : '') + ':' + (g.result ? g.result.family : '') + ':' + (g.error || '') + ':' + g.info;
   if (key === gLastKey && !['usb', 'download'].includes(g.phase)) return; gLastKey = key;
   const el = $('#gbody');
   switch (g.phase) {
@@ -90,12 +115,16 @@ function gBody(g) {
       el.innerHTML = `<div class="card"><h3>${g.phase === 'usb' ? 'Plug the USB cable into the autopilot' : 'Reading the log over USB'}</h3><p class="muted">${esc(g.info)}</p>${g.phase === 'download' && p ? `<div class="progress" style="margin-top:8px"><i style="width:${pct}%"></i></div>` : ''}
         <ul class="notes">${g.notes.map(n => `<li>${esc(n.text)}</li>`).join('')}</ul></div>`; break;
     }
-    case 'review': case 'writing': case 'done': {
+    case 'review': case 'writing': case 'rebooting': case 'done': {
       const r = g.result; if (!r) { el.innerHTML = ''; break; }
       let html = `<div class="banner ok"><div class="ico">📄</div><div style="flex:1"><b>${r.family === 'vtol' ? 'QuadPlane hover (Q_A_*)' : esc(r.family)} · ${esc(r.firmware || '')}</b><span>${g.notes.map(n => esc(n.text)).join(' · ')}</span></div><div class="row">${fileLinks(g)}</div></div>`;
+      if (g.identityText) html += `<p class="muted small" style="margin-top:6px">Autopilot on this connection: ${esc(g.identityText)}</p>`;
+      if (g.logCheck && g.logCheck.problems.length) html += `<div class="banner bad" style="margin-top:8px"><div class="ico">✖</div><div><b>This log does not match the autopilot on the cable</b><span>${g.logCheck.problems.map(esc).join(' · ')}. Nothing from it can be written.</span></div></div>`;
+      if (g.phase === 'writing' || g.phase === 'rebooting') html += `<div class="banner warn" style="margin-top:8px"><div class="ico">⏳</div><div><b>${g.phase === 'rebooting' ? 'Rebooting the autopilot' : 'Writing'}</b><span>${esc(g.info)}</span></div></div>`;
       html += `<div class="cards cols-auto" style="margin-top:12px">${(r.chosenAxes || []).map(ax => gAxisCard(ax, r.axes[ax])).join('')}</div>`;
       if (g.phase === 'review') html += g.rows.length ? `<div class="card" style="margin-top:12px"><h3>Changes to write</h3><p class="muted small">Untick anything you do not want. These are one round of changes: fly again afterwards and repeat until the app says no change is needed.</p>${gRowsTable(g)}</div>` : `<div class="banner warn" style="margin-top:12px"><div class="ico">⚠</div><div><b>Nothing to write</b><span>Either the gains are already right, or there was too little stick input in the 30 s. See the cards above.</span></div></div>`;
-      if (g.phase === 'done') html += `<div class="card" style="margin-top:12px"><h3>Written</h3><table class="gains"><tr><th>parameter</th><th>was</th><th>now</th><th></th></tr>${g.writes.map(w => `<tr class="${w.ok ? 'changed' : ''}"><td>${esc(w.name)}</td><td>${f3(w.from)}</td><td>${f3(w.to)}</td><td>${w.ok ? (w.same ? 'already set' : (w.undone ? 'undone' : (w.undoError ? '<span class="bad">undo failed</span>' : '✓ read back'))) : '<span class="bad">' + esc(w.error || 'failed') + '</span>'}</td></tr>`).join('')}</table><p class="muted small">Unplug the USB and fly again to check (run another capture). The UNDO file loads in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params.</p></div>`;
+      if (g.phase === 'done' && g.writes.length) html += `<div class="card" style="margin-top:12px"><h3>Written</h3><p class="${/fail|uncertain|refused|not written|did not|incomplete|holds/.test(g.info) ? 'bad' : 'muted'} small">${esc(g.info)}</p>${gWritesTable(g)}<p class="muted small">Unplug the USB and fly again to check (run another capture). The UNDO file loads in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params.</p></div>`;
+      else if (g.phase === 'done') html += `<div class="card" style="margin-top:12px"><h3>Values read again</h3><p class="muted small">${esc(g.info)}</p>${g.rows.length ? gRowsTable(g) : ''}</div>`;
       el.innerHTML = html; break;
     }
     case 'error': el.innerHTML = `<div class="banner bad"><div class="ico">✖</div><div><b>${esc(g.error || 'error')}</b><span>${g.notes.map(n => esc(n.text)).join(' · ')}</span></div></div>`; break;
@@ -119,7 +148,7 @@ function renderGround(s) {
   let prog = 0; if (g.phase === 'capture') prog = Math.min(100, 100 * el / (g.opts.seconds || 30)); else if (g.phase === 'download' && g.progress && g.progress.total) prog = 100 * g.progress.done / g.progress.total; else if (g.phase === 'done') prog = 100;
   $('#gprog').style.width = prog + '%';
   $('#gsetup').style.display = ['idle', 'stopped', 'done', 'error'].includes(g.phase) ? '' : 'none';
-  const bk = g.phase + ':' + !!g.savedMark + ':' + (g.writes || []).length;
+  const bk = g.phase + ':' + !!g.savedMark + ':' + JSON.stringify((g.writes || []).map(w => [w.status, w.undo])) + ':' + ((g.rebootPending || []).length + (g.afterReboot || []).length) + ':' + (g.proposal ? g.proposal.id : '') + ':' + (g.rows || []).filter(r => !r.blocked && !r.same).length;
   if (bk !== gLastPhase) { gButtons(g); gLastPhase = bk; }
   gBody(g);
 }

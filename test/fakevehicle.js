@@ -45,6 +45,7 @@ class FakeVehicle {
     this.streaming = true;        // PID_TUNING on / off (dropout)
     this.heartbeats = true;
     this.ignoreSets = false;      // never answer PARAM_SET (the link then retries)
+    this.ignoreReads = false;     // never answer PARAM_REQUEST_READ
     this.replyDelayMs = 5;
     this.echoDelayMs = null;      // delay of the echo of a PARAM_SET (null: replyDelayMs): late acknowledgements
     this.dropEchoes = 0;          // the next N writes are stored but their echo is lost
@@ -73,18 +74,22 @@ class FakeVehicle {
   /** attach to the link as its only vehicle (bus: share one link with other fake vehicles, see joinBus) */
   attach(link, bus = null) {
     this.link = link;
-    if (bus) { bus.push(this); if (bus.length === 1) link.attachTransport({ send: buf => { for (const v of bus.slice()) v._onSend(buf); }, close: () => {} }, 'fake vehicles'); }
-    else link.attachTransport({ send: buf => this._onSend(buf), close: () => {} }, 'fake vehicle');
+    // a closed transport (the link reconnected) delivers nothing more, like a closed socket
+    if (bus) {
+      bus.push(this);
+      if (bus.length === 1) { bus.transport = { closed: false, send: buf => { for (const v of bus.slice()) v._onSend(buf); }, close() { this.closed = true; } }; link.attachTransport(bus.transport, 'fake vehicles'); }
+      this._transport = bus.transport;
+    } else { this._transport = { closed: false, send: buf => this._onSend(buf), close() { this.closed = true; } }; link.attachTransport(this._transport, 'fake vehicle'); }
     this._t0 = Date.now(); this._nextPid = Date.now(); this._nextAtt = Date.now(); this._nextSlow = Date.now(); this._nextSys = Date.now();
     this._hb();
     this.timers.push(setInterval(() => this._hb(), 1000));
     this.timers.push(setInterval(() => this._tick(), 5));
     return this;
   }
-  stop() { for (const t of this.timers) clearInterval(t); this.timers = []; if (this.link) this.link.disconnect(); }
+  stop() { for (const t of this.timers) clearInterval(t); this.timers = []; if (this.link && this.link.transport === this._transport) this.link.disconnect(); }
   /** stop this vehicle's timers only (the link stays: other vehicles on the bus go on) */
   silence() { for (const t of this.timers) clearInterval(t); this.timers = []; }
-  feed(name, fields) { if (this.link && this.link.transport && !this._down) this.link.feed(this.enc.pack(name, fields)); }
+  feed(name, fields) { if (this.link && this._transport && !this._transport.closed && !this._down) this.link.feed(this.enc.pack(name, fields)); }
   setsOf(name) { return this.sets.filter(s => s.name === name); }
   typeOf(name) { return this.types[name] || 9; }
 
@@ -171,7 +176,7 @@ class FakeVehicle {
       const f = m.fields;
       if (f.target_system !== undefined && f.target_system !== 0 && f.target_system !== this.sysid) continue;   // for another vehicle
       if (this._down) continue;   // rebooting: nothing is heard
-      if (m.name === 'PARAM_REQUEST_READ') { this.reads.push({ t: Date.now(), name: f.param_id }); if (this._exists(f.param_id)) this._reply(f.param_id); }
+      if (m.name === 'PARAM_REQUEST_READ') { this.reads.push({ t: Date.now(), name: f.param_id }); if (this._exists(f.param_id) && !this.ignoreReads) this._reply(f.param_id); }
       else if (m.name === 'PARAM_SET') this._set(f.param_id, f.param_value);
       else if (m.name === 'COMMAND_LONG') this._command(m);
     }

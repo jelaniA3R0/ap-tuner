@@ -123,6 +123,8 @@ class Tuner extends EventEmitter {
     // every PARAM_VALUE of the vehicle keeps the cache current; a change the app did not make is reported (Q94)
     L.on('param', (name, value) => this._onParamValue(name, value));
     L.on('vehicle-change', c => this._onConnectionChange('another vehicle answered (' + c.reason + ')'));
+    // a reboot loses the requested message rates: ask again (the values are the same: the identity was checked)
+    L.on('reboot', () => { if (this.family) { this.requestStreams(); this.log('link', 'the autopilot rebooted: streams re-requested'); } });
     L.on('heartbeat', v => {
       if (this._preparedGen !== undefined && this._preparedGen !== L.generation) this._onConnectionChange('the connection changed');
       if (!this.family && Object.keys(this.params).length) this.family = detectFamily(v, this.params);
@@ -580,8 +582,8 @@ class Tuner extends EventEmitter {
     let steps = 1;
     for (const k of keys) { const a = cur[k] || 1e-6, b = target[k] || 1e-6; if (a > 0 && b > 0) steps = Math.max(steps, Math.ceil(Math.abs(Math.log(b / a)) / Math.log(this.opts.stepMax) - 1e-9)); }
     steps = Math.min(steps, 6);
-    // filters / smax first (small effect), then the gains stepwise, the angle gain last
-    const pre = {}; for (const k of ['FLTT', 'FLTE', 'FLTD', 'SMAX']) if (target[k] !== undefined) pre[k] = target[k];
+    // filters, smax and the I limit first (small effect), then the gains stepwise, the angle gain last
+    const pre = {}; for (const k of ['FLTT', 'FLTE', 'FLTD', 'SMAX', 'IMAX']) if (target[k] !== undefined) pre[k] = target[k];
     if (!(await this._change(job, axis, pre, 'apply filters'))) return false;
     for (let s = 1; s <= steps; s++) {
       const g = {};
