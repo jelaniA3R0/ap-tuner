@@ -8,7 +8,8 @@ if (-not $SkipBuild) {
   if ($LASTEXITCODE -ne 0) { throw 'build failed' }
 }
 $bin = Join-Path $root 'cpp\build\release'
-$stage = Join-Path $env:TEMP 'aptuner-cpp-stage'
+# stage next to the zip, not in %TEMP%: drive C: may be nearly full
+$stage = Join-Path (Split-Path -Parent $root) 'aptuner-cpp-stage'
 $dst = Join-Path $stage 'AP Tuner C++'
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force $dst | Out-Null

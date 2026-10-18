@@ -6,7 +6,8 @@ set "SRC=%~dp0"
 set "DST=%LOCALAPPDATA%\Programs\AP Tuner"
 echo Installing AP Tuner to "%DST%" ...
 if not exist "%DST%" mkdir "%DST%"
-robocopy "%SRC%." "%DST%" /E /NFL /NDL /NJH /NJS /XD sessions run /XF "Install AP Tuner.cmd" >nul
+rem never copy the git history, the C++ edition, demo results or editor folders when run from a source checkout
+robocopy "%SRC%." "%DST%" /E /NFL /NDL /NJH /NJS /XD sessions run run-* demo _old .git .claude .vscode cpp build node_modules /XF "Install AP Tuner.cmd" *.log eeprom.bin >nul
 if not exist "%DST%\sessions" mkdir "%DST%\sessions"
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ws = New-Object -ComObject WScript.Shell;" ^
