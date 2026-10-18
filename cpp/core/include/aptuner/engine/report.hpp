@@ -25,8 +25,11 @@ struct ParamFileOut {
 ParamFileOut paramFileChecked(const core::Json& rows, const std::vector<std::string>& header = {}, const core::Json& identity = core::Json(), bool strict = true);
 std::string paramFile(const core::Json& rows, const std::vector<std::string>& header = {}, const core::Json& identity = core::Json(), bool strict = true);
 
-/** the vehicle a log comes from: {sysid, fw, gitHash, firmwareText} (SYSID_THISMAV, the version and hash of its MSG text) */
+/** the vehicle a log comes from: {sysid, fw, gitHash, firmwareText} (SYSID_THISMAV or, from ArduPilot 4.7 on, MAV_SYSID; the version and hash
+    of its MSG text) */
 core::Json logIdentity(const core::Json& result);
+/** the sentence naming the vehicle of a log (the header of a .param file made from it) */
+std::string logIdentityText(const core::Json& result);
 /** does the log come from the vehicle on this connection? {log, problems: [text] (writing is refused), notes: [text]} */
 core::Json logVehicleCheck(const core::Json& result, const core::Json& identity);
 

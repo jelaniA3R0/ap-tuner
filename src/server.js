@@ -14,7 +14,7 @@ const { NotchLive } = require('./engine/notchlive');
 const { FlightSession } = require('./engine/flight');
 const { GroundTune } = require('./engine/groundtune');
 const { analyzeLog } = require('./engine/loganalysis');
-const { proposalRows, paramFileChecked, logIdentity } = require('./engine/report');
+const { proposalRows, paramFileChecked, logIdentityText } = require('./engine/report');
 const { PRESETS } = require('./model/rules');
 const { axisParamNames } = require('./engine/vehicle');
 const { Journal } = require('./engine/journal');
@@ -212,9 +212,7 @@ function liveParamFile() {
 }
 /** the .param text of a log analysis (checked; the vehicle is the one in the log) */
 function logParamFile(r) {
-  const L = logIdentity(r);
-  const who = `the vehicle of log ${path.basename(r.file)}: system id ${L.sysid === null ? 'not in the log' : L.sysid}, ${L.firmwareText || 'firmware not in the log'}`;
-  const out = paramFileChecked(r.rows, [`From log ${path.basename(r.file)} (${r.firmware || ''}), ${r.family}, preset ${Object.values(r.axes).find(a => a && a.preset)?.preset || 'normal'}`, 'Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters.'], { identity: who });
+  const out = paramFileChecked(r.rows, [`From log ${path.basename(r.file)} (${r.firmware || ''}), ${r.family}, preset ${Object.values(r.axes).find(a => a && a.preset)?.preset || 'normal'}`, 'Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters.'], { identity: logIdentityText(r) });
   journal.append('export', { what: 'log .param', file: r.file, rows: r.rows.map(x => ({ name: x.name, value: x.value })), errors: out.errors, warnings: out.warnings });
   return out;
 }

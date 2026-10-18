@@ -53,17 +53,24 @@ function paramFileChecked(rows, header = [], { identity = null, strict = true } 
 }
 function paramFile(rows, header = [], opts = {}) { return paramFileChecked(rows, header, opts).text; }
 
-/** the vehicle a log comes from: system id (SYSID_THISMAV), firmware version and git hash from its MSG text */
+/** the vehicle a log comes from: system id (SYSID_THISMAV, MAV_SYSID from ArduPilot 4.7 on), firmware version and git hash from its MSG text */
 function logIdentity(result) {
   const p = (result && result.params) || {};
+  const sysid = typeof p.SYSID_THISMAV === 'number' ? p.SYSID_THISMAV : typeof p.MAV_SYSID === 'number' ? p.MAV_SYSID : null;
   const m = /V(\d+)\.(\d+)\.(\d+)/.exec((result && result.firmware) || '');
   const h = /\(([0-9a-f]{6,})\)/i.exec((result && result.firmware) || '');
-  return { sysid: typeof p.SYSID_THISMAV === 'number' ? p.SYSID_THISMAV : null, fw: m ? `${m[1]}.${m[2]}.${m[3]}` : null, gitHash: h ? h[1].toLowerCase() : null, firmwareText: (result && result.firmware) || null };
+  return { sysid, fw: m ? `${m[1]}.${m[2]}.${m[3]}` : null, gitHash: h ? h[1].toLowerCase() : null, firmwareText: (result && result.firmware) || null };
+}
+/** the sentence naming the vehicle of a log (the header of a .param file made from it) */
+function logIdentityText(result) {
+  const L = logIdentity(result);
+  const base = String((result && result.file) || 'log').split(/[\\/]/).pop();
+  return `the vehicle of log ${base}: system id ${L.sysid === null ? 'not in the log' : L.sysid}, ${L.firmwareText || 'firmware not in the log'}`;
 }
 /** does the log come from the vehicle on this connection? {problems: [text] (writing is refused), notes: [text]} */
 function logVehicleCheck(result, identity) {
   const L = logIdentity(result); const problems = [], notes = [];
-  if (L.sysid === null) notes.push('the log has no SYSID_THISMAV: the system id could not be compared');
+  if (L.sysid === null) notes.push('the log has no SYSID_THISMAV / MAV_SYSID: the system id could not be compared');
   else if (identity && identity.sysid !== null && identity.sysid !== undefined && L.sysid !== identity.sysid) problems.push(`the log is from system id ${L.sysid}, the autopilot on this connection is system id ${identity.sysid}`);
   const fw = identity && identity.fw ? String(identity.fw).replace(/-.*$/, '') : null;
   if (!L.fw || !fw) notes.push('the firmware version could not be compared (' + (!L.fw ? 'not in the log' : 'the autopilot did not report it') + ')');
@@ -72,4 +79,4 @@ function logVehicleCheck(result, identity) {
   return { log: L, problems, notes };
 }
 
-module.exports = { proposalRows, paramFile, paramFileChecked, logIdentity, logVehicleCheck, PRETTY };
+module.exports = { proposalRows, paramFile, paramFileChecked, logIdentity, logIdentityText, logVehicleCheck, PRETTY };

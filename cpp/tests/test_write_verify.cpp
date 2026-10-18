@@ -203,7 +203,12 @@ GRig groundSetup(std::map<std::string, double> params = test::copterParams()) {
 /** the Telemetry + USB review, as after a log download: the log's values and the proposed rows */
 Json review(app::GroundTune& g, const Json& rows, const Json& logParams = Json::object(), const std::string& firmware = "ArduCopter V4.5.7 (abcdef12)") {
   Json params = Json::obj({{"SYSID_THISMAV", 1}});
-  for (const auto& [k, v] : logParams.items()) params.set(k, v);
+  for (const auto& [k, v] : logParams.items()) {
+    if (v.isNull())
+      params.erase(k);
+    else
+      params.set(k, v);
+  }
   g.result = Json::obj({{"family", "copter"}, {"firmware", firmware}, {"params", params}, {"axes", Json::object()}, {"chosenAxes", Json::array()}});
   Json rs = Json::array();
   for (const auto& r : rows.arr()) {
@@ -838,7 +843,7 @@ TEST(wv_ground_value_changed_since_review_writes_nothing) {
 
 TEST(wv_ground_log_of_another_vehicle_or_firmware_blocked) {
   GRig G = groundSetup();
-  Json ap = review(*G.g, rollRows(), Json::obj({{"SYSID_THISMAV", 7}}));
+  Json ap = review(*G.g, rollRows(), Json::obj({{"SYSID_THISMAV", Json()}, {"MAV_SYSID", 7}}));   // ArduPilot 4.7 name
   bool all = true;
   for (const auto& row : G.g->rows().arr())
     if (!has(row["blocked"].strOr(""), "the log is from system id 7, the autopilot on this connection is system id 1")) all = false;

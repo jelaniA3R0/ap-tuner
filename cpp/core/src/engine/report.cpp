@@ -145,10 +145,19 @@ Json logIdentity(const Json& result) {
   const bool hasHash = std::regex_search(fwText, h, hashRe);
   std::string hash = hasHash ? h[1].str() : "";
   std::transform(hash.begin(), hash.end(), hash.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-  return Json::obj({{"sysid", p["SYSID_THISMAV"].isNumber() ? p["SYSID_THISMAV"] : Json()},
+  return Json::obj({{"sysid", p["SYSID_THISMAV"].isNumber() ? p["SYSID_THISMAV"] : p["MAV_SYSID"].isNumber() ? p["MAV_SYSID"] : Json()},
                     {"fw", hasVer ? Json(m[1].str() + "." + m[2].str() + "." + m[3].str()) : Json()},
                     {"gitHash", hasHash ? Json(hash) : Json()},
                     {"firmwareText", fwText.empty() ? Json() : Json(fwText)}});
+}
+
+std::string logIdentityText(const Json& result) {
+  const Json L = logIdentity(result);
+  std::string base = result["file"].isString() && !result["file"].str().empty() ? result["file"].str() : "log";
+  const auto cut = base.find_last_of("\\/");
+  if (cut != std::string::npos) base = base.substr(cut + 1);
+  return "the vehicle of log " + base + ": system id " + (L["sysid"].isNull() ? std::string("not in the log") : jsText(L["sysid"])) + ", " +
+         (L["firmwareText"].isString() ? L["firmwareText"].str() : std::string("firmware not in the log"));
 }
 
 Json logVehicleCheck(const Json& result, const Json& identity) {
@@ -156,7 +165,7 @@ Json logVehicleCheck(const Json& result, const Json& identity) {
   Json problems = Json::array(), notes = Json::array();
   const bool hasId = identity.isObject();
   if (L["sysid"].isNull())
-    notes.push("the log has no SYSID_THISMAV: the system id could not be compared");
+    notes.push("the log has no SYSID_THISMAV / MAV_SYSID: the system id could not be compared");
   else if (hasId && identity["sysid"].isNumber() && L["sysid"].num() != identity["sysid"].num())
     problems.push("the log is from system id " + jsText(L["sysid"]) + ", the autopilot on this connection is system id " + jsText(identity["sysid"]));
   std::string fw;

@@ -64,7 +64,8 @@ function maxWriteRatio(fv, base) {
 }
 /** the Telemetry + USB review, as after a log download: the log's values and the proposed rows */
 async function review(g, rows, { logParams = {}, firmware = 'ArduCopter V4.5.7 (abcdef12)' } = {}) {
-  g.result = { family: 'copter', firmware, params: Object.assign({ SYSID_THISMAV: 1 }, logParams), axes: {}, chosenAxes: [] };
+  const params = Object.assign({ SYSID_THISMAV: 1 }, logParams); for (const k of Object.keys(params)) if (params[k] === undefined) delete params[k];
+  g.result = { family: 'copter', firmware, params, axes: {}, chosenAxes: [] };
   g.rows = rows.map(r => Object.assign({ group: 'roll', label: r.name }, r));
   await g._review();
   g.setPhase('review', 'test review');
@@ -556,7 +557,7 @@ test('wv_ground_value_changed_since_review_writes_nothing', async () => {
 test('wv_ground_log_of_another_vehicle_or_firmware_blocked', async () => {
   const G = await groundSetup();
   try {
-    let ap = await review(G.g, ROLL_ROWS, { logParams: { SYSID_THISMAV: 7 } });
+    let ap = await review(G.g, ROLL_ROWS, { logParams: { SYSID_THISMAV: undefined, MAV_SYSID: 7 } });   // ArduPilot 4.7 name
     assert.ok(G.g.rows.every(r => /the log is from system id 7, the autopilot on this connection is system id 1/.test(r.blocked)));
     await assert.rejects(G.g.write(['ATC_RAT_RLL_P'], ap), /cannot be written/);
     ap = await review(G.g, ROLL_ROWS, { firmware: 'ArduCopter V4.5.6 (abcdef12)' });

@@ -357,10 +357,8 @@ class App {
   }
   /** the .param text of a log analysis (checked; the vehicle is the one in the log) */
   engine::ParamFileOut logParamFile(const Json& r) {
-    const Json L = engine::logIdentity(r);
     const std::string base = pathStr(fsPath(r["file"].strOr("log.bin")).filename());
-    const std::string who = "the vehicle of log " + base + ": system id " + (L["sysid"].isNull() ? std::string("not in the log") : engine::jsText(L["sysid"])) + ", " +
-                            (L["firmwareText"].isString() ? L["firmwareText"].str() : std::string("firmware not in the log"));
+    const std::string who = engine::logIdentityText(r);
     std::string presetName = "normal";
     for (const auto& [k, a] : r["axes"].items())
       if (a["preset"].isString()) {
