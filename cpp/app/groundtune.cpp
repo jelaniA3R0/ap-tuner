@@ -659,9 +659,9 @@ rt::Task<Json> GroundTune::rebootNow() {
     co_return reboot_;
   }
   rebootPending_ = Json::array();
+  // the identity of the new connection (the link may have reopened): the same vehicle was checked by rebootAndVerify
+  identity_ = engine::sessionIdentity(link_.identity(), Json());
   if (afterReboot_.size()) {
-    // the identity of the new connection (the link may have reopened): the same vehicle was checked by rebootAndVerify
-    identity_ = engine::sessionIdentity(link_.identity(), Json());
     const Json later = afterReboot_;
     afterReboot_ = Json::array();
     Json items = Json::array();
@@ -736,6 +736,7 @@ rt::Task<void> GroundTune::undo() {
     w.set("undo", r["ok"].asBool() ? Json("undone") : r["status"]);
     w.set("undoText", r["ok"].asBool() ? "back to " + fmt6(r["holds"]) + " (read back)" : writeText(r));
     w.set("undoHolds", r["holds"]);
+    w.set("afterReboot", Json());   // the last reboot's check was about the value written, not this one
     if (r["ok"].asBool() && w["reboot"].asBool() && r["status"].str() == "verified") {
       Json next = Json::array();
       for (const auto& x : rebootPending_.arr())

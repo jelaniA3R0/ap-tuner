@@ -605,8 +605,10 @@ test('wv_ground_notch_reboot_workflow_with_values_after_reboot', async () => {
     assert.ok(G.g.writes.every(w => /read back after the reboot/.test(w.afterReboot || 'read back after the reboot')));
     // Undo: REF waits for a reboot again; the reboot checks the values from before (not the values written)
     const before = Object.fromEntries(G.g.writes.map(w => [w.name, w.from]));
+    assert.deepStrictEqual(G.g.writes.map(w => !!w.afterReboot), [true, true, true, true, false]);
     await G.g.undo();
     assert.deepStrictEqual(G.g.writes.map(w => w.undo), ['undone', 'undone', 'undone', 'undone', null], 'HMNCS did not change');
+    assert.deepStrictEqual(G.g.writes.map(w => !!w.afterReboot), [false, false, false, false, false], 'the reboot notes were about the values written (HMNCS was never written)');
     assert.deepStrictEqual(G.g.rebootPending.map(x => x.name), ['INS_HNTCH_REF']);
     await G.g.rebootNow();
     assert.strictEqual(G.fv.reboots, 3); assert.strictEqual(G.g.rebootPending.length, 0);
@@ -666,6 +668,23 @@ test('wv_journal_is_append_only', async () => {
     assert.ok(w.every(e => 'requested' in e && 'sent' in e && 'echo' in e && 'status' in e && 'identity' in e && 'gen' in e));
     const appr = events(S.journal).filter(e => e.kind === 'approval');
     assert.strictEqual(appr.length, 2); assert.ok(appr.every(a => a.by === 'user' && a.proposal && a.hash));
+  } finally { await S.done(); }
+});
+
+test('wv_journal_names_the_vehicle_before_housekeeping_writes', async () => {
+  const p = copterParams(); p.GCS_PID_MASK = 0;
+  const S = await setup({ params: p });
+  try {
+    const ev = events(S.journal);
+    const firstWrite = ev.findIndex(e => e.kind === 'write');
+    assert.strictEqual(ev[firstWrite].name, 'GCS_PID_MASK');
+    const before = ev.slice(0, firstWrite).filter(e => e.kind === 'identity');
+    assert.strictEqual(before.length, 1, 'one identity event before the first write');
+    assert.strictEqual(before[0].identity.key, ev[firstWrite].identity);
+    assert.ok(before[0].identity.uid && before[0].identity.fw, 'board UID and firmware in it');
+    assert.strictEqual(ev.filter(e => e.kind === 'identity').length, 2, 'and the identity after the housekeeping values (their hash)');
+    assert.ok(ev.every(e => !Object.values(e).includes(undefined)));
+    assert.ok('readBack' in ev[firstWrite] && ev[firstWrite].readBack === null, 'a value not known is written as null (as in C++)');
   } finally { await S.done(); }
 });
 

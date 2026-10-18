@@ -344,9 +344,9 @@ class GroundTune extends EventEmitter {
     for (const w of this.writes) { const x = res.rows.find(y => y.name === w.name); if (x) w.afterReboot = x.ok ? 'read back after the reboot' : (x.holds === undefined ? 'no answer after the reboot' : `holds ${fmt(x.holds)} after the reboot`); }
     if (!res.ok) { this.setPhase('done', 'reboot: ' + res.reason); return this.reboot; }
     this.rebootPending = [];
+    // the identity of the new connection (the link may have reopened): the same vehicle was checked by rebootAndVerify
+    this.identity = sessionIdentity(this.link.identity(), null);
     if (this.afterReboot.length) {
-      // the identity of the new connection (the link may have reopened): same vehicle checked by rebootAndVerify
-      this.identity = sessionIdentity(this.link.identity(), null);
       const later = this.afterReboot; this.afterReboot = [];
       const txn = await runTransaction(this.link, later.map(r => ({ name: r.name, to: r.value, reason: r.label })), { journal: (k, d) => this.audit.append(k, d), ctx: { via: 'ground write after the reboot', identity: this.identity.key } });
       for (const r of later) { const w = this.writes.find(x => x.name === r.name); const nw = this._rowResult(Object.assign({}, r, { deferred: false }), txn); if (w) Object.assign(w, nw); }
@@ -375,6 +375,7 @@ class GroundTune extends EventEmitter {
       else r = await verifiedSet(this.link, w.name, w.from, { before: cur });
       this.audit.append('write', Object.assign({ via: 'ground undo', identity: this.identity ? this.identity.key : null }, r));
       w.undo = r.ok ? 'undone' : r.status; w.undoText = r.ok ? `back to ${fmt(r.holds)} (read back)` : writeText(r); w.undoHolds = r.holds;
+      w.afterReboot = null;   // the last reboot's check was about the value written, not this one
       if (r.ok && w.reboot && r.status === 'verified') this.rebootPending = this.rebootPending.filter(x => x.name !== w.name).concat([{ name: w.name, value: r.holds }]);
     }
     const bad = todo.filter(w => w.undo !== 'undone');

@@ -18,15 +18,16 @@ const gStart = guard(async () => {
 });
 const gUsb = (useSaved) => guard(async () => { await api('ground/usb', { useSaved }); toast('Plug the USB cable into the autopilot', 'ok'); });
 const gWrite = guard(async () => {
-  const g = snap.ground; const names = $('.grow:checked').map(x => x.value);
+  const g = snap.ground; const names = $$('.grow:checked').map(x => x.value);
   if (!names.length) { toast('Tick at least one change', 'bad'); return; }
   if (!g.proposal) { toast('Nothing reviewed yet', 'bad'); return; }
   const rows = g.rows.filter(r => names.includes(r.name)).map(r => `<tr class="changed"><td>${esc(r.name)}${r.reboot ? ' <span class="warn small">(acts after a reboot)</span>' : ''}</td><td>${f3(r.vehicle)}</td><td>${f3(r.value)}</td></tr>`).join('');
   const ok = await modal('Write these values to the autopilot?', `<p class="muted">The vehicle must stay disarmed. Every value is read again first (if one changed since this review, nothing is written), the values from before are saved to an UNDO file, and every value is read back after writing. If one does not hold, everything written goes back to its value from before.</p><table class="gains"><tr><th>parameter</th><th>now</th><th>new</th></tr>${rows}</table><p class="muted small">For ${esc(g.identityText || '')} · list ${esc(g.proposal.id)} · ${esc(String(g.proposal.hash).slice(0, 8))}</p>`, { yes: 'Write to the autopilot' });
   if (!ok) return;
   const r = await api('ground/write', { names, id: g.proposal.id, hash: g.proposal.hash });
-  const bad = r.results.filter(x => !x.ok && x.status !== 'unchanged' && x.status !== 'after reboot').length;
-  toast(bad ? `${bad} value(s) did not hold: see the list` : 'All values written and read back', bad ? 'bad' : 'ok');
+  // a refused value and the others that went back with it: the list and the summary say which is which
+  const bad = r.results.some(x => !x.ok && x.status !== 'unchanged' && x.status !== 'after reboot');
+  toast(bad ? 'Not everything was written: see the list' : 'All values written and read back', bad ? 'bad' : 'ok');
 });
 const gUndo = guard(async () => { if (await modal('Write the previous values back?', '<p>Every value this session changed goes back to what it was before. Each one is read back; anything that does not go back is listed.</p>', { yes: 'Undo' })) { await api('ground/undo', {}); toast('Undo finished: see the list', 'ok'); } });
 const gRecheck = guard(async () => { await api('ground/recheck', {}); toast('Values read again from the autopilot', 'ok'); });
@@ -88,7 +89,9 @@ function gWritesTable(g) {
     const main = w.status === 'verified' ? '✓ read back' : w.status === 'unchanged' ? 'already set' : w.status === 'after reboot' ? `<span class="warn">${esc(w.text)}</span>` : `<span class="bad">${esc(w.text || w.status)}</span>`;
     const undo = w.undo ? (w.undo === 'undone' ? ` · undone: ${esc(w.undoText || '')}` : ` · <span class="bad">undo: ${esc(w.undoText || w.undo)}</span>`) : '';
     const rb = w.afterReboot ? ` · ${/read back/.test(w.afterReboot) ? esc(w.afterReboot) : '<span class="bad">' + esc(w.afterReboot) + '</span>'}` : '';
-    return main + (w.reboot && w.status === 'verified' && !w.afterReboot ? ' · <span class="warn">acts after a reboot</span>' : '') + rb + undo;
+    const waits = w.reboot && !w.afterReboot && (g.rebootPending || []).some(p => p.name === w.name) ? ' · <span class="warn">acts after a reboot</span>' : '';
+    // in the order things happened: written, (undone), waiting for the reboot, read back after it
+    return main + undo + waits + rb;
   };
   return `<table class="gains"><tr><th>parameter</th><th>before</th><th>on the autopilot</th><th></th></tr>${g.writes.map(w => `<tr class="${cls(w)}"><td>${esc(w.name)}</td><td>${f3(w.from)}</td><td>${f3(w.undo === 'undone' ? w.undoHolds : w.to)}</td><td class="small">${state(w)}</td></tr>`).join('')}</table>`;
 }

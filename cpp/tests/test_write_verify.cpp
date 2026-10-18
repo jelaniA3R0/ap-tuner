@@ -910,8 +910,10 @@ TEST(wv_ground_notch_reboot_workflow_with_values_after_reboot) {
   // Undo: REF waits for a reboot again; the reboot checks the values from before (not the values written)
   std::map<std::string, Json> before;
   for (const auto& w : G.g->writes().arr()) before[w["name"].str()] = w["from"];
+  CHECK(fieldList(G.g->writes(), "afterReboot") == "read back after the reboot,read back after the reboot,read back after the reboot,read back after the reboot,null");
   valueOf(G.g->undo().future());
   CHECK(fieldList(G.g->writes(), "undo") == "undone,undone,undone,undone,null");   // HMNCS did not change
+  CHECK(fieldList(G.g->writes(), "afterReboot") == "null,null,null,null,null");   // the notes were about the values written (HMNCS was never written)
   CHECK(fieldList(G.g->rebootPending(), "name") == "INS_HNTCH_REF");
   valueOf(G.g->rebootNow().future());
   CHECK(G.fv->reboots == 3 && G.g->rebootPending().size() == 0);
@@ -1004,6 +1006,33 @@ TEST(wv_journal_is_append_only) {
   const auto appr = eventsOf(*r.journal, "approval");
   CHECK(appr.size() == 2);
   for (const auto& a : appr) CHECK(a["by"].strOr("") == "user" && a["proposal"].isString() && a["hash"].isString());
+  done(r);
+}
+
+TEST(wv_journal_names_the_vehicle_before_housekeeping_writes) {
+  auto p = test::copterParams();
+  p["GCS_PID_MASK"] = 0;
+  Rig r = setup(false, false, p);
+  const auto ev = events(*r.journal);
+  std::size_t firstWrite = ev.size();
+  for (std::size_t i = 0; i < ev.size() && firstWrite == ev.size(); i++)
+    if (ev[i]["kind"].strOr("") == "write") firstWrite = i;
+  CHECK(firstWrite < ev.size() && ev[firstWrite]["name"].strOr("") == "GCS_PID_MASK");
+  int before = 0, all = 0;
+  std::string key;
+  for (std::size_t i = 0; i < ev.size(); i++)
+    if (ev[i]["kind"].strOr("") == "identity") {
+      ++all;
+      if (i < firstWrite) {
+        ++before;
+        key = ev[i]["identity"]["key"].strOr("");
+        CHECK(ev[i]["identity"]["uid"].isString() && ev[i]["identity"]["fw"].isString());   // board UID and firmware in it
+      }
+    }
+  CHECK(before == 1);   // one identity event before the first write
+  CHECK(firstWrite < ev.size() && key == ev[firstWrite]["identity"].strOr("?"));
+  CHECK(all == 2);   // and the identity after the housekeeping values (their hash)
+  CHECK(firstWrite < ev.size() && ev[firstWrite].has("readBack") && ev[firstWrite]["readBack"].isNull());   // a value not known is null (as in JS)
   done(r);
 }
 
@@ -1184,7 +1213,7 @@ TEST(wv_sitl_ground_write) {
   const int gen0 = link->generation();
   const double tr = rt::Loop::now();
   const Json rb = rebootF(*g);
-  step(rb["ok"].asBool() && g->rebootPending().size() == 0, "rebooted in " + fmtv((rt::Loop::now() - tr) / 1000) + " s, every value read back after the reboot (connection #" +
+  step(rb["ok"].asBool() && g->rebootPending().size() == 0 && g->snapshot()["identity"]["gen"].numOr(-1) == link->generation(), "rebooted in " + fmtv((rt::Loop::now() - tr) / 1000) + " s, every value read back after the reboot (connection #" +
                                                                 std::to_string(gen0) + " -> #" + std::to_string(link->generation()) + "): " + g->info());
   std::map<std::string, double> fresh;
   auto freshText = [&]() {

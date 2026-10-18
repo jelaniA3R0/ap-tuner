@@ -333,7 +333,9 @@ rt::Task<Json> Tuner::prepareInner(bool confirm) {
                          {"checks", checks}, {"gains", gainsAll()}, {"loopHz", loopHz}});
   }
   if (writes.size()) {
-    // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too
+    // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too;
+    // the journal names the vehicle before anything is written to it
+    audit_->append("identity", Json::obj({{"identity", identity}, {"via", "read the vehicle, before the housekeeping values"}, {"family", core::familyName(*fam)}}));
     auto job = beginJob("prepare");
     ScopeExit guard{[this, job] { endJob(job); }};
     for (const auto& w : writes.arr()) {

@@ -97,7 +97,7 @@ async function phases(link, g) {
   check(g.rebootPending.map(x => x.name).join() === 'INS_HNTCH_REF', 'INS_HNTCH_REF waits for a reboot: ' + g.info);
   const gen0 = link.generation; const t0 = Date.now();
   const rb = await g.rebootNow();
-  check(rb.ok && g.rebootPending.length === 0, `rebooted in ${((Date.now() - t0) / 1000).toFixed(1)} s, every value read back after the reboot (connection #${gen0} -> #${link.generation}): ${g.info}`);
+  check(rb.ok && g.rebootPending.length === 0 && g.identity.gen === link.generation, `rebooted in ${((Date.now() - t0) / 1000).toFixed(1)} s, every value read back after the reboot (connection #${gen0} -> #${link.generation}): ${g.info}`);
   fresh = {}; for (const n of nn) fresh[n] = await read(link, n);
   check(nn.every(n => sameF32(fresh[n], target[n])), 'read fresh after the reboot: ' + nn.map(n => `${n} ${fmt(fresh[n])}`).join(', '));
   await g.undo();

@@ -201,7 +201,9 @@ class Tuner extends EventEmitter {
     const checks = this.safetyChecks();
     if (writes.length && !confirm) { this.setState('ready', `${fam} detected; ${writes.length} housekeeping setting(s) need your OK`); return { family: fam, vehicle: v, needsConfirm: true, writes, checks, gains: Object.fromEntries(AXES.map(a => [a, currentGains(fam, a, this.params)])), loopHz: this.loopHz }; }
     if (writes.length) {
-      // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too
+      // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too;
+      // the journal names the vehicle before anything is written to it
+      this.audit.append('identity', { identity: this.identity, via: 'read the vehicle, before the housekeeping values', family: fam });
       const job = this._beginJob('prepare');
       try { for (const w of writes) await this.setParam(w.name, w.to, w.why.split('.')[0], job); } finally { this._endJob(job); }
     }

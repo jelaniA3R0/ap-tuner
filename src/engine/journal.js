@@ -11,13 +11,15 @@ class Journal {
   constructor(dir) { this.dir = dir; this.file = null; this.error = null; this.count = 0; this.lost = 0; this.recent = []; }
   /** append one event {t, kind, ...data}; false when it could not be written (the error stays: the journal has a gap) */
   append(kind, data = {}) {
-    const e = Object.assign({ t: Date.now(), kind }, data);
+    // a value not known is written as null, as the C++ edition writes it (the same fields in both journals)
+    const line = JSON.stringify(Object.assign({ t: Date.now(), kind }, data), (k, v) => (v === undefined ? null : v));
+    const e = JSON.parse(line);
     try {
       if (!this.file) {
         fs.mkdirSync(this.dir, { recursive: true });
         this.file = path.join(this.dir, new Date().toISOString().replace(/[:.]/g, '-') + '.jsonl');
       }
-      fs.appendFileSync(this.file, JSON.stringify(e) + '\n');
+      fs.appendFileSync(this.file, line + '\n');
       this.count++;
     } catch (err) { this.error = err.message; this.lost++; return false; }
     this.recent.push(e); if (this.recent.length > 300) this.recent.shift();
