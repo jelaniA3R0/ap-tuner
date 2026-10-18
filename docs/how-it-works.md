@@ -137,7 +137,7 @@ analyses, proposes; with auto-apply it writes filters first, then P/I/D in multi
 ≤ ×1.5 (D before P), then the angle gain (also ≤ ×1.5 per write). Rounds repeat (at most four per
 axis) until the rate gains change by less than 10% and the angle gain by less than 15%, then the
 next axis. Everything written is journaled in `sessions/*.json` (requested and echoed value,
-armed or not) and **Restore original gains** rewrites the originals. A QuikTune-style ramp (same
+armed or not) and in the append-only write journal (below), and **Restore original gains** rewrites the originals. A QuikTune-style ramp (same
 doubling time, back-off and limits as the Lua applet) is available as a fallback when no model can
 be identified.
 
@@ -170,6 +170,57 @@ be identified.
   the notch is switched off first. The result is checked (sustained criterion after 4 s); the message says
   what was written back, or "land now". Without the opt-in, and without any in-flight write of the app in
   this session, nothing is written: the pilot is told to land.
+
+**Verified writes bound to the vehicle** (2026-10-17 audit R3; `mavlink/link.js`, `engine/paramwrite.js`,
+`engine/identity.js`, `engine/journal.js`, `model/parammeta.js`; the same in the C++ port):
+
+* *Pinned target (F-28).* The link talks to the first heartbeat from an ArduPilot autopilot (autopilot 3,
+  component 1, not a GCS, gimbal, camera or ADS-B type). Messages from any other system or component are dropped
+  (counted as foreign) and other vehicles are reported. A connection generation goes up on every connect and on a
+  vehicle change (the target silent for 5 s while another answers, another frame type, another board UID); every
+  pending request is then rejected (`link-changed`, with the number of attempts already sent) and no echo or
+  `COMMAND_ACK` of an older generation resolves anything. An ACK counts only when its target is 0 or the app
+  (255/190).
+* *Identity (F-25).* `AUTOPILOT_VERSION` (requested with `MAV_CMD_REQUEST_MESSAGE` and the older
+  `REQUEST_AUTOPILOT_CAPABILITIES`) gives firmware, git hash and board UID; `time_boot_ms` in the target's messages
+  going back by more than 0.5 s counts as a reboot (pending requests rejected, identity read again). The session
+  identity is `{gen, sysid, compid, type, uid, fw, gitHash, key "g<gen>:<sysid>/<compid>", paramHash}`; a
+  proposal made for one key is never written on another, and a log is checked against the vehicle (`MAV_SYSID` /
+  `SYSID_THISMAV`, firmware version and build) before its values can be written.
+* *Exact verification (F-29 / F-30).* `verifiedSet` casts the value as the parameter's `MAV_PARAM_TYPE` stores it
+  (integers rounded half away from zero and range-checked, REAL32 through `Math.fround`), sends it and compares
+  the echo exactly; a missing or different echo is followed by one fresh read. Status: `verified`, `refused` (the
+  value from before is still there), `different`, `not-applied`, `uncertain`, `missing`, `invalid`, `cancelled`
+  or `not-sent`. Requested, sent and echoed values, the read-back, type and attempts are journaled. Every
+  `PARAM_VALUE` keeps the tuner's cache current; a change the app did not make is journaled as a conflict.
+* *Transactions (F-32).* `runTransaction` reads every value fresh first (a missing value or one that changed
+  since the review aborts before anything is sent; the ground write saves the UNDO file at this point), writes in
+  order, stops at the first value that does not hold and rolls back newest first, each roll-back verified; a
+  generation change stops it and lists what is uncertain.
+* *Approval (F-33).* A proposal carries an id and an FNV-1a 64 hash over `APT-PROPOSAL 1`, the identity (key,
+  UID, firmware) and every `name=float32(to) from float32(from)`; Apply and the ground write take `{id, hash}`
+  and refuse anything else, a stale proposal or another vehicle. The dialog shows full names, reasons, the
+  values that act after a reboot and the id/hash. IMAX is written with the gains it belongs to.
+* *Reboot-only values (F-35).* `INS_HNTC[H2]_REF`, `_HMNCS`, `_OPTS` and `FFT_ENABLE` (`@RebootRequired`) are
+  refused while armed (`reboot-required`). On the ground `rebootAndVerify` sends `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`
+  (disarmed only, an ACK from the target), waits until the autopilot is gone, reconnects when the transport
+  closed, proves the restart (the boot clock went back, or the uptime is shorter than the time since the
+  command), checks that it is the same vehicle and reads every expected value (after an Undo, the values from
+  before). Notch values that appear only once the notch is on are written after it.
+* *Journal (F-39).* `sessions/journal/<start>.jsonl`, one JSON line per event (`identity`, `proposal`, `approval`,
+  `txn`, `write`, `rollback`, `reboot`, `refused`, `conflict`, `connection`, `export`), appended before the app
+  goes on and never rewritten; a value not known is written as null. A lost line blocks forward writes until a
+  restart (corrections still go out).
+* *Export (F-43).* `paramFileChecked` writes CRLF `NAME,VALUE` lines with the shortest decimal that gives the same
+  float32, whole numbers for integer parameters, the vehicle on the header line, the value from before and the
+  reboot note on comment lines, and leaves out (with a `# NOT IN THIS FILE` line) a value outside ArduPilot's
+  hard range, an invalid enum or an undocumented bit.
+
+Checked on ArduCopter SITL 4.7.2-beta (`tools/sitl-ground-write.js --cpp`, both editions, disarmed): a ground write
+of four gains read back, UNDO file, Undo read back; a `@READONLY` value reported as refused ("Param write denied")
+with the other value rolled back; `INS_GYRO_FILTER` (INT16) 20.6 sent as 21; the notch with `REF` needing a reboot,
+the reboot over TCP (the simulator re-executes, the app reconnects; about 4-6 s), every value read again, Undo and a
+second reboot. ArduPilot 4.7 names the system id `MAV_SYSID`; notch parameters can be read while the notch is off.
 
 The local server only obeys its own page: Host (and Origin when sent) must be 127.0.0.1 / localhost on its
 port, `Sec-Fetch-Site: cross-site` is refused, state-changing routes accept only POST with the per-run token
