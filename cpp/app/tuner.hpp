@@ -1,14 +1,19 @@
 // Live tuning session: observe -> identify -> propose -> (apply in bounded steps, each change watched) -> observe
 // again, per axis; the QuikTune-style ramp as a fallback; the parameter journal with restore / undo; and the in-flight
 // safety layer (opt-in, one write lock with cancellation, all-axis oscillation monitor, watch after every in-flight
-// change that fails closed, evidence-based revert). Port of src/engine/tuner.js (runs on the event loop).
+// change that fails closed, evidence-based revert) and the verified writes bound to the vehicle (2026-10-17 audit R3: every
+// write verified exactly and journaled, the session identity on every analysis and proposal, Apply bound to the
+// proposal's id + hash, a fresh read before an apply, the whole apply written back when a write does not verify,
+// reboot-only values never in flight). Port of src/engine/tuner.js (runs on the event loop).
 #pragma once
 
 #include <deque>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "aptuner/core/json.hpp"
@@ -16,6 +21,7 @@
 #include "aptuner/io/link.hpp"
 #include "aptuner/rt/async.hpp"
 #include "aptuner/rt/emitter.hpp"
+#include "journal.hpp"
 #include "liveaxis.hpp"
 
 namespace aptuner::app {
@@ -41,12 +47,27 @@ class TripError : public rt::Error {
   Trip trip;
 };
 
+/** thrown by a write that did not verify (code "verify"); result: the paramwrite result */
+class VerifyError : public rt::Error {
+ public:
+  VerifyError(const std::string& msg, Json r) : rt::Error(msg, "verify"), result(std::move(r)) {}
+  Json result;
+};
+
 /** the holder of the single write lock */
 struct Job {
   int id = 0;
   std::string kind;
   bool corrective = false, handlesTrips = false, abortWatch = false;
   std::string cancelled;   // non-empty: pause / stop asked it to write nothing more
+  int gen = 0;             // the connection it was taken on: it never writes on another one
+  int txn = 0;             // the journal's transaction number (0: none yet)
+  std::vector<std::pair<std::string, Json>> touched;   // every value it wrote, with the value before (rollback)
+  bool touchedHas(const std::string& name) const {
+    for (const auto& t : touched)
+      if (t.first == name) return true;
+    return false;
+  }
 };
 
 struct Calm {
@@ -76,7 +97,8 @@ struct Change {
 
 class Tuner : public rt::Emitter {
  public:
-  Tuner(io::Link& link, const std::string& sessionDir);
+  /** journal: the write journal of the app run (null: one of its own in sessionDir/journal) */
+  Tuner(io::Link& link, const std::string& sessionDir, Journal* journal = nullptr);
   ~Tuner();
 
   // ---- session setup
@@ -100,7 +122,12 @@ class Tuner : public rt::Emitter {
   rt::Task<void> stop();
   rt::Task<void> restoreOriginals();
   rt::Task<void> undoAxis(const std::string& axis);
-  rt::Task<bool> applyProposal(const std::string& axis);
+  /** approval = {id, hash} of the proposal shown; a write that does not verify rolls the whole apply back and throws
+      (code "apply-failed", the session pauses) */
+  rt::Task<bool> applyProposal(const std::string& axis, Json approval = Json());
+  /** the proposal gets its full rows (name, from, to, reason, reboot flag), an id and a hash over the identity and them */
+  Json& bindProposal(const std::string& axis, Json& proposal);
+  Journal& audit() { return *audit_; }
   /** a vehicle-wide change (notch, gyro filter, FFT) through the write lock, watched in flight; true if it held */
   rt::Task<bool> applyFilterChange(Json values, std::string reason);
   /** values the vehicle changed by itself ({name: {from, to}}): watched like the app's own changes */
@@ -135,6 +162,10 @@ class Tuner : public rt::Emitter {
   std::vector<std::shared_ptr<Change>> changes;
   Json monitor;
   Json lastTrip;
+  Json identity;                           // the session identity (taken when the vehicle is read)
+  Json paramsAtPrepare = Json::object();   // the values read then
+  Json rebootPending = Json::array();      // [{name, value}] written on the ground, effective after a reboot
+  std::string expectExternal;              // who changes values on the vehicle right now (the autopilot's FFT tune)
 
  private:
   friend struct TunerTestAccess;   // cpp/tests: the private ramp steps, as test/live-safety.test.js calls them
@@ -158,7 +189,7 @@ class Tuner : public rt::Emitter {
   };
   struct CorrectiveResult {
     std::vector<Target> written;
-    std::vector<std::string> failed;
+    std::vector<std::string> failed, failedText;
   };
   rt::Task<Json> prepareInner(bool confirm);
   rt::Task<bool> applyStaged(const std::string& axis, Json target, std::shared_ptr<Job> job);
@@ -166,7 +197,14 @@ class Tuner : public rt::Emitter {
   rt::Future<WatchResult> watchChange(std::shared_ptr<Job> job, std::shared_ptr<Change> ch);
   rt::Task<CheckResult> watchCorrective(std::vector<std::string> watchAxes);
   rt::Task<void> handleTrip(std::shared_ptr<Job> job, Trip trip, std::shared_ptr<Change> ch);
-  rt::Task<CorrectiveResult> corrective(std::shared_ptr<Job> job, std::vector<Target> targets, std::string reason);
+  rt::Task<CorrectiveResult> corrective(std::shared_ptr<Job> job, std::vector<Target> targets, std::string reason, bool fresh = false);
+  void checkApproval(const Json& p, const Json& approval);
+  rt::Task<bool> applyBound(std::string axis, Json p, std::shared_ptr<Job> job);
+  rt::Task<void> freshCheck(Json rows);
+  rt::Task<void> rollback(std::string axis, std::shared_ptr<Job> job, std::string errMsg, Json errResult);
+  void onParamValue(const std::string& name, double value);
+  void onConnectionChange(const std::string& why);
+  void notePendingReboot(const std::string& name);
   rt::Task<void> userCorrective(std::string kind, std::vector<Target> targets, std::string reason);
   rt::Task<void> takeOver();
   rt::Task<bool> waitNoJob(double ms);
@@ -203,7 +241,11 @@ class Tuner : public rt::Emitter {
   std::uint64_t timer_ = 0, monitorTimer_ = 0;
   int loopGen_ = 0;
   std::string sessionDir_, sessionFile_;
-  int linkGen_ = -1, preparedGen_ = -1;
+  int linkGen_ = -1, preparedGen_ = -1, droppedGen_ = -1;
+  std::unique_ptr<Journal> ownJournal_;
+  Journal* audit_ = nullptr;
+  std::set<std::string> writingNames_;
+  int txnSeq_ = 0;
   bool armedSeen_ = false;
   std::shared_ptr<Job> job_;
   int jobSeq_ = 0, changeSeq_ = 0;

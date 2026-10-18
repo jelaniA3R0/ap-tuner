@@ -3,6 +3,8 @@
 add_library(aptuner_app STATIC
   common.cpp
   liveaxis.cpp
+  journal.cpp
+  paramwrite.cpp
   tuner.cpp
   notchlive.cpp
   flight.cpp

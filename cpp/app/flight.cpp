@@ -330,8 +330,11 @@ rt::Task<void> FlightSession::step() {
         hover = tuner_.params[hoverName];
       }
     }
+    bool notchPending = false;
+    for (const auto& p : tuner_.rebootPending.arr())
+      if (p["name"].strOr("").rfind("INS_HNTCH_", 0) == 0) notchPending = true;
     overall_ = Json::obj({{"results", res}, {"summary", summary}, {"gains", gainsNow()}, {"vibe", tuner_.vibe}, {"hover", hover},
-                          {"notch", jv(tuner_.params, "INS_HNTCH_ENABLE") > 0}, {"t", Loop::now()}});
+                          {"notch", jv(tuner_.params, "INS_HNTCH_ENABLE") > 0 && !notchPending}, {"notchPending", notchPending}, {"t", Loop::now()}});
     overall_.set("verdict", verdict(overall_));
     setPhase("land", overall_["verdict"]["ok"].asBool() ? "all good: land when you are ready"
                                                          : "land when you are ready; the list shows what still needs attention");
@@ -408,6 +411,12 @@ rt::Task<void> FlightSession::startFilters() {
     } else if (!inFlight()) {
       filters_.set("result", "off");
       note("warn", "changes in flight are off: the notch filter was not changed (set it on the ground, from a log)");
+    } else if (st["escProposal"].isObject() && !notch_.rebootOnly(st["escProposal"]).empty()) {
+      // values that act only after a reboot cannot be checked in the air: the notch is set on the ground (F-35)
+      filters_.set("result", "ground");
+      std::string list;
+      for (const auto& n : notch_.rebootOnly(st["escProposal"])) list += (list.empty() ? "" : ", ") + n;
+      note("warn", "the ESC RPM notch changes " + list + ", which take effect only after a reboot: after landing set it in the Notch panel (disarmed), then reboot");
     } else if (st["escProposal"].isObject()) {
       info_ = "setting the notch to the ESC RPM; every axis is watched for oscillation for a few seconds";
       const Json a = co_await notch_.applyEsc();
@@ -544,7 +553,10 @@ Json FlightSession::verdict(const Json& ov) const {
                           {"text", "hover throttle " + jsToFixed(h, 2) + (good ? " (normal range)" : " (outside 0.2 to 0.7: check the thrust-to-weight ratio)")}}));
   }
   const bool notch = ov["notch"].asBool();
-  items.push(Json::obj({{"ok", notch}, {"text", notch ? "harmonic notch filter active" : "no harmonic notch filter yet: set it from a log after landing"}}));
+  items.push(Json::obj({{"ok", notch},
+                        {"text", notch ? "harmonic notch filter active"
+                                       : ov["notchPending"].asBool() ? "harmonic notch filter set, but it takes effect only after a reboot (Notch panel, disarmed)"
+                                                                      : "no harmonic notch filter yet: set it from a log after landing"}}));
   return Json::obj({{"ok", ok}, {"items", items}});
 }
 

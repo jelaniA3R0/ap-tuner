@@ -76,6 +76,7 @@ function formatParamValue(name, value) {
   const rule = paramRule(name);
   if (rule && rule.int && Number.isInteger(value)) return value.toFixed(0);
   const f = Math.fround(value);
+  if (!Number.isFinite(f)) return String(f);   // never in a checked file (refused); an UNDO file keeps what it read
   if (f === 0) return '0';
   const e = decExp(Math.abs(f));
   for (let p = 1; p <= 9; p++) {

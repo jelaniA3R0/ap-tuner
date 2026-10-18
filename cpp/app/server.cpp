@@ -13,6 +13,7 @@
 
 #include "aptuner/core/build_info.hpp"
 #include "aptuner/core/jsnum.hpp"
+#include "aptuner/engine/identity.hpp"
 #include "aptuner/engine/loganalysis.hpp"
 #include "aptuner/engine/report.hpp"
 #include "aptuner/engine/vehicle.hpp"
@@ -24,6 +25,7 @@
 #include "flight.hpp"
 #include "groundtune.hpp"
 #include "http.hpp"
+#include "journal.hpp"
 #include "notchlive.hpp"
 #include "tuner.hpp"
 
@@ -112,8 +114,8 @@ HttpResponse jsonResp(int code, const Json& j) {
 }
 
 // API routes that only read: GET, no token. Everything else under /api/ changes state: POST + token.
-const std::set<std::string> kReadRoutes{"/api/events", "/api/ports", "/api/presets", "/api/notch/status", "/api/live/rows", "/api/live/param",
-                                        "/api/log/list", "/api/log/param", "/api/ground/result", "/api/ground/state", "/api/ground/file"};
+const std::set<std::string> kReadRoutes{"/api/events",   "/api/ports",         "/api/presets",       "/api/notch/status", "/api/live/rows", "/api/live/param",
+                                        "/api/log/list", "/api/log/param",     "/api/ground/result", "/api/ground/state", "/api/ground/file", "/api/journal"};
 
 std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -240,7 +242,13 @@ Json sanitizeOpts(const Json& b) {
 class App {
  public:
   explicit App(const AppOptions& o)
-      : opts_(o), token_(randomHex(24)), tuner(link, pathStr(fsPath(o.sessionsDir))), notch(link, tuner), flight(link, tuner, notch), ground(link, o.sessionsDir) {
+      : opts_(o),
+        token_(randomHex(24)),
+        journal(pathStr(fsPath(o.sessionsDir) / "journal")),   // one append-only write journal for this run
+        tuner(link, pathStr(fsPath(o.sessionsDir)), &journal),
+        notch(link, tuner),
+        flight(link, tuner, notch),
+        ground(link, o.sessionsDir, &journal) {
     link.on("status", [this](const Json& s) { tuner.log("link", s.strOr("")); });
     tuner.on("log", [this](const Json& e) { hub.publish("log", e.dump()); });
     tuner.on("state", [this](const Json& s) { hub.publish("state", s.dump()); });
@@ -309,6 +317,7 @@ class App {
     return j;
   }
 
+  /** the live session's values: every tuned gain and the notch block, with the value read at the start (changed: differs) */
   Json liveRows() {
     Json rows = Json::array();
     const Json snap = tuner.snapshot();
@@ -317,20 +326,56 @@ class App {
       const Json n = engine::axisParamNames(*tuner.family, *core::parseAxis(ax));
       const Json& g = snap["gains"][ax];
       const Json& o = tuner.originals[ax];
-      for (const char* k : {"P", "I", "D", "FF", "FLTT", "FLTE", "FLTD", "SMAX", "angleP", "tconst"}) {
+      for (const char* k : {"P", "I", "D", "FF", "FLTT", "FLTE", "FLTD", "SMAX", "IMAX", "angleP", "tconst"}) {
         if (!n[k].isString() || !g[k].isNumber()) continue;
-        const double v = g[k].num();
-        Json row = Json::obj({{"group", ax}, {"name", n[k]}, {"value", core::jsRoundPrecision(v, 6)}});
-        if (o[k].isNumber()) row.set("from", o[k]);
-        row.set("label", k);
-        row.set("changed", o[k].isNumber() && std::fabs(o[k].num() - v) > 1e-6 * std::max(1.0, std::fabs(o[k].num())));
-        rows.push(row);
+        rows.push(Json::obj({{"group", ax}, {"name", n[k]}, {"value", g[k]}, {"from", o[k]}, {"label", k}, {"changed", o[k].isNumber() && !engine::sameF32(o[k], g[k])}}));
       }
     }
+    const Json& at = tuner.paramsAtPrepare;
     for (const char* k : {"INS_HNTCH_ENABLE", "INS_HNTCH_MODE", "INS_HNTCH_FREQ", "INS_HNTCH_BW", "INS_HNTCH_ATT", "INS_HNTCH_REF", "INS_HNTCH_HMNCS",
                           "INS_HNTCH_OPTS", "INS_HNTCH_FM_RAT", "INS_GYRO_FILTER"})
-      if (tuner.params[k].isNumber()) rows.push(Json::obj({{"group", "notch"}, {"name", k}, {"value", tuner.params[k]}, {"label", k}}));
+      if (tuner.params[k].isNumber())
+        rows.push(Json::obj({{"group", "notch"}, {"name", k}, {"value", tuner.params[k]}, {"from", at[k]}, {"label", k},
+                             {"changed", at[k].isNumber() && !engine::sameF32(at[k], tuner.params[k])}}));
     return rows;
+  }
+  /** the .param text of the values a session changed (checked, fixed point, the vehicle named in the header) */
+  engine::ParamFileOut liveParamFile() {
+    Json rows = Json::array();
+    const Json all = liveRows();
+    for (const auto& r : all.arr())
+      if (r["changed"].asBool()) rows.push(r);
+    std::vector<std::string> head{"Live session values read from the vehicle on " + localNow() + ": the " + core::jsToString(static_cast<double>(rows.size())) +
+                                  " value(s) this session changed"};
+    if (!rows.size()) head.push_back("Nothing was changed in this session.");
+    engine::ParamFileOut out = engine::paramFileChecked(rows, head, tuner.identity.isObject() ? tuner.identity : link.identity());
+    Json list = Json::array();
+    for (const auto& r : rows.arr()) list.push(Json::obj({{"name", r["name"]}, {"value", r["value"]}}));
+    journal.append("export", Json::obj({{"what", "live .param"}, {"rows", list}, {"errors", out.errors}, {"warnings", out.warnings},
+                                        {"identity", tuner.identity.isObject() ? tuner.identity["key"] : Json()}}));
+    return out;
+  }
+  /** the .param text of a log analysis (checked; the vehicle is the one in the log) */
+  engine::ParamFileOut logParamFile(const Json& r) {
+    const Json L = engine::logIdentity(r);
+    const std::string base = pathStr(fsPath(r["file"].strOr("log.bin")).filename());
+    const std::string who = "the vehicle of log " + base + ": system id " + (L["sysid"].isNull() ? std::string("not in the log") : engine::jsText(L["sysid"])) + ", " +
+                            (L["firmwareText"].isString() ? L["firmwareText"].str() : std::string("firmware not in the log"));
+    std::string presetName = "normal";
+    for (const auto& [k, a] : r["axes"].items())
+      if (a["preset"].isString()) {
+        presetName = a["preset"].str();
+        break;
+      }
+    engine::ParamFileOut out = engine::paramFileChecked(
+        r["rows"],
+        {"From log " + base + " (" + r["firmware"].strOr("") + "), " + r["family"].strOr("") + ", preset " + presetName,
+         "Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters."},
+        Json(who));
+    Json list = Json::array();
+    for (const auto& x : r["rows"].arr()) list.push(Json::obj({{"name", x["name"]}, {"value", x["value"]}}));
+    journal.append("export", Json::obj({{"what", "log .param"}, {"file", r["file"]}, {"rows", list}, {"errors", out.errors}, {"warnings", out.warnings}}));
+    return out;
   }
 
   /** API handlers that run on the loop thread */
@@ -390,7 +435,8 @@ class App {
       co_return ok();
     }
     if (path == "/api/apply") {
-      const bool applied = co_await tuner.applyProposal(body["axis"].strOr(""));
+      // the approval names the proposal it showed (id + hash): another proposal is not written (F-33)
+      const bool applied = co_await tuner.applyProposal(body["axis"].strOr(""), Json::obj({{"id", body["id"]}, {"hash", body["hash"]}}));
       if (applied && tuner.state != "paused") tuner.resume();
       co_return jsonResp(200, Json::obj({{"ok", applied}}));
     }
@@ -415,9 +461,12 @@ class App {
       co_return jsonResp(200, p);
     }
     if (path == "/api/notch/status") co_return jsonResp(200, co_await notch.status());
-    if (path == "/api/notch/esc") co_return ok(Json::obj({{"applied", co_await notch.applyEsc()}}));
+    if (path == "/api/notch/esc") {
+      const Json applied = co_await notch.applyEsc();
+      co_return ok(Json::obj({{"applied", applied}, {"rebootNeeded", notch.rebootNeeded()}}));
+    }
     if (path == "/api/notch/fft/enable") co_return ok(co_await notch.enableFft());
-    if (path == "/api/notch/reboot") co_return ok(co_await notch.reboot());
+    if (path == "/api/notch/reboot") co_return jsonResp(200, co_await notch.reboot());
     if (path == "/api/notch/fft/start") co_return ok(co_await notch.startFftTune());
     if (path == "/api/notch/fft/stop") co_return ok(co_await notch.stopFftTune());
     if (path == "/api/flight/start") {
@@ -488,11 +537,25 @@ class App {
       std::vector<std::string> names;
       for (const auto& n : body["names"].arr())
         if (n.isString()) names.push_back(n.str());
-      co_return ok(Json::obj({{"results", co_await ground.write(names)}}));
+      co_return ok(Json::obj({{"results", co_await ground.write(names, Json::obj({{"id", body["id"]}, {"hash", body["hash"]}}))}}));
     }
     if (path == "/api/ground/undo") {
       co_await ground.undo();
       co_return ok();
+    }
+    if (path == "/api/ground/recheck") {
+      co_await ground.recheck();
+      co_return ok();
+    }
+    if (path == "/api/ground/reboot") co_return ok(co_await ground.rebootNow());
+    if (path == "/api/journal") {
+      Json entries = Json::array();
+      const auto& rec = journal.recent();
+      for (std::size_t i = rec.size() > 200 ? rec.size() - 200 : 0; i < rec.size(); i++) entries.push(rec[i]);
+      Json j = Json::obj({{"entries", entries}});
+      const Json st = journal.status();
+      for (const auto& [k, v] : st.items()) j.set(k, v);
+      co_return jsonResp(200, j);
     }
     if (path == "/api/ground/stop") {
       ground.stop();
@@ -513,7 +576,7 @@ class App {
     if (path == "/api/live/param") {
       HttpResponse r;
       r.contentType = "text/plain";
-      r.body = engine::paramFile(liveRows(), {"Live session gains read from the vehicle on " + localNow()});
+      r.body = liveParamFile().text;
       r.headers.push_back({"Content-Disposition", "attachment; filename=\"AP Tuner live gains.param\""});
       co_return r;
     }
@@ -527,15 +590,13 @@ class App {
         }
       const std::string file = lastLogResult["file"].strOr("log.bin");
       const std::string base = pathStr(fsPath(file).filename());
-      const std::string txt = engine::paramFile(
-          lastLogResult["rows"],
-          {"From log " + base + " (" + lastLogResult["firmware"].strOr("") + "), " + lastLogResult["family"].strOr("") + ", preset " + presetName,
-           "Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters."});
+      const engine::ParamFileOut pf = logParamFile(lastLogResult);
+      const std::string txt = pf.text;
       static const std::regex binRe("\\.bin$", std::regex::icase);
       if (req.param("save") == "1") {
         const std::string out = std::regex_replace(file, binRe, "") + " - AP Tuner.param";
         writeText(out, txt);
-        co_return jsonResp(200, Json::obj({{"ok", true}, {"file", out}}));
+        co_return jsonResp(200, Json::obj({{"ok", true}, {"file", out}, {"errors", pf.errors}, {"warnings", pf.warnings}}));
       }
       HttpResponse r;
       r.contentType = "text/plain";
@@ -577,7 +638,10 @@ class App {
       if (!family.empty()) ao.family = core::parseFamily(family);
       Json r = engine::analyzeLogFile(file, ao);
       const auto fam = core::parseFamily(r["family"].str());
-      r.set("rows", engine::proposalRows(*fam, r["axes"], r["noise"]));
+      // the proposed rows, with the value in the log and what the file checks found
+      r.set("rows", engine::proposalRows(*fam, r["axes"], r["noise"], r["params"]));
+      const engine::ParamFileOut pf = engine::paramFileChecked(r["rows"]);
+      r.set("paramChecks", Json::obj({{"errors", pf.errors}, {"warnings", pf.warnings}}));
       std::string body = r.dump();
       std::promise<void> done;
       Loop::main().post([this, r, &done] {
@@ -681,6 +745,7 @@ class App {
   AppOptions opts_;
   std::string token_;   // per run; the app page gets it, other pages cannot read it
   io::Link link;
+  Journal journal;      // before the tuner and the ground session: they write to it
   Tuner tuner;
   NotchLive notch;
   FlightSession flight;

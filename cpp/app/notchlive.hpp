@@ -1,5 +1,7 @@
 // Live harmonic-notch setup through the vehicle: the autopilot's in-flight FFT notch tune (RC option 162 over
-// MAVLink), ESC RPM telemetry tracking (mode 3), or the log route. Port of src/engine/notchlive.js.
+// MAVLink), ESC RPM telemetry tracking (mode 3), or the log route. Values that act only after a reboot (INS_HNTCH_REF /
+// HMNCS / OPTS, FFT_ENABLE) are written on the ground only; the reboot is then done through the app and every value is
+// read again after it (2026-10-17 audit F-35). Port of src/engine/notchlive.js.
 #pragma once
 
 #include <string>
@@ -23,6 +25,11 @@ class NotchLive {
   rt::Task<Json> reboot();
   rt::Task<Json> startFftTune();
   rt::Task<Json> stopFftTune();
+
+  /** names written on the ground that take effect only after a reboot */
+  Json rebootNeeded() const;
+  /** the values of a change that act only after a reboot and differ from what the vehicle holds */
+  std::vector<std::string> rebootOnly(const Json& values) const;
 
   bool escSeen() const { return escSeen_; }
   double escLastTs() const { return escLastTs_; }

@@ -1,6 +1,7 @@
 #include "aptuner/mavlink/mavlink.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <unordered_map>
@@ -209,6 +210,12 @@ core::Json decodePayload(const MsgDef& def, const std::uint8_t* payload, std::si
       }
     } else {
       out.items().emplace_back(f.name, core::Json(readOne(at, f.type)));
+      // a number cannot hold all 64 bits (board UIDs): every unsigned 64-bit field also as exact hex, <name>_hex
+      if (f.type == kU64) {
+        char hex[17];
+        std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(le(at, 8)));
+        out.items().emplace_back(std::string(f.name) + "_hex", core::Json(std::string(hex)));
+      }
     }
   }
   return out;

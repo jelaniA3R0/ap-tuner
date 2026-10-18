@@ -5,12 +5,15 @@
 #include <regex>
 
 #include "aptuner/core/jsnum.hpp"
+#include "aptuner/core/parammeta.hpp"
+#include "aptuner/engine/identity.hpp"
 #include "aptuner/engine/issues.hpp"
 #include "aptuner/engine/loganalysis.hpp"
 #include "aptuner/engine/report.hpp"
 #include "aptuner/io/sysinfo.hpp"
 #include "common.hpp"
 #include "flight.hpp"
+#include "paramwrite.hpp"
 
 namespace aptuner::app {
 
@@ -26,10 +29,29 @@ std::string join(const Json& a, const char* sep) {
   return s;
 }
 std::string mb(double bytes) { return jsToFixed(bytes / 1048576, 1); }
+/** fmt(v) of src/engine/groundtune.js: +v.toPrecision(6) */
+std::string fmt6(const Json& v) { return v.isNumber() ? core::jsToString(core::jsRoundPrecision(v.num(), 6)) : engine::jsText(v); }
+std::string joinV(const std::vector<std::string>& v, const std::string& sep) {
+  std::string s;
+  for (std::size_t i = 0; i < v.size(); i++) s += (i ? sep : "") + v[i];
+  return s;
+}
+Json strings(const std::vector<std::string>& v) {
+  Json a = Json::array();
+  for (const auto& x : v) a.push(x);
+  return a;
+}
+bool contains(const std::vector<std::string>& v, const std::string& s) { return std::find(v.begin(), v.end(), s) != v.end(); }
 }  // namespace
 
-GroundTune::GroundTune(io::Link& link, const std::string& sessionsDir)
+GroundTune::GroundTune(io::Link& link, const std::string& sessionsDir, Journal* journal)
     : link_(link), dl_(link), dir_(pathStr(fsPath(sessionsDir) / "ground")) {
+  if (journal) {
+    audit_ = journal;
+  } else {
+    ownJournal_ = std::make_unique<Journal>(pathStr(fsPath(sessionsDir) / "journal"));
+    audit_ = ownJournal_.get();
+  }
   link_.on("message", [this](const Json& m) {
     const Json& f = m["fields"];
     if (f.isObject() && f.has("time_boot_ms") && m["compid"].numOr(0) == 1 && f["time_boot_ms"].numOr(0) > 0) {
@@ -56,6 +78,9 @@ void GroundTune::reset() {
   knownPorts_.clear();
   busy_.clear();
   tried_.clear();
+  identity_ = proposal_ = logCheck_ = reboot_ = lastTxn_ = Json();
+  rebootPending_ = Json::array();
+  afterReboot_ = Json::array();
   restoreMark();
 }
 
@@ -112,6 +137,7 @@ void GroundTune::fail(const std::string& msg) {
 
 void GroundTune::start(const Json& o) {
   if (kRunning.count(phase_)) throw rt::Error("a session is already running");
+  if (phase_ == "writing" || phase_ == "rebooting") throw rt::Error("the app is writing to the autopilot: wait until it has finished");
   reset();
   for (const auto& [k, v] : o.items())
     if (!v.isNull()) opts.set(k, v);
@@ -388,113 +414,341 @@ rt::Task<void> GroundTune::download() {
   Json axes = Json::object();
   for (const auto& [ax, a] : r["axes"].items())
     if (chosen.count(ax)) axes.set(ax, a);
-  rows_ = engine::proposalRows(*fam, axes, r["noise"]);
+  rows_ = engine::proposalRows(*fam, axes, r["noise"], r["params"]);
   Json chosenJ = Json::array();
   for (const auto& a : chosen) chosenJ.push(a);
   r.set("chosenAxes", chosenJ);
   result = r;
-  // current values on the vehicle (the log holds the values at the time of the flight)
-  for (auto& row : rows_.arr()) {
-    try {
-      const double v = co_await link_.requestParam(row["name"].str(), 1200, 2);
-      row.set("vehicle", v);
-    } catch (const std::exception&) {
-      row.erase("vehicle");
-    }
-  }
+  co_await review();
   setPhase("review", rows_.size() ? core::jsToString(static_cast<double>(rows_.size())) + " change(s) proposed: check them, then press Write to the autopilot"
                                   : "no change proposed: see the issues per axis");
 }
 
-rt::Task<Json> GroundTune::write(const std::vector<std::string>& names) {
-  if (phase_ != "review" && phase_ != "done") throw rt::Error("nothing to write yet");
+rt::Task<void> GroundTune::reviewReader(std::shared_ptr<std::size_t> next) {
+  while (*next < rows_.size()) {
+    const std::size_t i = (*next)++;
+    const std::string name = rows_[i]["name"].str();
+    std::optional<double> v;
+    try {
+      v = co_await link_.requestParam(name, 1200, 2);
+    } catch (const std::exception&) {
+    }
+    rows_.arr()[i].set("vehicle", v ? Json(*v) : Json());
+  }
+}
+
+rt::Task<void> GroundTune::review() {
+  // the value on the autopilot now for every row, the checks, whether the log is from this vehicle; one proposal
+  // (id + hash over this connection and the exact values) that Write has to name
+  co_await link_.waitAutopilot(3000);
+  identity_ = engine::sessionIdentity(link_.identity(), Json());
+  logCheck_ = engine::logVehicleCheck(result, identity_);
+  for (const auto& n : logCheck_["notes"].arr()) note("warn", n.str());
+  bool enablesNotch = false;
+  for (const auto& r : rows_.arr())
+    if (r["name"].strOr("") == "INS_HNTCH_ENABLE" && r["value"].numOr(0) > 0) enablesNotch = true;
+  // the values on the autopilot now, read a few at a time (a missing one costs its timeouts only once)
+  auto next = std::make_shared<std::size_t>(0);
+  std::vector<rt::Future<void>> readers;
+  for (int k = 0; k < 4; k++) readers.push_back(reviewReader(next));
+  co_await rt::whenAll(readers);
+  std::vector<std::string> problems;
+  for (const auto& p : logCheck_["problems"].arr()) problems.push_back(p.str());
+  for (auto& row : rows_.arr()) {
+    const std::string name = row["name"].str();
+    const core::ParamCheck v = core::validateParam(name, row["value"]);
+    row.set("reboot", v.reboot);
+    row.set("warnings", strings(v.warnings));
+    row.set("errors", strings(v.errors));
+    row.set("same", false);
+    row.set("deferred", false);
+    row.set("blocked", Json());
+    if (!v.ok) {
+      row.set("blocked", name + " " + joinV(v.errors, ", "));
+    } else if (!row["vehicle"].isNumber()) {
+      // the notch values may only appear once the notch is switched on (after the reboot): they are written then
+      if (enablesNotch && name.rfind("INS_HNTCH_", 0) == 0 && name != "INS_HNTCH_ENABLE")
+        row.set("deferred", true);
+      else
+        row.set("blocked", "not found on the autopilot");
+    } else if (engine::sameF32(row["vehicle"], row["value"])) {
+      row.set("same", true);
+    } else if (row["from"].isNumber() && !engine::sameF32(row["vehicle"], row["from"])) {
+      row.set("blocked", "the autopilot holds " + fmt6(row["vehicle"]) + ", the log had " + fmt6(row["from"]) +
+                             ": the change was worked out for other values (fly again with the values now on the autopilot)");
+    }
+    if (row["blocked"].isNull() && !problems.empty()) row.set("blocked", joinV(problems, "; "));
+  }
+  Json prow = Json::array(), logRows = Json::array();
+  for (const auto& x : rows_.arr()) {
+    prow.push(Json::obj({{"name", x["name"]}, {"from", x["vehicle"]}, {"to", x["value"]}}));
+    logRows.push(Json::obj({{"name", x["name"]}, {"log", x["from"]}, {"vehicle", x["vehicle"]}, {"to", x["value"]}, {"reboot", x["reboot"]}, {"blocked", x["blocked"]},
+                            {"deferred", x["deferred"]}, {"same", x["same"]}, {"warnings", x["warnings"]}}));
+  }
+  proposal_ = engine::makeProposal("log", "", identity_, prow);
+  audit_->append("identity", Json::obj({{"identity", identity_}, {"via", "ground review"}, {"log", logCheck_["log"]}, {"logProblems", logCheck_["problems"]}}));
+  audit_->append("proposal", Json::obj({{"proposal", proposal_["id"]}, {"hash", proposal_["hash"]}, {"source", "log"}, {"file", files["bin"]},
+                                        {"identity", identity_["key"]}, {"rows", logRows}}));
+}
+
+rt::Task<void> GroundTune::recheck() {
+  if (!result.isObject() || (phase_ != "review" && phase_ != "done")) throw rt::Error("nothing to check yet");
   if (!link_.alive()) throw rt::Error("the autopilot is not connected");
+  co_await review();
+  writes_ = Json::array();
+  setPhase("review", "values read again: check them, then press Write to the autopilot");
+}
+
+rt::Task<Json> GroundTune::write(std::vector<std::string> names, Json approval) {
+  if (phase_ != "review" && phase_ != "done") throw rt::Error("nothing to write yet");
+  const Json p = proposal_;
+  if (!p.isObject() || !approval.isObject() || !approval["id"].isString() || approval["id"].str() != p["id"].str() || !approval["hash"].isString() ||
+      approval["hash"].str() != p["hash"].str()) {
+    audit_->append("refused", Json::obj({{"what", "ground write"}, {"proposal", p.isObject() ? p["id"] : Json()}, {"approval", approval}, {"why", "proposal id / hash mismatch"}}));
+    throw rt::Error("the list changed since it was shown: look at it again, then press Write");
+  }
+  if (!link_.alive()) throw rt::Error("the autopilot is not connected");
+  const Json id = link_.identity();
+  if (p["gen"].numOr(-1) != link_.generation() || !(p["sysid"] == id["sysid"]) || !(p["compid"] == id["compid"])) {
+    audit_->append("refused", Json::obj({{"what", "ground write"}, {"proposal", p["id"]}, {"why", "another connection"}, {"now", id}}));
+    throw rt::Error("the connection changed since the review: press \"Read the values again\", check them, then Write");
+  }
   if (link_.vehicle()["armed"].asBool()) throw rt::Error("the vehicle is armed: disarm first");
-  std::vector<std::size_t> idx;
-  for (std::size_t i = 0; i < rows_.size(); i++)
-    if (std::find(names.begin(), names.end(), rows_[i]["name"].strOr("")) != names.end()) idx.push_back(i);
-  if (idx.empty()) throw rt::Error("choose at least one change");
+  if (!audit_->ok()) throw rt::Error("the write journal cannot be written (" + audit_->error() + "): nothing is written. Free some disk space and restart AP Tuner");
+  Json rows = Json::array();
+  for (const auto& r : rows_.arr())
+    if (contains(names, r["name"].strOr(""))) rows.push(r);
+  if (!rows.size()) throw rt::Error("choose at least one change");
+  std::string blocked;
+  for (const auto& r : rows.arr())
+    if (!r["blocked"].isNull()) blocked += (blocked.empty() ? "" : "; ") + r["name"].str() + " (" + r["blocked"].str() + ")";
+  if (!blocked.empty()) throw rt::Error("cannot be written: " + blocked);
+  Json namesJ = Json::array();
+  for (const auto& n : names) namesJ.push(n);
+  audit_->append("approval", Json::obj({{"proposal", p["id"]}, {"hash", p["hash"]}, {"by", "user"}, {"via", "ground write"}, {"names", namesJ}, {"identity", identity_["key"]}}));
   setPhase("writing", "writing");
-  Json before = Json::array();
-  for (std::size_t i : idx) {
-    Json& r = rows_.arr()[i];
-    std::optional<double> cur;
-    try {
-      cur = co_await link_.requestParam(r["name"].str(), 1200, 2);
-    } catch (const std::exception&) {
-    }
-    if (cur) {
-      r.set("vehicle", *cur);
-      before.push(Json::obj({{"group", r["group"]}, {"name", r["name"]}, {"value", core::jsRoundPrecision(*cur, 6)}}));
-    } else {
-      r.erase("vehicle");
-    }
-  }
   const std::string stamp = isoStampForFile().substr(0, 19);
-  files.set("undo", pathStr(fsPath(dir_) / (stamp + " UNDO (values before AP Tuner).param")));
-  writeText(files["undo"].str(), engine::paramFile(before, {"Values on the autopilot before AP Tuner wrote, " + localNow(), "Load this file to go back."}));
-  Json results = Json::array();
-  // notch: enable first; the other notch parameters only exist after a reboot when it was off
-  std::stable_sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
-    return (rows_[a]["name"].strOr("") == "INS_HNTCH_ENABLE" ? -1 : 0) < (rows_[b]["name"].strOr("") == "INS_HNTCH_ENABLE" ? -1 : 0);
-  });
-  for (std::size_t i : idx) {
-    const Json r = rows_[i];
-    const double value = r["value"].num();
-    if (r["vehicle"].isNumber() && std::fabs(r["vehicle"].num() - value) <= 1e-6 * std::max(1.0, std::fabs(value))) {
-      results.push(Json::obj({{"name", r["name"]}, {"from", r["vehicle"]}, {"to", value}, {"ok", true}, {"same", true}}));
-      continue;
+  // the notch switch first; values that only exist once the notch is on wait for the reboot
+  Json now = Json::array(), later = Json::array();
+  for (const auto& r : rows.arr()) (r["deferred"].asBool() ? later : now).push(r);
+  std::stable_sort(now.arr().begin(), now.arr().end(), [](const Json& a, const Json& b) { return a["name"].strOr("") == "INS_HNTCH_ENABLE" && b["name"].strOr("") != "INS_HNTCH_ENABLE"; });
+  Json items = Json::array();
+  for (const auto& r : now.arr()) items.push(Json::obj({{"name", r["name"]}, {"to", r["value"]}, {"expect", r["vehicle"]}, {"reason", r["label"]}}));
+  TxnOpts to;
+  to.journal = [this](const std::string& k, const Json& d) { audit_->append(k, d); };
+  to.ctx = Json::obj({{"proposal", p["id"]}, {"hash", p["hash"]}, {"identity", identity_["key"]}, {"via", "ground write"}});
+  // the UNDO file is on disk before the first value is written (otherwise nothing is written)
+  to.afterPreRead = [this, stamp, rows](const Json& before) {
+    files.set("undo", pathStr(fsPath(dir_) / (stamp + " UNDO (values before AP Tuner).param")));
+    Json undoRows = Json::array();
+    for (const auto& b : before.arr()) {
+      Json group;
+      for (const auto& r : rows.arr())
+        if (r["name"].strOr("") == b["name"].strOr("")) {
+          group = r["group"];
+          break;
+        }
+      undoRows.push(Json::obj({{"group", group}, {"name", b["name"]}, {"value", b["before"]}}));
     }
-    bool failed = false;
-    double echo = 0;
-    try {
-      echo = co_await link_.setParam(r["name"].str(), value, 1500, 3);
-    } catch (const std::exception&) {
-      failed = true;
+    if (!writeText(files["undo"].str(), engine::paramFile(undoRows, {"Values on the autopilot before AP Tuner wrote, " + localNow(), "Load this file to go back."}, identity_, false)))
+      throw std::runtime_error("the UNDO file could not be saved (" + files["undo"].str() + ")");
+  };
+  const Json txn = co_await runTransaction(link_, items, to);
+  lastTxn_ = txn;
+  Json writes = Json::array();
+  for (const auto& r : rows.arr()) writes.push(rowResult(r, txn));
+  writes_ = writes;
+  // what acts only after a reboot (written and read back) and what can only be written after it
+  rebootPending_ = Json::array();
+  for (const auto& w : writes_.arr())
+    if (w["reboot"].asBool() && w["status"].str() == "verified") rebootPending_.push(Json::obj({{"name", w["name"]}, {"value", w["to"]}}));
+  afterReboot_ = Json::array();
+  if (txn["ok"].asBool())
+    for (const auto& r : later.arr())
+      afterReboot_.push(Json::obj({{"name", r["name"]}, {"value", r["value"]}, {"group", r["group"]}, {"label", r["label"]}, {"reboot", r["reboot"].asBool()}}));
+  Json written = Json::array();
+  for (const auto& w : writes_.arr())
+    if (w["status"].str() == "verified") written.push(Json::obj({{"group", w["group"]}, {"name", w["name"]}, {"value", w["to"]}, {"from", w["from"]}}));
+  if (written.size()) {
+    files.set("param", pathStr(fsPath(dir_) / (stamp + " written by AP Tuner.param")));
+    if (!writeText(files["param"].str(), engine::paramFile(written, {"Written to the autopilot by AP Tuner (Telemetry + USB) and read back, " + localNow()}, identity_))) {
+      files.erase("param");
+      note("warn", "the file of the written values could not be saved");
     }
-    if (!failed) {
-      const bool ok = std::fabs(echo - value) <= 1e-4 * std::max(1.0, std::fabs(value));
-      results.push(Json::obj({{"name", r["name"]}, {"from", r["vehicle"]}, {"to", echo}, {"ok", ok}}));
+  }
+  std::string tail = " Unplug the USB and fly to check";
+  if (rebootPending_.size() || afterReboot_.size()) {
+    std::string list;
+    for (const auto& x : rebootPending_.arr()) list += (list.empty() ? "" : ", ") + x["name"].str();
+    for (const auto& x : afterReboot_.arr()) list += (list.empty() ? "" : ", ") + x["name"].str();
+    tail = " " + list + " take effect only after a reboot: press Reboot (disarmed)";
+  }
+  setPhase("done", txn["ok"].asBool() ? "all " + core::jsToString(static_cast<double>(rows.size() - later.size())) + " written and read back." + tail : txnText(txn));
+  co_return writes_;
+}
+
+Json GroundTune::rowResult(const Json& r, const Json& txn) const {
+  // one row's outcome of a transaction, in plain words
+  Json out = Json::obj({{"group", r["group"]}, {"name", r["name"]}, {"label", r["label"]}, {"requested", r["value"]}, {"reboot", r["reboot"].asBool()}, {"from", Json()},
+                        {"to", Json()}, {"status", "not written"}, {"ok", false}, {"text", ""}, {"changed", false}, {"undo", Json()}});
+  const std::string name = r["name"].str();
+  if (r["deferred"].asBool()) {
+    out.set("status", "after reboot");
+    out.set("text", name + ": written after the reboot (it appears once the notch is on)");
+    return out;
+  }
+  Json res;
+  for (const auto& x : txn["rows"].arr())
+    if (x["name"].strOr("") == name) res = x;
+  if (!res.isObject()) {
+    out.set("text", txn["aborted"].isString() ? "not written: " + txn["aborted"].str() : name + ": not written (an earlier value failed)");
+    return out;
+  }
+  Json rb;
+  for (const auto& x : txn["rollback"].arr())
+    if (x["name"].strOr("") == name) rb = x;
+  out.set("from", res["before"]);
+  out.set("to", res["holds"]);
+  out.set("status", res["status"]);
+  out.set("ok", res["ok"]);
+  out.set("text", writeText(res));
+  if (!txn["ok"].asBool() && rb.isObject()) {
+    out.set("ok", false);
+    out.set("to", rb["holds"]);
+    if (rb["ok"].asBool()) {
+      out.set("status", "rolled back");
+      out.set("text", writeText(res) + "; written back to " + fmt6(rb["holds"]) + " (read back)");
     } else {
-      const std::string n = r["name"].str();
-      const bool reboot = n.rfind("INS_HNTCH_", 0) == 0 && n != "INS_HNTCH_ENABLE";
-      results.push(Json::obj({{"name", r["name"]}, {"from", r["vehicle"]}, {"ok", false},
-                              {"error", reboot ? "needs a reboot first (the notch was just switched on)" : "no answer from the autopilot"}}));
+      out.set("status", "uncertain");
+      out.set("text", writeText(res) + "; writing it back failed: " + writeText(rb));
     }
+  } else if (!txn["ok"].asBool() && !rb.isObject() && res["ok"].asBool()) {
+    for (const auto& u : txn["uncertain"].arr())
+      if (u["name"].strOr("") == name) {
+        out.set("status", "uncertain");
+        out.set("ok", false);
+        out.set("text", u["why"]);
+      }
   }
-  writes_ = results;
-  Json after = Json::array();
-  for (std::size_t i : idx) {
-    const Json& r = rows_[i];
-    Json row = Json::obj({{"group", r["group"]}, {"name", r["name"]}, {"value", r["value"]}});
-    if (r["vehicle"].isNumber()) row.set("from", r["vehicle"]);
-    after.push(row);
+  const std::string st = out["status"].str();
+  out.set("changed", changedStatus(st) && !(st == "verified" && engine::sameF32(out["to"], out["from"])));
+  return out;
+}
+
+rt::Task<Json> GroundTune::rebootNow() {
+  if (phase_ != "done") throw rt::Error("nothing written yet");
+  if (!rebootPending_.size() && !afterReboot_.size()) throw rt::Error("nothing written here needs a reboot");
+  Json expect = Json::array();
+  for (const auto& w : writes_.arr())
+    if (w["status"].str() == "verified") expect.push(Json::obj({{"name", w["name"]}, {"value", w["to"]}}));
+  setPhase("rebooting", "rebooting the autopilot: it disconnects for a few seconds");
+  RebootOpts ro;
+  ro.journal = [this](const std::string& k, const Json& d) { audit_->append(k, d); };
+  ro.ctx = Json::obj({{"via", "ground write"}, {"identity", identity_.isObject() ? identity_["key"] : Json()}});
+  ro.onInfo = [this](const std::string& t) { info_ = t; };
+  const Json res = co_await rebootAndVerify(link_, expect, ro);
+  reboot_ = Json::obj({{"at", Loop::now()}, {"ok", res["ok"]}, {"reason", res["reason"]}, {"rows", res["rows"]}});
+  for (auto& w : writes_.arr())
+    for (const auto& x : res["rows"].arr())
+      if (x["name"].strOr("") == w["name"].strOr(""))
+        w.set("afterReboot", x["ok"].asBool() ? "read back after the reboot" : (x["holds"].isNull() ? "no answer after the reboot" : "holds " + fmt6(x["holds"]) + " after the reboot"));
+  if (!res["ok"].asBool()) {
+    setPhase("done", "reboot: " + res["reason"].strOr(""));
+    co_return reboot_;
   }
-  files.set("param", pathStr(fsPath(dir_) / (stamp + " written by AP Tuner.param")));
-  writeText(files["param"].str(), engine::paramFile(after, {"Written to the autopilot by AP Tuner (Telemetry + USB), " + localNow()}));
-  std::size_t bad = 0;
-  for (const auto& x : results.arr())
-    if (!x["ok"].asBool()) bad++;
-  const std::size_t n = results.size();
-  setPhase("done", bad ? std::to_string(n - bad) + " of " + std::to_string(n) + " written; " + std::to_string(bad) + " need attention (see the list)"
-                       : "all " + std::to_string(n) + " written and read back. Unplug the USB and fly to check");
-  co_return results;
+  rebootPending_ = Json::array();
+  if (afterReboot_.size()) {
+    // the identity of the new connection (the link may have reopened): the same vehicle was checked by rebootAndVerify
+    identity_ = engine::sessionIdentity(link_.identity(), Json());
+    const Json later = afterReboot_;
+    afterReboot_ = Json::array();
+    Json items = Json::array();
+    for (const auto& r : later.arr()) items.push(Json::obj({{"name", r["name"]}, {"to", r["value"]}, {"reason", r["label"]}}));
+    TxnOpts to;
+    to.journal = [this](const std::string& k, const Json& d) { audit_->append(k, d); };
+    to.ctx = Json::obj({{"via", "ground write after the reboot"}, {"identity", identity_["key"]}});
+    const Json txn = co_await runTransaction(link_, items, to);
+    for (const auto& r : later.arr()) {
+      Json row = r;
+      row.set("deferred", false);
+      const Json nw = rowResult(row, txn);
+      for (auto& w : writes_.arr())
+        if (w["name"].strOr("") == r["name"].strOr(""))
+          for (const auto& [k, v] : nw.items()) w.set(k, v);
+    }
+    Json pend = Json::array();
+    for (const auto& w : writes_.arr()) {
+      bool isLater = false;
+      for (const auto& l : later.arr())
+        if (l["name"].strOr("") == w["name"].strOr("")) isLater = true;
+      if (w["reboot"].asBool() && w["status"].str() == "verified" && isLater) pend.push(Json::obj({{"name", w["name"]}, {"value", w["to"]}}));
+    }
+    rebootPending_ = pend;
+    std::string pendNames;
+    for (const auto& x : pend.arr()) pendNames += (pendNames.empty() ? "" : ", ") + x["name"].str();
+    setPhase("done", txn["ok"].asBool() ? "rebooted and read back; then " + core::jsToString(static_cast<double>(later.size())) + " notch value(s) written and read back" +
+                                              (pend.size() ? ": " + pendNames + " need one more reboot (press Reboot)" : "")
+                                        : "after the reboot: " + txnText(txn));
+    co_return reboot_;
+  }
+  setPhase("done", "rebooted: every value written here was read back after the reboot. Unplug the USB and fly to check");
+  co_return reboot_;
 }
 
 rt::Task<void> GroundTune::undo() {
-  if (!writes_.size()) throw rt::Error("nothing written yet");
-  if (link_.vehicle()["armed"].asBool()) throw rt::Error("the vehicle is armed: disarm first");
-  for (auto& w : writes_.arr()) {
-    if (!w["ok"].asBool() || w["same"].asBool() || !w["from"].isNumber()) continue;
-    bool failed = false;
-    try {
-      co_await link_.setParam(w["name"].str(), w["from"].num(), 1500, 3);
-    } catch (const std::exception&) {
-      failed = true;
-    }
-    w.set(failed ? "undoError" : "undone", true);
+  // write the values from before back, each verified on its own (an undo goes as far back as it can)
+  std::vector<std::size_t> todo;
+  for (std::size_t i = 0; i < writes_.size(); i++) {
+    const Json& w = writes_[i];
+    if (w["changed"].asBool() && w["from"].isNumber() && w["undo"].strOr("") != "undone") todo.push_back(i);
   }
-  setPhase("done", "previous values written back");
+  if (todo.empty()) throw rt::Error("nothing to undo: no value written here is different from before");
+  if (!link_.alive()) throw rt::Error("the autopilot is not connected");
+  if (link_.vehicle()["armed"].asBool()) throw rt::Error("the vehicle is armed: disarm first");
+  if (identity_.isObject() && !engine::sameVehicle(identity_, link_.identity()))
+    throw rt::Error("another vehicle is connected now (" + engine::identityText(link_.identity()) + "): the undo values are for " + engine::identityText(identity_));
+  setPhase("writing", "writing the previous values back");
+  Json namesJ = Json::array();
+  for (const auto i : todo) namesJ.push(writes_[i]["name"]);
+  audit_->append("approval", Json::obj({{"by", "user"}, {"via", "ground undo"}, {"names", namesJ}, {"identity", identity_.isObject() ? identity_["key"] : Json()}}));
+  for (const auto i : todo) {
+    const std::string name = writes_[i]["name"].str();
+    const double from = writes_[i]["from"].num();
+    std::optional<double> cur;
+    try {
+      cur = co_await link_.requestParam(name, 1200, 2);
+    } catch (const std::exception&) {
+    }
+    Json r;
+    if (cur && engine::sameF32(*cur, from)) {
+      r = Json::obj({{"name", name}, {"status", "unchanged"}, {"ok", true}, {"holds", *cur}});
+    } else {
+      VerifyOpts vo;
+      vo.before = cur ? Json(*cur) : Json();
+      r = co_await verifiedSet(link_, name, from, vo);
+    }
+    Json ev = Json::obj({{"via", "ground undo"}, {"identity", identity_.isObject() ? identity_["key"] : Json()}});
+    for (const auto& [k, v] : r.items()) ev.set(k, v);
+    audit_->append("write", ev);
+    Json& w = writes_.arr()[i];
+    w.set("undo", r["ok"].asBool() ? Json("undone") : r["status"]);
+    w.set("undoText", r["ok"].asBool() ? "back to " + fmt6(r["holds"]) + " (read back)" : writeText(r));
+    w.set("undoHolds", r["holds"]);
+    if (r["ok"].asBool() && w["reboot"].asBool() && r["status"].str() == "verified") {
+      Json next = Json::array();
+      for (const auto& x : rebootPending_.arr())
+        if (x["name"].strOr("") != name) next.push(x);
+      next.push(Json::obj({{"name", name}, {"value", r["holds"]}}));
+      rebootPending_ = next;
+    }
+  }
+  std::string bad;
+  for (const auto i : todo)
+    if (writes_[i]["undo"].strOr("") != "undone") bad += (bad.empty() ? "" : "; ") + writes_[i]["undoText"].strOr("");
+  std::string pend;
+  for (const auto& x : rebootPending_.arr()) pend += (pend.empty() ? "" : ", ") + x["name"].str();
+  setPhase("done", !bad.empty() ? "undo incomplete: " + bad + ". Load the UNDO file in Mission Planner to go back"
+                                : "previous values written back and read back" + (pend.empty() ? "" : "; " + pend + " take effect after a reboot (press Reboot)"));
 }
 
 Json GroundTune::snapshot() const {
@@ -543,7 +797,15 @@ Json GroundTune::snapshot() const {
                     {"writes", writes_},
                     {"files", files},
                     {"notes", notes},
-                    {"error", error_}});
+                    {"error", error_},
+                    {"proposal", proposal_.isObject() ? Json::obj({{"id", proposal_["id"]}, {"hash", proposal_["hash"]}}) : Json()},
+                    {"identity", identity_},
+                    {"identityText", identity_.isObject() ? Json(engine::identityText(identity_)) : Json()},
+                    {"logCheck", logCheck_},
+                    {"rebootPending", rebootPending_},
+                    {"afterReboot", afterReboot_},
+                    {"reboot", reboot_},
+                    {"audit", audit_->status()}});
 }
 
 }  // namespace aptuner::app

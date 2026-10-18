@@ -5,9 +5,12 @@
 #include <functional>
 
 #include "aptuner/core/jsnum.hpp"
+#include "aptuner/core/parammeta.hpp"
 #include "aptuner/engine/analysis.hpp"
+#include "aptuner/engine/identity.hpp"
 #include "aptuner/engine/vehicle.hpp"
 #include "common.hpp"
+#include "paramwrite.hpp"
 
 namespace aptuner::app {
 
@@ -24,8 +27,26 @@ const std::string kInFlightOff =
 
 namespace {
 constexpr int kPidTuningId = 194, kAttitudeId = 30;
-// gain keys in the order they are written (filters first, D before P)
-const std::vector<std::string> kWriteOrder{"FLTT", "FLTE", "FLTD", "SMAX", "D", "P", "I", "FF", "angleP", "tconst"};
+// gain keys in the order they are written (filters and limits first, D before P); IMAX is written when a proposal
+// changes it, like every value it shows (F-33)
+const std::vector<std::string> kWriteOrder{"FLTT", "FLTE", "FLTD", "SMAX", "IMAX", "D", "P", "I", "FF", "angleP", "tconst"};
+// why a proposal changes a value (shown with the full parameter name before the approval)
+std::string reasonOf(const std::string& k) {
+  if (k == "P") return "rate P from the identified model (preset margins)";
+  if (k == "I") return "rate I follows P / FF (ArduPilot rule)";
+  if (k == "D") return "rate D from the identified model";
+  if (k == "FF") return "feed-forward";
+  if (k == "FLTT") return "target filter (QuikTune rule)";
+  if (k == "FLTE") return "error filter (QuikTune rule)";
+  if (k == "FLTD") return "D-term filter (QuikTune rule)";
+  if (k == "SMAX") return "slew-rate limit (needed for the oscillation signal)";
+  if (k == "IMAX") return "I limit: the I term holds a steady correction near its limit";
+  if (k == "angleP") return "angle gain from the rate-loop crossover (at most x1.5 per round)";
+  if (k == "tconst") return "time constant from the rate-loop crossover";
+  return "";
+}
+// a live proposal older than this is not applied: observe again
+constexpr double kProposalMaxAgeMs = 15 * 60 * 1000;
 // per-axis values a corrective write moves in steps of at most stepMax; kLinearKeys also from / to zero (linearly)
 const std::vector<std::string> kSteppedKeys{"P", "I", "D", "FF", "angleP", "tconst", "FLTT", "FLTE", "FLTD"};
 const std::vector<std::string> kLinearKeys{"P", "I", "D", "FF", "angleP", "tconst"};
@@ -80,7 +101,14 @@ struct ScopeExit {
 
 TripError::TripError(Trip t) : rt::Error("oscillation: " + join(t.reasons, "; "), "trip"), trip(std::move(t)) {}
 
-Tuner::Tuner(io::Link& lk, const std::string& sessionDir) : link(lk), sessionDir_(sessionDir) {
+Tuner::Tuner(io::Link& lk, const std::string& sessionDir, Journal* journal) : link(lk), sessionDir_(sessionDir) {
+  // R3: the journal file of the app run (or one of its own)
+  if (journal) {
+    audit_ = journal;
+  } else {
+    ownJournal_ = std::make_unique<Journal>(pathStr(fsPath(sessionDir) / "journal"));
+    audit_ = ownJournal_.get();
+  }
   opts = Json::obj({{"preset", "normal"}, {"autoApply", false}, {"axes", Json(Json::Array{"roll", "pitch"})}, {"observeSeconds", 30},
                     {"stepMax", 1.5}, {"watchSeconds", 4}, {"oscSmax", 5}, {"massKg", 0}, {"allowRamp", false},
                     {"rampDoubleTime", 10}, {"rampMargin", 60}, {"maxReducePct", 20}, {"inFlightWrites", false}, {"watchGrace", 0.5},
@@ -137,7 +165,18 @@ Tuner::Tuner(io::Link& lk, const std::string& sessionDir) : link(lk), sessionDir
     vibe = Json::obj({{"x", f["vibration_x"]}, {"y", f["vibration_y"]}, {"z", f["vibration_z"]},
                       {"clip", i("clipping_0") + i("clipping_1") + i("clipping_2")}, {"ts", Loop::now() / 1000}});
   });
+  // every PARAM_VALUE of the vehicle keeps the cache current; a change the app did not make is reported (Q94)
+  link.on("param", [this](const Json& p) { onParamValue(p["name"].strOr(""), p["value"].numOr(0)); });
+  link.on("vehicle-change", [this](const Json& c) { onConnectionChange("another vehicle answered (" + c["reason"].strOr("") + ")"); });
+  // a reboot loses the requested message rates: ask again (the values are the same: the identity was checked)
+  link.on("reboot", [this](const Json&) {
+    if (family) {
+      requestStreams();
+      log("link", "the autopilot rebooted: streams re-requested");
+    }
+  });
   link.on("heartbeat", [this](const Json& v) {
+    if (preparedGen_ != -1 && preparedGen_ != link.generation()) onConnectionChange("the connection changed");
     if (!family && params.size())
       family = engine::detectFamily(static_cast<int>(v["type"].numOr(0)), v["modeName"].strOr(""), toParams(params));
     if (linkGen_ != link.generation()) {
@@ -158,6 +197,36 @@ Tuner::Tuner(io::Link& lk, const std::string& sessionDir) : link(lk), sessionDir
 Tuner::~Tuner() {
   stopMonitor();
   if (timer_) Loop::main().clear(timer_);
+}
+
+void Tuner::onParamValue(const std::string& name, double value) {
+  if (!params.has(name)) return;
+  const Json cur = params[name];
+  params.set(name, value);
+  if (writingNames_.count(name) || !cur.isNumber() || engine::sameF32(cur.num(), value)) return;
+  const std::string who = expectExternal.empty() ? "not by AP Tuner: another ground station?" : expectExternal;
+  log("param", name + " changed on the vehicle: " + fmt4(cur) + " -> " + fmt4(Json(value)) + " (" + who + ")");
+  audit_->append("conflict", Json::obj({{"name", name}, {"from", cur}, {"to", value}, {"by", who}, {"identity", identity.isObject() ? identity["key"] : Json()},
+                                        {"gen", link.generation()}}));
+}
+
+void Tuner::onConnectionChange(const std::string& why) {
+  // a reconnect or another vehicle: proposals, live buffers and automatic writes of the old connection end (F-25)
+  if (preparedGen_ == -1 || preparedGen_ == link.generation() || droppedGen_ == link.generation()) return;
+  droppedGen_ = link.generation();
+  results = Json::object();
+  previous = Json::object();
+  prepared = false;
+  family.reset();
+  params = Json::object();
+  rebootPending = Json::array();
+  identity = Json();
+  for (const auto& a : kAxisNames) axes[a].clear();
+  cancelJob(why);
+  endSession();
+  if (inList(kRunningStates, state)) pause(why + ": read the vehicle again (step 2); nothing is written until then");
+  audit_->append("connection", Json::obj({{"why", why}, {"gen", link.generation()}, {"identity", link.identity()}}));
+  log("link", why + ": proposals and live data of the previous connection were dropped");
 }
 
 void Tuner::log(const std::string& kind, const std::string& text) {
@@ -208,6 +277,8 @@ rt::Task<Json> Tuner::prepareInner(bool confirm) {
     lastGood = Json::object();
     prepared = false;
     lastTrip = Json();
+    rebootPending = Json::array();
+    identity = Json();
     endSession();
   }
   // samples buffered so far may be from another vehicle or in other units: none are kept until the family is known (F-91)
@@ -231,6 +302,8 @@ rt::Task<Json> Tuner::prepareInner(bool confirm) {
   const std::vector<std::string> names = core::neededParams(*fam == Family::Heli ? Family::Copter : *fam);
   const Json got = co_await link.requestParams(names, 3, [this](int d, int n) { emit("progress", Json::obj({{"done", d}, {"total", n}})); });
   for (const auto& [k, val] : got.items()) params.set(k, val);
+  co_await link.waitAutopilot(3000);
+  identity = engine::sessionIdentity(link.identity(), params);
   loopHz = jor(params, "SCHED_LOOP_RATE", *fam == Family::Plane ? 50 : 400);
   // PID_TUNING streaming needs GCS_PID_MASK (bits: roll 1, pitch 2, yaw 4) and SMAX > 0 for the slew-rate signal
   Json writes = Json::array();
@@ -269,6 +342,10 @@ rt::Task<Json> Tuner::prepareInner(bool confirm) {
     }
   }
   pendingWrites = Json::array();
+  // the session identity: this connection, the vehicle (board UID, firmware) and a hash of every value read (F-25)
+  identity = engine::sessionIdentity(link.identity(), params);
+  paramsAtPrepare = params;
+  audit_->append("identity", Json::obj({{"identity", identity}, {"via", "read the vehicle"}, {"family", core::familyName(*fam)}}));
   requestStreams();
   lastGood = originals;
   if (sessionFile_.empty()) sessionFile_ = pathStr(fsPath(sessionDir_) / (isoStampForFile() + ".json"));
@@ -380,6 +457,7 @@ std::shared_ptr<Job> Tuner::beginJob(const std::string& kind, bool corrective, b
   j->kind = kind;
   j->corrective = corrective;
   j->handlesTrips = handlesTrips;
+  j->gen = link.generation();
   job_ = j;
   return j;
 }
@@ -430,46 +508,50 @@ std::string Tuner::watchBlind(const std::string& ax) const {
 
 rt::Task<double> Tuner::setParam(const std::string& name, double value, const std::string& reason, std::shared_ptr<Job> job) {
   if (!job) throw rt::Error("internal: write without the write lock");
+  // a change started on one connection never goes on on another one (it may be another vehicle)
+  if (job->gen != link.generation()) throw rt::Error(name + " not written: the connection changed since this change started", "link-changed");
   if (job->corrective) {
     if (!link.connected()) throw rt::Error(name + " not written: no connection to the vehicle");
   } else {
     checkpoint(*job);
     assertForward(*job);
+    if (isArmed() && core::isRebootRequired(name))
+      throw rt::Error(name + " takes effect only after a reboot: it is set on the ground (disarmed), never in flight", "reboot-required");
+    if (!audit_->ok())
+      throw rt::Error("the write journal cannot be written (" + audit_->error() + "): nothing is written. Free some disk space and restart AP Tuner", "journal");
+    if (!job->touchedHas(name)) job->touched.push_back({name, params[name]});
   }
   const Json from = params[name];
   const bool armed = isArmed();
-  double v = 0;
-  std::string cancelCode;
-  try {
-    v = co_await link.setParam(name, value, 1500, 3, [this, job] { return job->corrective || (job->cancelled.empty() && !pendingTrip_); });
-  } catch (const rt::Error& e) {
-    if (e.code() != "cancelled" && e.code() != "cancelled-sent") throw;
-    cancelCode = e.code();
-  }
-  if (!cancelCode.empty()) {
-    if (cancelCode == "cancelled-sent") {
-      // an earlier PARAM_SET may have reached the vehicle: ask what it holds now
-      Json rb;
-      try {
-        rb = co_await link.requestParam(name, 1000, 1);
-      } catch (const std::exception&) {
-        rb = Json();
-      }
-      if (rb.isNumber()) params.set(name, rb);
-      journal.push(Json::obj({{"t", Loop::now()}, {"name", name}, {"from", from}, {"to", rb}, {"requested", value}, {"reason", reason},
-                              {"armed", armed}, {"job", job->kind},
-                              {"status", rb.isNumber() ? "cancelled, read back" : "uncertain: cancelled, no read-back"}}));
-      saveSession();
-    }
+  writingNames_.insert(name);
+  VerifyOpts vo;
+  vo.before = from;
+  vo.keepGoing = [this, job] { return job->corrective || (job->cancelled.empty() && !pendingTrip_); };
+  const Json r = co_await verifiedSet(link, name, value, vo);
+  writingNames_.erase(name);
+  if (r["holds"].isNumber()) params.set(name, r["holds"]);
+  const std::string st = r["status"].str();
+  const std::string status = r["cancelled"].asBool() ? "cancelled: " + (st == "cancelled" ? std::string("not sent") : st == "verified" ? std::string("written before the stop (read back)") : writeText(r)) : st;
+  const Json entry = Json::obj({{"t", Loop::now()}, {"name", name}, {"from", from}, {"to", r["holds"]}, {"requested", value}, {"sent", r["sent"]}, {"echo", r["echo"]},
+                                {"readBack", r["readBack"]}, {"status", status}, {"reason", reason}, {"armed", armed}, {"job", job->kind},
+                                {"txn", job->txn ? Json(job->txn) : Json()}});
+  journal.push(entry);
+  Json ev = Json::obj({{"identity", identity.isObject() ? identity["key"] : Json()}, {"gen", link.generation()}, {"type", r["type"]}, {"before", r["before"]},
+                       {"ok", r["ok"]}, {"error", r["error"]}, {"note", r["note"]}, {"ms", r["ms"]}, {"corrective", job->corrective}});
+  for (const auto& [k, v] : entry.items()) ev.set(k, v);
+  audit_->append("write", ev);
+  saveSession();
+  if (r["cancelled"].asBool()) {
     checkpoint(*job);   // report the trip / cancel that stopped it
     throw rt::Error(name + " not written: cancelled", "cancelled");
   }
-  params.set(name, v);
-  journal.push(Json::obj({{"t", Loop::now()}, {"name", name}, {"from", from}, {"to", v}, {"requested", value}, {"reason", reason}, {"armed", armed}, {"job", job->kind}}));
-  emit("param", Json::obj({{"name", name}, {"from", from}, {"to", v}, {"reason", reason}}));
-  log("param", name + ": " + fmt4(from) + " -> " + fmt4(Json(v)) + " (" + reason + ")");
-  saveSession();
-  co_return v;
+  if (!r["ok"].asBool()) {
+    log("error", writeText(r));
+    throw VerifyError(writeText(r), r);
+  }
+  emit("param", Json::obj({{"name", name}, {"from", from}, {"to", r["holds"]}, {"reason", reason}}));
+  log("param", name + ": " + fmt4(from) + " -> " + fmt4(r["holds"]) + " (" + reason + ")");
+  co_return r["holds"].num();
 }
 
 void Tuner::saveSession() {
@@ -510,6 +592,8 @@ Json Tuner::analyze(const std::string& axis, double seconds) {
   Json res = engine::analyzeAxis(a);
   res.set("dataInfo", Json::obj({{"fs", data->fs}, {"rawRateHz", data->rawRate}, {"seconds", static_cast<double>(data->n) / data->fs}}));
   res.set("at", Loop::now());
+  res.set("identity", identity.isObject() ? Json::obj({{"key", identity["key"]}, {"paramHash", identity["paramHash"]}}) : Json());
+  if (res["proposal"].isObject()) bindProposal(axis, res.at("proposal"));
   const std::size_t step = std::max<std::size_t>(1, data->n / 1500);
   Json st = Json::array(), tar = Json::array(), act = Json::array(), u = Json::array();
   for (std::size_t i = 0; i < data->n; i += step) {
@@ -522,6 +606,23 @@ Json Tuner::analyze(const std::string& axis, double seconds) {
   results.set(axis, res);
   emit("analysis", res);
   return res;
+}
+
+Json& Tuner::bindProposal(const std::string& axis, Json& p) {
+  const Json n = engine::axisParamNames(*family, axisOf(axis));
+  Json rows = Json::array();
+  for (const auto& k : kWriteOrder) {
+    if (!p["gains"][k].isNumber() || !n[k].isString()) continue;
+    const std::string name = n[k].str();
+    const Json from = params[name];
+    const double to = p["gains"][k].num();
+    if (from.isNumber() && std::fabs(from.num() - to) < 1e-9) continue;   // unchanged: not written
+    rows.push(Json::obj({{"name", name}, {"key", k}, {"from", from}, {"to", to}, {"reason", reasonOf(k)}, {"reboot", core::isRebootRequired(name)}}));
+  }
+  const Json made = engine::makeProposal("live", axis, identity, rows);
+  for (const auto& [k, v] : made.items()) p.set(k, v);
+  audit_->append("proposal", Json::obj({{"proposal", p["id"]}, {"hash", p["hash"]}, {"axis", axis}, {"identity", identity.isObject() ? identity["key"] : Json()}, {"rows", rows}}));
+  return p;
 }
 
 // ---------------- session control
@@ -628,23 +729,34 @@ rt::Task<void> Tuner::takeOver() {
 
 rt::Task<void> Tuner::userCorrective(std::string kind, std::vector<Target> targets, std::string reason) {
   if (!link.alive()) throw rt::Error("no vehicle heartbeat: connect first");
+  // the values belong to the vehicle read on this connection: after a reconnect it may be another vehicle
+  if (!prepared || preparedGen_ != link.generation()) throw rt::Error("read the vehicle first (the connection changed)");
   if (isArmed() && !opts["inFlightWrites"].asBool()) throw rt::Error("the vehicle is armed and " + kInFlightOff);
   auto job = beginJob(kind, true);
   ScopeExit guard{[this, job] { endJob(job); }};
-  const CorrectiveResult r = co_await corrective(job, std::move(targets), reason);
-  if (!r.failed.empty()) throw rt::Error("not written: " + join(r.failed, ", "));
+  job->txn = ++txnSeq_;
+  Json items = Json::array();
+  for (const auto& t : targets) items.push(Json::obj({{"name", t.name}, {"to", t.to}}));
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "begin"}, {"kind", kind}, {"reason", reason}, {"items", items}}));
+  // read back before going back (F-51): every value is read fresh, and only what differs is written (each verified)
+  const CorrectiveResult r = co_await corrective(job, std::move(targets), reason, true);
+  Json ft = Json::array();
+  for (const auto& t : r.failedText) ft.push(t);
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", r.failed.empty()}, {"failed", ft}}));
+  if (!r.failed.empty()) throw rt::Error("not written back: " + join(r.failedText, "; "));
 }
 
 void Tuner::onDisarm() {
   if (state != "idle") pause("vehicle disarmed");
 }
 
-rt::Task<bool> Tuner::applyProposal(const std::string& axis) {
+rt::Task<bool> Tuner::applyProposal(const std::string& axis, Json approval) {
   const Json& r = results[axis];
   if (!r.isObject() || !r["proposal"].isObject()) throw rt::Error("no proposal for " + axis);
+  const Json p = r["proposal"];
+  checkApproval(p, approval);
   if (state == "applying" || job_) throw rt::Error("another change is being written: wait until it has finished");
   if (isArmed() && !opts["inFlightWrites"].asBool()) throw rt::Error(kInFlightOff);
-  const Json target = r["proposal"]["gains"];
   auto job = beginJob("apply " + axis, false, true);
   ScopeExit guard{[this, job] { endJob(job); }};
   bool ok = false;
@@ -652,7 +764,9 @@ rt::Task<bool> Tuner::applyProposal(const std::string& axis) {
   std::string code, what;
   try {
     setState("applying", axis);
-    ok = co_await applyStaged(axis, target, job);
+    audit_->append("approval", Json::obj({{"proposal", p["id"]}, {"hash", p["hash"]}, {"axis", axis}, {"by", "user"}, {"via", "Apply"},
+                                          {"identity", identity.isObject() ? identity["key"] : Json()}}));
+    ok = co_await applyBound(axis, p, job);
   } catch (const rt::Error& e) {
     ep = std::current_exception();
     code = e.code();
@@ -669,6 +783,114 @@ rt::Task<bool> Tuner::applyProposal(const std::string& axis) {
   co_return ok;
 }
 
+void Tuner::checkApproval(const Json& p, const Json& approval) {
+  // the approval must name the proposal held now (id and hash), made on this connection for this vehicle, not too old
+  if (!p["id"].isString() || !approval.isObject() || !approval["id"].isString() || approval["id"].str() != p["id"].str() || !approval["hash"].isString() ||
+      approval["hash"].str() != p["hash"].strOr("")) {
+    audit_->append("refused", Json::obj({{"what", "apply"}, {"proposal", p["id"]}, {"hash", p["hash"]}, {"approval", approval}, {"why", "proposal id / hash mismatch"}}));
+    throw rt::Error("the proposal changed since it was shown (a newer analysis): look at it again, then press Apply", "approval");
+  }
+  const Json id = link.identity();
+  if (!identity.isObject() || p["gen"].numOr(-1) != link.generation() || p["gen"].numOr(-1) != identity["gen"].numOr(-2) || !(p["sysid"] == id["sysid"]) ||
+      !(p["compid"] == id["compid"])) {
+    audit_->append("refused", Json::obj({{"what", "apply"}, {"proposal", p["id"]}, {"why", "another connection or vehicle"}, {"proposalIdentity", p["identityKey"]}, {"now", id}}));
+    throw rt::Error("the proposal was made on another connection or for another vehicle: read the vehicle again and analyse again", "identity");
+  }
+  const double age = Loop::now() - p["at"].numOr(0);
+  if (age > kProposalMaxAgeMs) {
+    audit_->append("refused", Json::obj({{"what", "apply"}, {"proposal", p["id"]}, {"why", "too old"}}));
+    throw rt::Error("the proposal is " + jsToString(core::jsRound(age / 60000)) + " min old: observe again for a fresh one", "stale");
+  }
+}
+
+rt::Task<bool> Tuner::applyBound(std::string axis, Json p, std::shared_ptr<Job> job) {
+  // a bound proposal as one transaction: fresh values first (a changed one stops it, nothing written), the staged apply,
+  // and a write that does not verify rolls the whole apply back (each verified, within stepMax): code "apply-failed"
+  co_await freshCheck(p["rows"]);
+  job->txn = ++txnSeq_;
+  Json items = Json::array();
+  for (const auto& r : p["rows"].arr()) items.push(Json::obj({{"name", r["name"]}, {"from", r["from"]}, {"to", r["to"]}}));
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "begin"}, {"proposal", p["id"]}, {"hash", p["hash"]}, {"axis", axis}, {"armed", isArmed()}, {"items", items}}));
+  bool ok = false;
+  std::exception_ptr ep;
+  std::string code, what;
+  Json result;
+  try {
+    ok = co_await applyStaged(axis, p["gains"], job);
+  } catch (const VerifyError& e) {
+    ep = std::current_exception();
+    code = "verify";
+    what = e.what();
+    result = e.result;
+  } catch (const rt::Error& e) {
+    ep = std::current_exception();
+    code = e.code();
+    what = e.what();
+  } catch (const std::exception& e) {
+    ep = std::current_exception();
+    what = e.what();
+  }
+  if (ep) {
+    if (code != "verify") {
+      audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", false}, {"error", what}}));
+      std::rethrow_exception(ep);
+    }
+    co_await rollback(axis, job, what, result);
+    throw rt::Error(stateInfo, "apply-failed");
+  }
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", ok}}));
+  co_return ok;
+}
+
+rt::Task<void> Tuner::freshCheck(Json rows) {
+  // read every value a change will write; one that is no longer what the change was made from stops it (F-25, Q94)
+  std::vector<std::string> stale;
+  for (const auto& r : rows.arr()) {
+    const std::string name = r["name"].str();
+    double v = 0;
+    std::string err;
+    try {
+      v = co_await link.requestParam(name, 1200, 2);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+    if (!err.empty()) throw rt::Error(name + " could not be read before writing (" + err + "): nothing was written", "stale");
+    if (r["from"].isNumber() && !engine::sameF32(v, r["from"].num()))
+      stale.push_back(name + " is " + fmt4(Json(v)) + " on the vehicle, the proposal was made from " + fmt4(r["from"]));
+  }
+  if (!stale.empty()) {
+    Json st = Json::array();
+    for (const auto& x : stale) st.push(x);
+    audit_->append("refused", Json::obj({{"what", "apply"}, {"why", "changed on the vehicle"}, {"stale", st}}));
+    throw rt::Error("changed on the vehicle since the analysis: " + join(stale, "; ") + ". Nothing was written: analyse again", "stale");
+  }
+}
+
+rt::Task<void> Tuner::rollback(std::string axis, std::shared_ptr<Job> job, std::string errMsg, Json errResult) {
+  // a write that did not verify: every value this job touched goes back to its value from before (each verified; in
+  // flight within stepMax and watched); what cannot be proven is listed as uncertain. The session pauses with the result.
+  job->corrective = true;
+  std::vector<Target> targets;
+  for (const auto& [name, to] : job->touched)
+    if (to.isNumber()) targets.push_back({name, to.num()});
+  const bool armed = isArmed();
+  const std::string what = axis.empty() ? "notch / filters" : axis;
+  log("tuner", what + ": " + errMsg + ": writing back the values from before");
+  CorrectiveResult r;
+  if (!targets.empty()) r = co_await corrective(job, targets, "roll back: a write did not verify");
+  CheckResult w{true, {}};
+  if (armed && !r.written.empty()) w = co_await watchCorrective(axis.empty() ? sharedAxes() : std::vector<std::string>{axis});
+  Json ft = Json::array();
+  for (const auto& t : r.failedText) ft.push(t);
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", false}, {"failed", errResult.isObject() ? errResult["name"] : Json()},
+                                   {"rolledBack", r.failed.empty()}, {"uncertain", ft}}));
+  if (!r.failed.empty())
+    pause(what + ": " + errMsg + ". Writing back failed, uncertain parameters: " + join(r.failedText, "; ") + (armed ? ": land now" : ": check them before flying"));
+  else
+    pause(what + ": " + errMsg + ". Rolled back: every value written by this apply is back to what it was before (read back)" +
+          (w.ok ? "" : ", but " + join(w.reasons, "; ") + ": land now"));
+}
+
 rt::Task<bool> Tuner::applyStaged(const std::string& axis, Json target, std::shared_ptr<Job> job) {
   const Json cur = gainsOf(axis);
   previous.set(axis, cur);
@@ -683,9 +905,9 @@ rt::Task<bool> Tuner::applyStaged(const std::string& axis, Json target, std::sha
     if (a > 0 && b > 0) steps = std::max(steps, static_cast<int>(std::ceil(std::fabs(std::log(b / a)) / std::log(stepMax) - 1e-9)));
   }
   steps = std::min(steps, 6);
-  // filters / smax first (small effect), then the gains stepwise, the angle gain last
+  // filters, smax and the I limit first (small effect), then the gains stepwise, the angle gain last
   Json pre = Json::object();
-  for (const char* k : {"FLTT", "FLTE", "FLTD", "SMAX"})
+  for (const char* k : {"FLTT", "FLTE", "FLTD", "SMAX", "IMAX"})
     if (target[k].isNumber()) pre.set(k, target[k]);
   if (!(co_await change(job, axis, pre, "apply filters", ""))) co_return false;
   for (int s = 1; s <= steps; s++) {
@@ -759,6 +981,14 @@ rt::Task<bool> Tuner::change(std::shared_ptr<Job> job, std::optional<std::string
     assertForward(*job);
     std::optional<Calm> calm;
     if (armed) {
+      // a value that takes effect only after a reboot cannot be watched in flight (it acts on the next flight): ground only (F-35)
+      std::vector<std::string> rb;
+      for (const auto& e : todo)
+        if (core::isRebootRequired(e.name)) rb.push_back(e.name);
+      if (!rb.empty())
+        throw rt::Error(join(rb, ", ") + " take" + (rb.size() > 1 ? "" : "s") + " effect only after a reboot: " + (rb.size() > 1 ? "they are" : "it is") +
+                            " set on the ground (disarmed, then reboot), never in flight",
+                        "reboot-required");
       for (const auto& ax : watchAxes) {
         const std::string why = watchBlind(ax);
         if (!why.empty()) throw rt::Error(ax + ": " + why + ": the change could not be watched, so it was not written");
@@ -809,6 +1039,10 @@ rt::Task<bool> Tuner::change(std::shared_ptr<Job> job, std::optional<std::string
     co_await handleTrip(job, *trip, ch);
     co_return false;
   }
+  if (code == "verify") {   // the whole set is rolled back by the caller
+    if (ch) ch->status = "failed";
+    std::rethrow_exception(err);
+  }
   if (err) {
     // stopped or failed midway in flight: the part that was written is watched like any change
     if (!ch || !armed || ch->written.empty()) {
@@ -838,7 +1072,63 @@ rt::Task<bool> Tuner::applyFilterChange(Json values, std::string reason) {
   if (job_) throw rt::Error("a change is being written (" + job_->kind + "): wait until it has finished");
   auto job = beginJob("filters", false, true);
   ScopeExit guard{[this, job] { endJob(job); }};
-  co_return co_await change(job, std::nullopt, values, reason, "notch");
+  // fresh values first: the change is worked out against what the vehicle holds now
+  for (const auto& [name, to] : values.items()) {
+    std::string err;
+    try {
+      co_await link.requestParam(name, 1200, 2);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+    if (!err.empty()) throw rt::Error(name + " could not be read (" + err + "): nothing was written");
+  }
+  job->txn = ++txnSeq_;
+  Json items = Json::array();
+  for (const auto& [name, to] : values.items()) items.push(Json::obj({{"name", name}, {"from", params[name]}, {"to", to}}));
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "begin"}, {"kind", "filters"}, {"reason", reason}, {"armed", isArmed()}, {"items", items}}));
+  bool held = false;
+  std::exception_ptr ep;
+  std::string code, what;
+  Json result;
+  try {
+    held = co_await change(job, std::nullopt, values, reason, "notch");
+  } catch (const VerifyError& e) {
+    ep = std::current_exception();
+    code = "verify";
+    what = e.what();
+    result = e.result;
+  } catch (const rt::Error& e) {
+    ep = std::current_exception();
+    code = e.code();
+    what = e.what();
+  } catch (const std::exception& e) {
+    ep = std::current_exception();
+    what = e.what();
+  }
+  if (ep) {
+    if (code != "verify") {
+      audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", false}, {"error", what}}));
+      std::rethrow_exception(ep);
+    }
+    co_await rollback("", job, what, result);
+    throw rt::Error(stateInfo, "apply-failed");
+  }
+  audit_->append("txn", Json::obj({{"txn", job->txn}, {"phase", "end"}, {"ok", held}}));
+  // written on the ground: values that act only after a reboot wait for the reboot workflow (verified after it)
+  if (held && !isArmed())
+    for (const auto& [name, v] : job->touched)
+      if (core::isRebootRequired(name)) notePendingReboot(name);
+  co_return held;
+}
+
+void Tuner::notePendingReboot(const std::string& name) {
+  // a value written on the ground that takes effect only after a reboot (checked again after the reboot)
+  Json next = Json::array();
+  for (const auto& p : rebootPending.arr())
+    if (p["name"].strOr("") != name) next.push(p);
+  next.push(Json::obj({{"name", name}, {"value", params[name]}}));
+  rebootPending = next;
+  log("tuner", name + " takes effect after a reboot of the autopilot (disarmed)");
 }
 
 rt::Task<bool> Tuner::watchExternalChange(Json changed, std::string reason) {
@@ -1081,7 +1371,7 @@ rt::Task<void> Tuner::handleTrip(std::shared_ptr<Job> job, Trip trip, std::share
       pause(what + after + ": the change was reverted (" + list + ") and the vehicle is calm again. Press Resume to continue, or land");
       co_return;
     }
-    reverted = std::make_pair(list, !r.failed.empty() ? "not written: " + join(r.failed, ", ") : join(w.reasons, "; "));
+    reverted = std::make_pair(list, !r.failed.empty() ? "not written back: " + join(r.failedText, "; ") : join(w.reasons, "; "));
     log("watchdog", "after the revert (" + list + "): " + reverted->second + ": restoring the values from the start of the session");
   }
   const std::vector<Target> targets = sessionDiff();
@@ -1097,14 +1387,14 @@ rt::Task<void> Tuner::handleTrip(std::shared_ptr<Job> job, Trip trip, std::share
   const CheckResult w = co_await watchCorrective(wa);
   const std::string list = listOf(r.written);
   if (!r.failed.empty())
-    pause(what + after + ": restoring the values from the start of the session failed for " + join(r.failed, ", ") + ": land now");
+    pause(what + after + ": restoring the values from the start of the session failed (uncertain parameters: " + join(r.failedText, "; ") + "): land now");
   else if (w.ok)
     pause(what + after + ": the values from the start of the session were restored (" + list + ") and the vehicle is calm again. Land and check, or press Resume");
   else
     pause(what + after + ": still oscillating with the values from the start of the session (" + join(w.reasons, "; ") + "): land now");
 }
 
-rt::Task<Tuner::CorrectiveResult> Tuner::corrective(std::shared_ptr<Job> job, std::vector<Target> targets, std::string reason) {
+rt::Task<Tuner::CorrectiveResult> Tuner::corrective(std::shared_ptr<Job> job, std::vector<Target> targets, std::string reason, bool fresh) {
   std::map<std::string, std::string> gainKey;
   if (family)
     for (const auto& ax : kAxisNames) {
@@ -1116,13 +1406,23 @@ rt::Task<Tuner::CorrectiveResult> Tuner::corrective(std::shared_ptr<Job> job, st
     std::string name;
     double from, to;
   };
+  // fresh: read every value first and leave out what the vehicle provably holds already; otherwise nothing is left
+  // out on the strength of the cache (F-51: a stale cache must not skip a revert)
+  if (fresh)
+    for (const auto& t : targets) {
+      try {
+        co_await link.requestParam(t.name, 1200, 2);
+      } catch (const std::exception&) {
+        // the write will tell
+      }
+    }
   std::vector<Step> stepped;
   std::vector<Target> direct;
   for (const auto& t : targets) {
-    const Json& cur = params[t.name];
-    if (cur.isNumber() && std::fabs(cur.num() - t.to) <= 1e-9 * std::max(1.0, std::fabs(t.to))) continue;
+    const Json cur = params[t.name];
+    if (fresh && cur.isNumber() && engine::sameF32(cur.num(), t.to)) continue;
     const auto it = gainKey.find(t.name);
-    if (it != gainKey.end() && cur.isNumber() && ((cur.num() > 0 && t.to > 0) || inList(kLinearKeys, it->second)))
+    if (it != gainKey.end() && cur.isNumber() && !engine::sameF32(cur.num(), t.to) && ((cur.num() > 0 && t.to > 0) || inList(kLinearKeys, it->second)))
       stepped.push_back({t.name, cur.num(), t.to});
     else
       direct.push_back(t);
@@ -1138,21 +1438,31 @@ rt::Task<Tuner::CorrectiveResult> Tuner::corrective(std::shared_ptr<Job> job, st
       }
     out.written.push_back({name, v});
   };
+  auto fail = [&](const std::string& name, const std::string& msg, const std::string& text) {
+    if (!inList(out.failed, name)) {
+      out.failed.push_back(name);
+      out.failedText.push_back(text);
+    }
+    log("error", name + ": " + msg);
+  };
   for (const auto& t : direct) {
-    std::string msg;
+    std::string msg, text;
     bool ok = true;
     try {
       co_await setParam(t.name, t.to, reason, job);
+    } catch (const VerifyError& e) {
+      ok = false;
+      msg = e.what();
+      text = writeText(e.result);
     } catch (const std::exception& e) {
       ok = false;
       msg = e.what();
+      text = t.name + ": " + msg;
     }
-    if (ok) {
+    if (ok)
       record(t.name, t.to);
-    } else {
-      if (!inList(out.failed, t.name)) out.failed.push_back(t.name);
-      log("error", t.name + ": " + msg);
-    }
+    else
+      fail(t.name, msg, text);
   }
   std::vector<std::pair<double, double>> pairs;
   for (const auto& s : stepped) pairs.push_back({s.from, s.to});
@@ -1162,20 +1472,23 @@ rt::Task<Tuner::CorrectiveResult> Tuner::corrective(std::shared_ptr<Job> job, st
     for (const auto& s : stepped) {
       if (inList(out.failed, s.name)) continue;
       const double v = interp(s.from, s.to, k, steps);
-      std::string msg;
+      std::string msg, text;
       bool ok = true;
       try {
         co_await setParam(s.name, v, reason, job);
+      } catch (const VerifyError& e) {
+        ok = false;
+        msg = e.what();
+        text = writeText(e.result);
       } catch (const std::exception& e) {
         ok = false;
         msg = e.what();
+        text = s.name + ": " + msg;
       }
-      if (ok) {
+      if (ok)
         record(s.name, v);
-      } else {
-        if (!inList(out.failed, s.name)) out.failed.push_back(s.name);
-        log("error", s.name + ": " + msg);
-      }
+      else
+        fail(s.name, msg, text);
     }
   }
   co_return out;
@@ -1365,7 +1678,19 @@ rt::Task<void> Tuner::observeStep() {
     bool ok = false;
     {
       ScopeExit guard{[this, job] { endJob(job); }};
-      ok = co_await applyStaged(axis, res["proposal"]["gains"], job);
+      audit_->append("approval", Json::obj({{"proposal", res["proposal"]["id"]}, {"hash", res["proposal"]["hash"]}, {"axis", axis}, {"by", "auto"},
+                                            {"via", "auto-apply (authorised for this session when it started)"}, {"identity", identity.isObject() ? identity["key"] : Json()}}));
+      std::exception_ptr ep;
+      std::string code;
+      try {
+        ok = co_await applyBound(axis, res["proposal"], job);
+      } catch (const rt::Error& e) {
+        ep = std::current_exception();
+        code = e.code();
+      } catch (const std::exception&) {
+        ep = std::current_exception();
+      }
+      if (ep && code != "apply-failed") std::rethrow_exception(ep);   // apply-failed: rolled back, paused with the reason
     }
     if (ok && state == "applying") {
       round++;
@@ -1419,13 +1744,27 @@ rt::Task<void> Tuner::rampStep() {
   if (job_) co_return;
   auto job = beginJob("ramp", false, true);
   ScopeExit guard{[this, job] { endJob(job); }};
+  job->txn = ++txnSeq_;
   std::optional<Trip> trip;
+  bool verify = false;
+  std::string what;
+  Json result;
   try {
     co_await rampWrite(job);
   } catch (const TripError& e) {
     trip = e.trip;
+  } catch (const VerifyError& e) {
+    verify = true;
+    what = e.what();
+    result = e.result;
   }
-  if (trip) co_await handleTrip(job, *trip, nullptr);
+  if (trip) {
+    co_await handleTrip(job, *trip, nullptr);
+  } else if (verify) {   // a write that does not verify is written back too
+    const std::string axis = ramp_ ? ramp_->axis : currentAxis();
+    ramp_.reset();
+    co_await rollback(axis, job, what, result);
+  }
 }
 
 rt::Task<void> Tuner::rampWrite(std::shared_ptr<Job> job) {
@@ -1562,6 +1901,11 @@ Json Tuner::snapshot() const {
                     {"monitor", monitor},
                     {"sessionActive", sessionActive},
                     {"writing", job_ ? Json(job_->kind) : Json()},
+                    {"identity", identity},
+                    {"linkIdentity", link.identity()},
+                    {"otherVehicles", link.othersSeen()},
+                    {"rebootPending", rebootPending},
+                    {"audit", audit_->status()},
                     {"changes", ch},
                     {"journal", j},
                     {"messages", m}});
