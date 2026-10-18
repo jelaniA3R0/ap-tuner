@@ -46,7 +46,11 @@ function decodePayload(def, payload) {
         for (let i = 0; i < f.len; i++) arr[i] = rd(p, f.offset + i * SIZE[f.type]);
         out[f.name] = arr;
       }
-    } else out[f.name] = rd(p, f.offset);
+    } else {
+      out[f.name] = rd(p, f.offset);
+      // a number cannot hold all 64 bits (board UIDs): every unsigned 64-bit field also as exact hex, <name>_hex
+      if (f.type === 'uint64_t') out[f.name + '_hex'] = p.readBigUInt64LE(f.offset).toString(16).padStart(16, '0');
+    }
   }
   return out;
 }

@@ -37,7 +37,10 @@ async function setup({ armed = true, inFlight = true, opts = {}, params = copter
 function propose(tuner, axis, changes) {
   const cur = currentGains('copter', axis, tuner.params);
   tuner.results[axis] = { axis, at: Date.now(), proposal: { gains: Object.assign({}, cur, changes), changes: Object.keys(changes).map(k => ({ key: k, from: cur[k], to: changes[k], pct: 100 * (changes[k] / cur[k] - 1) })) } };
+  tuner.bindProposal(axis, tuner.results[axis].proposal);   // id + hash, as an analysis does
 }
+/** the approval the page sends back: the id and hash of the proposal it shows */
+function approve(tuner, axis) { const p = tuner.results[axis].proposal; return { id: p.id, hash: p.hash }; }
 /** largest ratio between consecutive values written to the same parameter (and from its value before) */
 function maxWriteRatio(fv, base) {
   const last = Object.assign({}, base); let worst = 1;
@@ -59,7 +62,7 @@ test('r0_armed_without_optin_writes_nothing', async () => {
   try {
     const n0 = S.fv.sets.length;
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
-    await assert.rejects(S.tuner.applyProposal('roll'), e => e.message === IN_FLIGHT_OFF, 'Advanced Apply while armed');
+    await assert.rejects(S.tuner.applyProposal('roll', approve(S.tuner, 'roll')), e => e.message === IN_FLIGHT_OFF, 'Advanced Apply while armed');
     await assert.rejects(S.tuner.applyFilterChange({ INS_HNTCH_ENABLE: 1 }, 'test'), /changes in flight are turned off/, 'notch / filter write while armed');
     S.fv.escRpm = 6000; await sleep(600);
     const notch = new NotchLive(S.link, S.tuner);
@@ -94,7 +97,7 @@ test('r0_on_the_ground_no_optin_needed', async () => {
   const S = await setup({ armed: false, inFlight: false });
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, true);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_RLL_P - 0.16) < 1e-6, 'written on the ground');
   } finally { await S.done(); }
@@ -104,7 +107,7 @@ test('r0_optin_allows_inflight_apply', async () => {
   const S = await setup({ armed: true, inFlight: true });
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, true, 'the change held: ' + S.tuner.stateInfo);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_RLL_P - 0.16) < 1e-6);
     const ch = S.tuner.changes[S.tuner.changes.length - 1];
@@ -180,7 +183,9 @@ test('f02_no_trip_on_calm_or_short_bursts', async () => {
 
 // ---------------- F-01: the in-flight notch change ----------------
 test('f01_notch_change_reverted_and_paused_within_5s', async () => {
-  const S = await setup({ armed: true, inFlight: true });
+  // INS_HNTCH_REF already 1 (set earlier on the ground): in flight only values that act at once are written (F-35)
+  const p = copterParams(); p.INS_HNTCH_REF = 1;
+  const S = await setup({ armed: true, inFlight: true, params: p });
   try {
     const notch = new NotchLive(S.link, S.tuner);
     S.fv.escRpm = 6000; await sleep(500);
@@ -208,7 +213,7 @@ test('f26_no_data_after_change_reverts', async () => {
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
     S.fv.onSet = name => { if (name === 'ATC_RAT_RLL_I' && S.fv.params.ATC_RAT_RLL_I > 0.15) { S.fv.streaming = false; setTimeout(() => { S.fv.streaming = true; }, 1600); } };
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, false, 'the change is not kept without data');
     assert.ok(Math.abs(S.fv.params.ATC_RAT_RLL_P - 0.135) < 1e-6 && Math.abs(S.fv.params.ATC_RAT_RLL_I - 0.135) < 1e-6, 'reverted to the set before the change');
     assert.match(S.tuner.stateInfo, /no PID data/);
@@ -220,7 +225,7 @@ test('f26_sparse_data_after_change_reverts', async () => {
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
     S.fv.onSet = name => { if (name === 'ATC_RAT_RLL_I' && S.fv.params.ATC_RAT_RLL_I > 0.15) S.fv.rateHz = 4; };
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, false);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_RLL_P - 0.135) < 1e-6, 'reverted');
     assert.match(S.tuner.stateInfo, /only \d+ PID samples after the change/);
@@ -232,7 +237,7 @@ test('f26_link_lost_during_watch_fails_closed', async () => {
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
     S.fv.onSet = name => { if (name === 'ATC_RAT_RLL_I' && S.fv.params.ATC_RAT_RLL_I > 0.15) setTimeout(() => S.link.disconnect(), 300); };
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, false);
     assert.strictEqual(S.tuner.state, 'paused');
     assert.ok(S.tuner.messages.some(m => /link to the vehicle was lost during the watch/.test(m.text)), 'the watch failed closed on the lost link');
@@ -246,7 +251,7 @@ test('f44_calm_before_step_reverts_to_pre_step_set', async () => {
   try {
     propose(S.tuner, 'pitch', { P: 0.17, I: 0.17 });
     S.fv.onSet = (name, v) => { if (name === 'ATC_RAT_PIT_P') S.fv.slew.pitch = v > 0.15 ? 9 : 0.5; };
-    const ok = await S.tuner.applyProposal('pitch');
+    const ok = await S.tuner.applyProposal('pitch', approve(S.tuner, 'pitch'));
     assert.strictEqual(ok, false);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_PIT_P - 0.135) < 1e-6, 'back to the set before the step');
     assert.match(S.tuner.stateInfo, /the change was reverted .* calm again/, S.tuner.stateInfo);
@@ -259,7 +264,7 @@ test('f44_lowering_step_reverted_upward_on_evidence', async () => {
   try {
     propose(S.tuner, 'roll', { D: 0.0025 });
     S.fv.onSet = (name, v) => { if (name === 'ATC_RAT_RLL_D') S.fv.slew.roll = v < 0.003 ? 7 : 0.5; };
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, false);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_RLL_D - 0.0036) < 1e-7, 'D back up to 0.0036 (the calm set before the step)');
     assert.ok(maxWriteRatio(S.fv, copterParams()) <= S.tuner.opts.stepMax * (1 + 1e-6), 'no write above stepMax');
@@ -272,7 +277,7 @@ test('f44_still_oscillating_restores_session_start_in_steps', async () => {
     S.tuner.beginSession();   // session start: D 0.0036
     // an earlier in-flight apply raised roll D to 0.0072 (held), then the vehicle starts oscillating and keeps on
     propose(S.tuner, 'roll', { D: 0.0072 });
-    assert.strictEqual(await S.tuner.applyProposal('roll'), true, 'the raise held: ' + S.tuner.stateInfo);
+    assert.strictEqual(await S.tuner.applyProposal('roll', approve(S.tuner, 'roll')), true, 'the raise held: ' + S.tuner.stateInfo);
     const n0 = S.fv.sets.length;
     S.tuner.resume(); await sleep(100);
     S.fv.slew.roll = 7;   // persistent oscillation, not caused by any write the monitor can blame
@@ -291,12 +296,12 @@ test('f44_revert_fails_then_session_start_restored', async () => {
   try {
     S.tuner.beginSession();
     propose(S.tuner, 'pitch', { P: 0.17, I: 0.17 });
-    assert.strictEqual(await S.tuner.applyProposal('pitch'), true);
+    assert.strictEqual(await S.tuner.applyProposal('pitch', approve(S.tuner, 'pitch')), true);
     S.tuner.resume();
     propose(S.tuner, 'pitch', { P: 0.21, I: 0.21 });
     // this step starts an oscillation that a revert of the step alone does not stop (only P <= 0.15 is calm)
     S.fv.onSet = (name, v) => { if (name === 'ATC_RAT_PIT_P') S.fv.slew.pitch = v > 0.15 ? 9 : 0.5; };
-    const ok = await S.tuner.applyProposal('pitch');
+    const ok = await S.tuner.applyProposal('pitch', approve(S.tuner, 'pitch'));
     assert.strictEqual(ok, false);
     assert.ok(Math.abs(S.fv.params.ATC_RAT_PIT_P - 0.135) < 1e-6, 'escalated to the session start values');
     assert.ok(maxWriteRatio(S.fv, copterParams()) <= S.tuner.opts.stepMax * (1 + 1e-6), 'no write above stepMax');
@@ -310,9 +315,9 @@ test('f92_second_apply_refused_and_resume_refused', async () => {
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
     propose(S.tuner, 'pitch', { P: 0.16, I: 0.16 });
-    const a = S.tuner.applyProposal('roll');
+    const a = S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     await sleep(50);
-    await assert.rejects(S.tuner.applyProposal('pitch'), /another change is being written/);
+    await assert.rejects(S.tuner.applyProposal('pitch', approve(S.tuner, 'pitch')), /another change is being written/);
     assert.throws(() => S.tuner.resume(), /still being written/);
     assert.throws(() => S.tuner.start(), /being written/);
     assert.strictEqual(await a, true);
@@ -326,7 +331,7 @@ test('f31_pause_stops_before_the_next_write', async () => {
     propose(S.tuner, 'roll', { P: 0.27, I: 0.27, D: 0.0072 });   // x2: two steps
     let paused = null;
     S.fv.onSet = name => { if (name === 'ATC_RAT_RLL_I' && !paused) setTimeout(() => { S.tuner.pause('paused by user'); paused = Date.now(); }, 250); };
-    const ok = await S.tuner.applyProposal('roll');
+    const ok = await S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     assert.strictEqual(ok, false, 'the apply stops');
     assert.ok(paused, 'paused during the watch of step 1');
     const after = S.fv.sets.filter(s => s.t > paused);
@@ -341,7 +346,7 @@ test('f31_pause_cancels_param_set_retries', async () => {
   try {
     propose(S.tuner, 'roll', { P: 0.16, I: 0.16 });
     S.fv.ignoreSets = true;   // the vehicle does not answer: the link would retry every 1.5 s
-    const a = S.tuner.applyProposal('roll');
+    const a = S.tuner.applyProposal('roll', approve(S.tuner, 'roll'));
     await sleep(300);
     S.tuner.pause('paused by user');
     const ok = await a;
@@ -387,7 +392,7 @@ test('f06_attitude_error_during_watch_reverts', async () => {
     await sleep(500);
     propose(S.tuner, 'pitch', { P: 0.16, I: 0.16 });
     S.fv.onSet = (name, v) => { if (name === 'ATC_RAT_PIT_P') S.fv.attitude.pitch = v > 0.15 ? 15 : 0; };   // 15 deg off target, slew rate calm
-    const ok = await S.tuner.applyProposal('pitch');
+    const ok = await S.tuner.applyProposal('pitch', approve(S.tuner, 'pitch'));
     assert.strictEqual(ok, false);
     assert.ok(S.tuner.messages.some(m => /attitude error 15\.0 deg/.test(m.text)), 'the attitude error tripped the watch');
     assert.ok(Math.abs(S.fv.params.ATC_RAT_PIT_P - 0.135) < 1e-6, 'reverted');
