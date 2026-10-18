@@ -13,6 +13,7 @@
 #include "aptuner/core/json.hpp"
 #include "aptuner/core/plant.hpp"
 #include "aptuner/core/rules.hpp"
+#include "aptuner/core/spectra.hpp"
 #include "aptuner/log/dfreader.hpp"
 
 namespace aptuner::engine {
@@ -21,6 +22,12 @@ using core::Axis;
 using core::Family;
 using core::Json;
 using core::Vec;
+
+/** one unbroken segment of an axis dataset: grid samples [g0, g1), logged time of g0 */
+struct AxisSeg {
+  std::size_t g0 = 0, g1 = 0;
+  double t0 = 0;
+};
 
 /** uniformly sampled rate-loop data of one axis (deg/s; u = PID output) */
 struct AxisData {
@@ -31,9 +38,31 @@ struct AxisData {
   double scaler2 = 1;                                 // plane: mean speed scaler^2
   std::optional<double> throttle;
   std::vector<std::uint8_t> airborne;                 // empty = all valid
+  std::vector<std::uint8_t> valid;                    // log analysis: 0 in logging gaps and for corrupt samples (empty = all real)
+  std::vector<AxisSeg> segs;                          // log analysis: unbroken segments (empty: t = t0 + i / fs)
+  std::vector<std::pair<double, double>> gaps;        // log analysis: logging gaps {t0, t1} (s)
+  std::size_t nonFinite = 0, implausible = 0;         // log analysis: masked samples
+  std::string source;                                 // log message the data come from
   Json motors;                                        // motor summary (log analysis), null if none
   Json iStats;                                        // I-term summary from a slower PID log, null if none
 };
+
+/**
+ * the samples an analysis may use: real (valid), airborne and finite (a NaN or infinity in target, actual or u is
+ * never used); empty when every sample is usable
+ */
+std::vector<std::uint8_t> usableMask(const AxisData& data);
+/** unbroken runs [i0, i1) of usable samples at least minLen long (empty mask: the whole array) */
+core::Blocks blocksOf(const std::vector<std::uint8_t>& mask, std::size_t n, std::size_t minLen = 1);
+
+/** prominence (over the median of its neighbourhood) a rate-error peak needs to count as an oscillation */
+inline constexpr double kPeakProminence = 10;
+struct LocalPeak {
+  std::size_t i = 0;
+  double f = 0, prominence = 0;
+};
+/** strongest true local maximum of a spectrum in (fLo, fHi] by prominence over the median of +-8 bins (own lobe out) */
+std::optional<LocalPeak> localPeak(const core::Psd& sp, double fLo, double fHi);
 
 /** gyro filter chain from parameters (notch frequencies resolved at the operating point) */
 core::GyroChain gyroChainFromParams(const log::Params& params, const core::NotchOp& op = {});
@@ -55,14 +84,15 @@ Json currentGains(Family f, Axis axis, const log::Params& params);
 /** [{key, from, to, pct}] for the keys whose values differ */
 Json describeChanges(const Json& cur, const Json& nw);
 
-Json diagnostics(const AxisData& data, const Json& cur, Family f, Axis axis);
+/** gyroFilterHz: INS_GYRO_FILTER for the aliasing check (0: 20 Hz) */
+Json diagnostics(const AxisData& data, const Json& cur, Family f, Axis axis, double gyroFilterHz = 0);
 Json saturationCheck(const AxisData& data, const Json& cur, Family f, const Json& d);
 struct GradeCtx {
   std::optional<bool> idOk;   // unset: grade from the data only
   bool lowConf = false;
 };
 Json gradeAxis(const Json& d, const GradeCtx& ctx = {});
-Json planeFFEvents(const AxisData& data);
+Json planeFFEvents(const AxisData& data, const core::Blocks* blocks = nullptr);
 
 struct AnalyzeArgs {
   Family family = Family::Copter;

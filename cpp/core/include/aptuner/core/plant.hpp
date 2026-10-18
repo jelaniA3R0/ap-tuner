@@ -35,7 +35,8 @@ struct PlantFit : Plant {
   double cost = 0;
   int nBins = 0;
   double fitBandLo = 0, fitBandHi = 0;
-  double fitQuality = 0;   // 1 at zero cost, ~0.5 at cost 0.3
+  double misfit = 0;       // weighted mean misfit (divided by the sum of the weights)
+  double fitQuality = 0;   // 1 / (1 + misfit / 0.3): 1 at zero misfit, ~0.5 at 0.3
   double dcGain = 0;       // K / a
   double bandwidthHz = 0;  // min(a, 1/tau) / 2 pi
 };

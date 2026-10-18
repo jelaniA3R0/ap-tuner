@@ -36,7 +36,8 @@ Json metricsJson(const std::optional<StepMetrics>& m) {
                     {"overshootPct", m->overshootPct},
                     {"riseTime", m->riseTime},
                     {"settlingTime", m->settlingTime},
-                    {"oscillations", m->oscillations}});
+                    {"oscillations", m->oscillations},
+                    {"settled", m->settled}});
 }
 
 Json marginsJson(const Margins& m) {
@@ -65,6 +66,7 @@ Json plantFitJson(const PlantFit& f) {
                     {"cost", f.cost},
                     {"nBins", f.nBins},
                     {"fitBand", Json(Json::Array{f.fitBandLo, f.fitBandHi})},
+                    {"misfit", f.misfit},
                     {"fitQuality", f.fitQuality},
                     {"dcGain", f.dcGain},
                     {"bandwidthHz", f.bandwidthHz}});
@@ -100,22 +102,66 @@ struct IdResult {
   std::size_t win = 0;
 };
 
-/** identify the bare plant for one axis (frequency domain) */
-IdResult identify(const AxisData& data, const GyroChain& gyro, Family fam, double scaler2) {
+std::size_t blockSamples(const Blocks& b) {
+  std::size_t s = 0;
+  for (const auto& [a, e] : b) s += e - a;
+  return s;
+}
+std::size_t longestBlock(const Blocks& b) {
+  std::size_t m = 0;
+  for (const auto& [a, e] : b) m = std::max(m, e - a);
+  return m;
+}
+
+/** the array itself when every value is finite, else a copy where each non-finite value holds the last finite one */
+Vec finiteHold(const Vec& a) {
+  bool bad = false;
+  for (double v : a)
+    if (!std::isfinite(v)) {
+      bad = true;
+      break;
+    }
+  if (!bad) return a;
+  Vec o = a;
+  std::optional<double> last;
+  for (double v : o)
+    if (std::isfinite(v)) {
+      last = v;
+      break;
+    }
+  double l = last.value_or(0);
+  for (auto& v : o) {
+    if (std::isfinite(v))
+      l = v;
+    else
+      v = l;
+  }
+  return o;
+}
+
+/** identify the bare plant for one axis (frequency domain), Welch windows only inside the usable blocks */
+IdResult identify(const AxisData& data, const GyroChain& gyro, Family fam, double scaler2, const Blocks& blocks) {
   IdResult r;
   const bool plane = fam == Family::Plane;
   const double windowS = plane ? 10.24 : 2.56;
   const double fs = data.fs;
-  const std::size_t n = std::min({data.target.size(), data.actual.size(), data.u.size()});
-  if (static_cast<double>(n) < fs * 8) {
-    r.reason = "not enough data (" + tf(static_cast<double>(n) / fs, 1) + " s)";
+  const std::size_t nUse = blockSamples(blocks);
+  if (static_cast<double>(nUse) < fs * 8) {
+    r.reason = "not enough data (" + tf(static_cast<double>(nUse) / fs, 1) + " s)";
     return r;
   }
+  const std::size_t fit2 = prevPow2(static_cast<double>(longestBlock(blocks)));
+  if (fit2 < 32) {
+    r.reason = "no unbroken stretch of data long enough to measure (longest " +
+               tf(static_cast<double>(longestBlock(blocks)) / fs, 2) + " s)";
+    return r;
+  }
+  const std::size_t n = std::min({data.target.size(), data.actual.size(), data.u.size()});
   std::size_t win = nextPow2(jsRound(windowS * fs));
-  win = std::max<std::size_t>(32, std::min(win, nextPow2(static_cast<double>(n) / 4)));
+  win = std::max<std::size_t>(32, std::min({win, nextPow2(static_cast<double>(nUse) / 4), fit2}));
   const double minIn = 2;   // deg/s
-  const FreqResponse ry = freqResponse(data.target.data(), data.actual.data(), n, fs, win, 0.75, minIn);
-  const FreqResponse ru = freqResponse(data.target.data(), data.u.data(), n, fs, win, 0.75, minIn);
+  const FreqResponse ry = freqResponse(data.target.data(), data.actual.data(), n, fs, win, 0.75, minIn, &blocks);
+  const FreqResponse ru = freqResponse(data.target.data(), data.u.data(), n, fs, win, 0.75, minIn, &blocks);
   if (ry.nWin < 8) {
     r.reason = "not enough pilot/autopilot excitation (" + std::to_string(ry.nWin) + " windows)";
     return r;
@@ -251,7 +297,10 @@ Json gainsJson(const PidGains& g) {
 GyroChain gyroChainFromParams(const log::Params& params, const NotchOp& op) {
   GyroChain g;
   const int rate = params.intOf("INS_GYRO_RATE");
-  g.backendHz = 1000 * std::pow(2.0, std::max(0, rate));
+  // the firmware filters at each IMU's own rate (logged as IMU.GHz); without it 1000 * 2^INS_GYRO_RATE
+  const bool logged = op.backendHz > 0;
+  g.backendHz = logged ? op.backendHz : 1000 * std::pow(2.0, std::max(0, rate));
+  g.backendSource = logged ? "IMU.GHz" : "INS_GYRO_RATE";
   for (const char* pre : {"INS_HNTCH_", "INS_HNTC2_"}) {
     const std::string p = pre;
     if (!(params.getOr(p + "ENABLE", kNaN) > 0)) continue;
@@ -267,6 +316,9 @@ GyroChain gyroChainFromParams(const log::Params& params, const NotchOp& op) {
     n.att = params.getOr(p + "ATT", 40);
     n.hmncs = static_cast<int>(params.getOr(p + "HMNCS", 3));
     n.opts = params.intOf(p + "OPTS");
+    // the notch shape stays the one of the configured FREQ / BW wherever the operating point moves it
+    n.refFreq = np.freq;
+    n.refBw = n.bw;
     g.notches.push_back(n);
   }
   g.gyroFilterHz = params.getOr("INS_GYRO_FILTER", 20);
@@ -276,14 +328,15 @@ GyroChain gyroChainFromParams(const log::Params& params, const NotchOp& op) {
 Json gyroChainJson(const GyroChain& g) {
   Json notches = Json::array();
   for (const auto& n : g.notches)
-    notches.push(Json::obj({{"enable", 1}, {"freq", n.freq}, {"bw", n.bw}, {"att", n.att}, {"hmncs", n.hmncs}, {"opts", n.opts}}));
-  return Json::obj({{"backendHz", g.backendHz}, {"gyroFilterHz", g.gyroFilterHz}, {"notches", notches}});
+    notches.push(Json::obj({{"enable", 1}, {"freq", n.freq}, {"bw", n.bw}, {"att", n.att}, {"hmncs", n.hmncs}, {"opts", n.opts}, {"refFreq", n.refFreq}, {"refBw", n.refBw}}));
+  return Json::obj({{"backendHz", g.backendHz}, {"backendSource", g.backendSource}, {"gyroFilterHz", g.gyroFilterHz}, {"notches", notches}});
 }
 
 std::optional<Resampled> resample(const Vec& t, const std::vector<const Vec*>& cols, double fs) {
   const std::size_t n = t.size();
   if (n < 4) return std::nullopt;
   const double t0 = t[0], t1 = t[n - 1];
+  if (!(t1 > t0)) return std::nullopt;   // a time base that does not increase (reset, corrupt stamps)
   const std::size_t m = static_cast<std::size_t>(std::floor((t1 - t0) * fs)) + 1;
   Resampled r;
   r.fs = fs;
@@ -302,6 +355,70 @@ std::optional<Resampled> resample(const Vec& t, const std::vector<const Vec*>& c
     }
   }
   return r;
+}
+
+std::vector<std::uint8_t> usableMask(const AxisData& data) {
+  const std::size_t n = data.target.size();
+  std::vector<std::uint8_t> m;
+  for (const auto* mask : {&data.valid, &data.airborne}) {
+    if (mask->empty()) continue;
+    if (m.empty()) {
+      m.assign(n, 0);
+      for (std::size_t i = 0; i < n; i++) m[i] = i < mask->size() && (*mask)[i] ? 1 : 0;
+    } else {
+      for (std::size_t i = 0; i < n; i++)
+        if (!(i < mask->size() && (*mask)[i])) m[i] = 0;
+    }
+  }
+  for (const Vec* a : {&data.target, &data.actual, &data.u}) {
+    if (a->empty()) continue;
+    for (std::size_t i = 0; i < n && i < a->size(); i++)
+      if (!std::isfinite((*a)[i])) {
+        if (m.empty()) m.assign(n, 1);
+        m[i] = 0;
+      }
+  }
+  return m;
+}
+
+Blocks blocksOf(const std::vector<std::uint8_t>& mask, std::size_t n, std::size_t minLen) {
+  Blocks out;
+  if (mask.empty()) {
+    if (n >= minLen && n > 0) out.emplace_back(0, n);
+    return out;
+  }
+  std::size_t i = 0;
+  while (i < n) {
+    if (!mask[i]) {
+      i++;
+      continue;
+    }
+    std::size_t j = i;
+    while (j < n && mask[j]) j++;
+    if (j - i >= minLen) out.emplace_back(i, j);
+    i = j;
+  }
+  return out;
+}
+
+std::optional<LocalPeak> localPeak(const Psd& sp, double fLo, double fHi) {
+  const Vec& p = sp.psd;
+  const Vec& f = sp.f;
+  const std::size_t n = p.size();
+  std::optional<LocalPeak> best;
+  for (std::size_t i = 1; i + 1 < n; i++) {
+    if (!(f[i] > fLo && f[i] <= fHi)) continue;
+    if (!(p[i] > p[i - 1] && p[i] >= p[i + 1])) continue;
+    Vec around;
+    const std::size_t k0 = i >= 9 ? i - 8 : 1, k1 = std::min(n - 1, i + 8);
+    for (std::size_t k = k0; k <= k1; k++)
+      if ((k > i ? k - i : i - k) > 2) around.push_back(p[k]);
+    std::sort(around.begin(), around.end());
+    const double base = around.empty() ? 0 : around[around.size() / 2];
+    const double prominence = base > 0 ? p[i] / base : (p[i] > 0 ? std::numeric_limits<double>::infinity() : 0);
+    if (!best || prominence > best->prominence) best = LocalPeak{i, f[i], prominence};
+  }
+  return best;
 }
 
 double estimateRate(const double* t, std::size_t n) {
@@ -338,80 +455,90 @@ Json describeChanges(const Json& cur, const Json& nw) {
 
 // ------------------------------------------------------------------------------------------------ diagnostics
 
-Json diagnostics(const AxisData& data, const Json& cur, Family family, Axis axis) {
+Json diagnostics(const AxisData& data, const Json& cur, Family family, Axis axis, double gyroFilterHz) {
   (void)axis;
   const double fs = data.fs;
   const std::size_t n = data.target.size();
+  // only usable samples count (no logging gap, airborne, finite); spectra only use unbroken stretches of them
+  const std::vector<std::uint8_t> use = usableMask(data);
+  const bool masked = !use.empty();
   Vec err(n);
-  double eSq = 0, tSq = 0;
+  double eSq = 0, tSq = 0, c = 0;
   for (std::size_t i = 0; i < n; i++) {
     err[i] = data.target[i] - data.actual[i];
+    if (masked && !use[i]) continue;
     eSq += err[i] * err[i];
     tSq += data.target[i] * data.target[i];
+    c++;
   }
-  const double rmsErr = std::sqrt(eSq / static_cast<double>(n)), rmsTarget = std::sqrt(tSq / static_cast<double>(n));
+  const double rmsErr = c != 0 ? std::sqrt(eSq / c) : kNaN, rmsTarget = c != 0 ? std::sqrt(tSq / c) : kNaN;
   Json out = Json::obj({{"rmsErrorDegs", rmsErr},
                         {"rmsTargetDegs", rmsTarget},
-                        {"trackingPct", rmsTarget > 1 ? Json(100 * std::max(0.0, 1 - rmsErr / rmsTarget)) : Json()}});
+                        {"trackingPct", rmsTarget > 1 ? Json(100 * std::max(0.0, 1 - rmsErr / rmsTarget)) : Json()},
+                        {"usableSeconds", c / fs}});
   // spectral content of the actual rate: oscillation band vs control band
   const std::size_t win = std::max<std::size_t>(64, std::min<std::size_t>(1024, nextPow2(fs)));
-  if (n >= win * 2) {
-    const Psd spA = psd(data.actual.data(), n, fs, win, 0.5), spE = psd(err.data(), n, fs, win, 0.5),
-              spT = psd(data.target.data(), n, fs, win, 0.5);
+  const Blocks blocks = blocksOf(use, n, win);
+  if (countWindows(blocks, win, 0.5) >= 3) {
+    const Psd spA = psd(data.actual.data(), n, fs, win, 0.5, &blocks), spE = psd(err.data(), n, fs, win, 0.5, &blocks),
+              spT = psd(data.target.data(), n, fs, win, 0.5, &blocks);
     const double fHi = std::min(30.0, fs * 0.45);
     const double oscRms = bandRms(spE, 2, fHi);   // error energy in the oscillation band
     out.set("oscRmsDegs", oscRms);
     out.set("lowRmsDegs", bandRms(spA, 0.05, 2));
-    // dominant peak in the error spectrum above 1 Hz
-    double pk = 0, pf = 0;
-    std::size_t pi = 0;
-    for (std::size_t i = 1; i < spE.f.size(); i++)
-      if (spE.f[i] > 1 && spE.f[i] <= fHi && spE.psd[i] > pk) {
-        pk = spE.psd[i];
-        pf = spE.f[i];
-        pi = i;
-      }
-    Vec sorted(spE.psd.begin() + 1, spE.psd.end());
-    std::sort(sorted.begin(), sorted.end());
-    const std::size_t mi = spE.psd.size() / 2;
-    double med = mi < sorted.size() ? sorted[mi] : kNaN;
-    if (!(med != 0) || std::isnan(med)) med = 1e-12;
-    out.set("peakHz", pf);
-    const double prominence = pk / med;
+    // the dominant peak of the error spectrum above 1 Hz: a true local maximum that stands out of the bins around it
+    const auto pk = localPeak(spE, 1, fHi);
+    out.set("peakHz", pk ? Json(pk->f) : Json());
+    const double prominence = pk ? pk->prominence : 0;
     out.set("peakProminence", prominence);
-    const double targetAtPeak = spT.psd[pi] != 0 && !std::isnan(spT.psd[pi]) ? spT.psd[pi] : 0;
-    const double peakVsTarget = targetAtPeak > 0 ? pk / targetAtPeak : std::numeric_limits<double>::infinity();
+    const double targetAtPeak = pk ? spT.psd[pk->i] : 0;
+    const double peakVsTarget =
+        pk ? (targetAtPeak > 0 ? spE.psd[pk->i] / targetAtPeak : std::numeric_limits<double>::infinity()) : 0;
     out.set("peakVsTarget", peakVsTarget);
-    out.set("oscillating", prominence > 40 && oscRms > 3 && peakVsTarget > 4);
+    const bool strong = pk && prominence > kPeakProminence && oscRms > 3 && peakVsTarget > 4;
+    // aliasing: content from fs - fHi upwards folds into the band; it must be well inside the gyro filter's stop band
+    const bool aliasRisk = fs - fHi < 3 * (gyroFilterHz > 0 ? gyroFilterHz : 20);
+    out.set("aliasRisk", aliasRisk);
+    out.set("oscillating", strong && !aliasRisk);
+    if (strong && aliasRisk) {
+      out.set("peakAmbiguous", true);
+      out.set("dataRateHz", fs);
+    }
     out.set("noiseRmsDegs", bandRms(spA, std::min(20.0, fs * 0.3), fs * 0.49));
   }
   // PID term shares and saturation
   if (data.P && data.D && data.I) {
-    double p2 = 0, d2 = 0, iSum = 0, sat = 0;
+    double p2 = 0, d2 = 0, iSum = 0, sat = 0, m = 0;
     const double uMax = family == Family::Plane ? 44 : 0.98;
     for (std::size_t i = 0; i < n; i++) {
+      if (masked && !use[i]) continue;
       p2 += (*data.P)[i] * (*data.P)[i];
       d2 += (*data.D)[i] * (*data.D)[i];
       iSum += (*data.I)[i];
       if (std::fabs(data.u[i]) >= uMax) sat++;
+      m++;
     }
     out.set("dOverP", p2 > 0 ? std::sqrt(d2 / p2) : 0.0);
-    out.set("iMean", iSum / static_cast<double>(n));
-    out.set("saturationPct", 100 * sat / static_cast<double>(n));
+    out.set("iMean", m != 0 ? iSum / m : 0.0);
+    out.set("saturationPct", m != 0 ? 100 * sat / m : 0.0);
   }
   if (data.srate) {
-    double m = 0, c = 0;
+    double m = 0, k = 0, cnt = 0;
     for (std::size_t i = 0; i < n; i++) {
+      if (masked && !use[i]) continue;
       if ((*data.srate)[i] > m) m = (*data.srate)[i];
-      if ((*data.srate)[i] > 3) c++;
+      if ((*data.srate)[i] > 3) k++;
+      cnt++;
     }
     out.set("srateMax", m);
-    out.set("sratePctAbove3", 100 * c / static_cast<double>(n));
+    out.set("sratePctAbove3", cnt != 0 ? 100 * k / cnt : 0.0);
   }
   if (data.dmod) {
     double m = 1;
-    for (std::size_t i = 0; i < n; i++)
+    for (std::size_t i = 0; i < n; i++) {
+      if (masked && !use[i]) continue;
       if ((*data.dmod)[i] < m) m = (*data.dmod)[i];
+    }
     out.set("dmodMin", m);
   }
   out.set("saturation", saturationCheck(data, cur, family, out));
@@ -422,10 +549,11 @@ Json diagnostics(const AxisData& data, const Json& cur, Family family, Axis axis
 Json saturationCheck(const AxisData& data, const Json& cur, Family family, const Json& d) {
   if (family == Family::Plane) return Json();
   const std::size_t n = data.target.size();
-  const bool hasAir = !data.airborne.empty();
+  const std::vector<std::uint8_t> air = usableMask(data);
+  const bool hasAir = !air.empty();
   double sT = 0, sA = 0, sU = 0, c = 0;
   for (std::size_t i = 0; i < n; i++) {
-    if (hasAir && !data.airborne[i]) continue;
+    if (hasAir && !air[i]) continue;
     sT += data.target[i];
     sA += data.actual[i];
     sU += data.u[i];
@@ -445,7 +573,7 @@ Json saturationCheck(const AxisData& data, const Json& cur, Family family, const
     Vec v;
     double m = 0;
     for (std::size_t i = 0; i < n; i++) {
-      if (hasAir && !data.airborne[i]) continue;
+      if (hasAir && !air[i]) continue;
       v.push_back(std::fabs((*data.I)[i]));
       m += (*data.I)[i];
     }
@@ -499,6 +627,12 @@ Json gradeAxis(const Json& d, const GradeCtx& ctx) {
                                       "reaching the controller, not a tuning oscillation. Set up the harmonic notch "
                                       "(Log tab, noise section) before tuning."
                                 : "Oscillation at " + tf(peakHz, 1) + " Hz (" + tf(oscRms, 1) + " deg/s RMS)");
+  } else if (d["peakAmbiguous"].asBool()) {
+    if (oscRms > 4) score -= 15;
+    notes.push_back("Rate-error peak at " + tf(peakHz, 1) + " Hz (" + tf(oscRms, 1) +
+                    " deg/s RMS), but the rate data are logged at only " + ts(fx(jv(d, "dataRateHz"), 1)) +
+                    " Hz: faster vibration or oscillation folds down to low frequencies (aliasing), so it cannot be told "
+                    "what this is. Log the rate loop faster before judging it.");
   } else if (oscRms > 4) {
     score -= 15;
     notes.push_back("Noticeable high-frequency error energy");
@@ -578,10 +712,11 @@ Json gradeAxis(const Json& d, const GradeCtx& ctx) {
   return Json::obj({{"score", std::max(0.0, score)}, {"letter", letter}, {"gradable", true}, {"notes", notesJson()}});
 }
 
-Json planeFFEvents(const AxisData& data) {
+Json planeFFEvents(const AxisData& data, const Blocks* blocks) {
   if (!data.P || !data.FF) return Json();
   const std::size_t n = data.target.size();
   const double fs = data.fs;
+  const Blocks bl = blocks ? *blocks : blocksOf(usableMask(data), n);
   struct Lp {
     double al, s = 0;
     double operator()(double v) {
@@ -590,40 +725,45 @@ Json planeFFEvents(const AxisData& data) {
     }
   };
   auto lp = [&](double fc) { return Lp{1 / (1 + fs / (2 * kPi * fc))}; };
-  Lp fa = lp(0.75), fr = lp(0.75), ftg = lp(4);
-  Vec absT(n);
-  for (std::size_t i = 0; i < n; i++) absT[i] = std::fabs(data.target[i]);
+  Vec absT;
+  for (const auto& [a, b] : bl)
+    for (std::size_t i = a; i < b; i++) absT.push_back(std::fabs(data.target[i]));
   std::sort(absT.begin(), absT.end());
-  const std::size_t k95 = static_cast<std::size_t>(std::floor(static_cast<double>(n) * 0.95));
-  const double p95 = k95 < n && absT[k95] != 0 ? absT[k95] : 0;
+  const std::size_t na = absT.size();
+  const std::size_t k95 = static_cast<std::size_t>(std::floor(static_cast<double>(na) * 0.95));
+  const double p95 = k95 < na && absT[k95] != 0 ? absT[k95] : 0;
   if (p95 < 10) return Json::obj({{"ff", Json()}, {"events", 0}, {"reason", "too little rate demand"}});
   const double thr1 = 0.4 * p95, thr2 = 0.25 * thr1;
-  int state = 0;
-  double maxA = 0, minA = 0, maxR = 0, minR = 0;
   Vec ffs;
-  for (std::size_t i = 0; i < n; i++) {
-    const double Ii = data.I ? (*data.I)[i] : 0;
-    const double u = (*data.P)[i] + (data.D ? (*data.D)[i] : 0) + (*data.FF)[i] + Ii;
-    const double clipped = std::max(-45.0, std::min(45.0, u)) - Ii;
-    const double act = fa(clipped), rat = fr(data.actual[i]), r = ftg(data.target[i]);
-    const double ss = data.ss ? (*data.ss)[i] : std::sqrt(data.scaler2 != 0 ? data.scaler2 : 1);
-    if (state == 0) {
-      if (r > thr1) {
-        state = 1;
-        maxA = minA = maxR = minR = 0;
-      } else if (r < -thr1) {
-        state = -1;
-        maxA = minA = maxR = minR = 0;
-      }
-    } else {
-      maxA = std::max(maxA, act);
-      minA = std::min(minA, act);
-      maxR = std::max(maxR, rat);
-      minR = std::min(minR, rat);
-      if ((state == 1 && r < thr2) || (state == -1 && r > -thr2)) {
-        const double ff = state == 1 ? maxA / (maxR * ss) : minA / (minR * ss);
-        if (std::isfinite(ff) && ff > 0 && ff < 5) ffs.push_back(ff);
-        state = 0;
+  // filters and the event detector start again in every unbroken stretch (never across a gap)
+  for (const auto& [b0, b1] : bl) {
+    Lp fa = lp(0.75), fr = lp(0.75), ftg = lp(4);
+    int state = 0;
+    double maxA = 0, minA = 0, maxR = 0, minR = 0;
+    for (std::size_t i = b0; i < b1; i++) {
+      const double Ii = data.I ? (*data.I)[i] : 0;
+      const double u = (*data.P)[i] + (data.D ? (*data.D)[i] : 0) + (*data.FF)[i] + Ii;
+      const double clipped = std::max(-45.0, std::min(45.0, u)) - Ii;
+      const double act = fa(clipped), rat = fr(data.actual[i]), r = ftg(data.target[i]);
+      const double ss = data.ss ? (*data.ss)[i] : std::sqrt(data.scaler2 != 0 ? data.scaler2 : 1);
+      if (state == 0) {
+        if (r > thr1) {
+          state = 1;
+          maxA = minA = maxR = minR = 0;
+        } else if (r < -thr1) {
+          state = -1;
+          maxA = minA = maxR = minR = 0;
+        }
+      } else {
+        maxA = std::max(maxA, act);
+        minA = std::min(minA, act);
+        maxR = std::max(maxR, rat);
+        minR = std::min(minR, rat);
+        if ((state == 1 && r < thr2) || (state == -1 && r > -thr2)) {
+          const double ff = state == 1 ? maxA / (maxR * ss) : minA / (minR * ss);
+          if (std::isfinite(ff) && ff > 0 && ff < 5) ffs.push_back(ff);
+          state = 0;
+        }
       }
     }
   }
@@ -659,11 +799,16 @@ Json analyzeAxis(const AnalyzeArgs& A) {
                         {"current", cur},
                         {"warnings", Json::array()}});
   auto warn = [&](const std::string& s) { res.at("warnings").push(s); };
+  // every measurement below uses only usable samples (no logging gap, airborne, finite), and spectra only windows
+  // that lie inside one unbroken stretch of them
+  const std::vector<std::uint8_t> use = usableMask(data);
+  const Blocks blocks = blocksOf(use, data.target.size());
   // measured closed-loop step response (data-driven, no model)
   StepResponseOptions so;
   so.windowSize = std::max<std::size_t>(64, std::min<std::size_t>(1024, nextPow2(data.fs * (plane ? 5.12 : 1.28))));
   so.durationS = plane ? 2.0 : 0.5;
   so.minInput = 15;
+  so.blocks = &blocks;
   const StepResponse sr = stepResponse(data.target, data.actual, data.fs, so);
   if (sr.count > 0)
     res.set("measuredStep", Json::obj({{"t", Json(sr.t)},
@@ -671,10 +816,21 @@ Json analyzeAxis(const AnalyzeArgs& A) {
                                        {"count", sr.count},
                                        {"metrics", metricsJson(stepMetrics(sr.t, sr.mean))}}));
   // diagnostics on the raw data
-  res.set("diagnostics", diagnostics(data, cur, fam, axis));
-  if (plane) res.set("ffEvents", planeFFEvents(data));
+  res.set("diagnostics", diagnostics(data, cur, fam, axis, gyro.gyroFilterHz));
+  if (plane) res.set("ffEvents", planeFFEvents(data, &blocks));
   // identification
-  const IdResult id = identify(data, gyro, fam, A.scaler2);
+  const IdResult id = identify(data, gyro, fam, A.scaler2, blocks);
+  // rate data logged slower than the loop: faster content folds into the measured band (aliasing)
+  {
+    const double gf = gyro.gyroFilterHz;
+    const double fBand = std::min({60.0, data.fs * 0.4, gf > 0 ? gf * 0.9 : 60.0});
+    if (data.fs - fBand < 3 * (gf > 0 ? gf : 20))
+      warn("The rate data are logged at only " + ts(fx(data.fs, 1)) + " Hz: motion faster than " + ts(fx(data.fs / 2, 1)) +
+           " Hz (which the " + ts(gf) +
+           " Hz gyro filter lets through) folds down into the measured band (aliasing), so the model and the "
+           "oscillation check are less reliable. Log the rate loop faster (copter: LOG_BITMASK with fast attitude / PID "
+           "logging; plane: the RATE message).");
+  }
   if (id.ok)
     res.set("identification", Json::obj({{"fit", plantFitJson(id.fit)}, {"nWin", id.nWin}, {"fCoh", id.fCoh}, {"win", id.win}}));
   else
@@ -702,9 +858,12 @@ Json analyzeAxis(const AnalyzeArgs& A) {
     bool ok = id.fit.fitQuality >= 0.4 && id.fCoh >= (plane ? 0.8 : 1.5);
     if (id.fit.Td >= 0.075) {
       ok = false;
-      warn("The delay estimate hit its limit (" + tf(id.fit.Td * 1000, 0) + " ms): the data rate (" + ts(data.fs) +
-           " Hz) is too low to resolve the loop dynamics. Log/stream the PID data faster (copter: LOG_BITMASK fast "
-           "attitude; live: a faster link) before trusting P and D.");
+      warn("The delay estimate hit its limit (" + tf(id.fit.Td * 1000, 0) + " ms): " +
+           (data.fs < 100 ? "the data rate (" + ts(fx(data.fs, 1)) +
+                                " Hz) is too low to resolve the loop dynamics. Log/stream the PID data faster (copter: "
+                                "LOG_BITMASK fast attitude; live: a faster link) before trusting P and D."
+                          : std::string("the flight does not show the loop delay (too little stick input at the "
+                                        "frequencies where it matters). Fly sharp stick taps before trusting P and D.")));
     }
     idn.set("ok", ok);
     if (!ok)
@@ -733,11 +892,13 @@ Json analyzeAxis(const AnalyzeArgs& A) {
            tf(cal.mismatch->second, 0) + " deg: treat the proposal with care.");
   } else if (A.timeDomain && !plane) {
     // fallback for ordinary hovers with little stick input: the time-domain (hover-data) fit, lower confidence
+    // its filters run over the whole record: unusable samples are excluded by the mask, and a non-finite one is
+    // replaced by the last finite value so it cannot poison the filters
     TimeIdInput tin;
     tin.fs = data.fs;
-    tin.actual = data.actual;
-    tin.u = data.u;
-    tin.airborne = data.airborne;
+    tin.actual = finiteHold(data.actual);
+    tin.u = finiteHold(data.u);
+    tin.airborne = use;
     TimeIdOptions to;
     to.axis = axis;
     const TimeIdResult td = identifyTimeDomain(tin, to);
@@ -792,7 +953,9 @@ Json analyzeAxis(const AnalyzeArgs& A) {
     const GainLimits lim = gainLimits(fam, axis);
     AxisGainsIn ag{jv(cur, "FLTT"), jv(cur, "FLTE"), jv(cur, "FLTD")};
     const Filters filters = filterRules(fam, axis, ag, gyro.gyroFilterHz, jor(cur, "tconst", 0.5));
-    Psd noise = psd(data.actual, data.fs, std::max<std::size_t>(64, std::min<std::size_t>(1024, nextPow2(data.fs * 1))), 0.5);
+    std::size_t nWin = std::max<std::size_t>(64, std::min<std::size_t>(1024, nextPow2(data.fs * 1)));
+    nWin = std::min(nWin, std::max<std::size_t>(64, prevPow2(static_cast<double>(longestBlock(blocks)))));
+    Psd noise = psd(data.actual, data.fs, nWin, 0.5, &blocks);
     for (auto& v : noise.psd) v = v / (us * us);
     // a yaw axis that runs near its mixer limit only has the headroom above the trim left for control
     const double uMax = plane ? 45

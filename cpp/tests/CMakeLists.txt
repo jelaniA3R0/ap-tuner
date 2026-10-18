@@ -3,6 +3,8 @@ add_executable(aptuner-tests
   test_build_info.cpp
   test_golden_core.cpp
   test_dfreader.cpp
+  test_logintegrity.cpp
+  test_reallogs.cpp
   test_io.cpp
   test_liveaxis.cpp
   test_live_safety.cpp
@@ -19,3 +21,7 @@ add_test(NAME analyze_version COMMAND aptuner-analyze --version)
 add_test(NAME app_version COMMAND aptuner --version)
 add_test(NAME analyze_usage COMMAND aptuner-analyze)
 set_tests_properties(analyze_usage PROPERTIES WILL_FAIL TRUE)   # no arguments: usage + exit code 2
+# a file that is not a DataFlash log: refused with exit code 3 and the reason
+add_test(NAME analyze_refuses_non_log
+         COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:aptuner-analyze> -DWORK=${CMAKE_CURRENT_BINARY_DIR}
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cli_refusal.cmake)

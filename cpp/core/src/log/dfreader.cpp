@@ -1,10 +1,13 @@
 #include "aptuner/log/dfreader.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace aptuner::log {
 
@@ -13,7 +16,7 @@ namespace {
 constexpr std::uint8_t kHead1 = 0xa3, kHead2 = 0x95;
 constexpr int kFmtType = 128, kFmtLen = 89;
 
-enum class Kind { None, I8, U8, I16, U16, I32, U32, F32, F64, Str, I16Arr, I16x100, U16x100, I32x100, U32x100, I32x1e7, I64, U64 };
+enum class Kind { None, I8, U8, I16, U16, F16, I32, U32, F32, F64, Str, I16Arr, I16x100, U16x100, I32x100, U32x100, I32x1e7, I64, U64 };
 
 struct FC {
   int size;
@@ -25,6 +28,7 @@ FC formatChar(char ch) {
     case 'a': return {64, Kind::I16Arr};
     case 'b': return {1, Kind::I8};
     case 'B': return {1, Kind::U8};
+    case 'g': return {2, Kind::F16};
     case 'h': return {2, Kind::I16};
     case 'H': return {2, Kind::U16};
     case 'i': return {4, Kind::I32};
@@ -66,6 +70,23 @@ inline double f64(const std::uint8_t* p) {
   std::memcpy(&d, &v, 8);
   return d;
 }
+inline std::uint64_t u64be(const std::uint8_t* p) {
+  std::uint64_t v = 0;
+  for (int k = 0; k < 8; k++) v = (v << 8) | p[k];
+  return v;
+}
+
+}  // namespace
+
+double f16(std::uint16_t u) {
+  const double s = (u & 0x8000) ? -1 : 1;
+  const int e = (u >> 10) & 0x1f, m = u & 0x3ff;
+  if (e == 0) return s * m * std::pow(2.0, -24);
+  if (e == 31) return m ? std::numeric_limits<double>::quiet_NaN() : s * std::numeric_limits<double>::infinity();
+  return s * std::pow(2.0, e - 15) * (1 + m / 1024.0);
+}
+
+namespace {
 
 double readField(const std::uint8_t* p, Kind k) {
   switch (k) {
@@ -73,6 +94,7 @@ double readField(const std::uint8_t* p, Kind k) {
     case Kind::U8: return p[0];
     case Kind::I16: return static_cast<std::int16_t>(u16(p));
     case Kind::U16: return u16(p);
+    case Kind::F16: return f16(u16(p));
     case Kind::I32: return static_cast<std::int32_t>(u32(p));
     case Kind::U32: return u32(p);
     case Kind::F32: return f32(p);
@@ -174,6 +196,96 @@ const MsgTable* LogData::msg(const std::string& name) const {
   return it == msgs.end() ? nullptr : &it->second;
 }
 
+MsgTable* LogData::msg(const std::string& name) {
+  auto it = msgs.find(name);
+  return it == msgs.end() ? nullptr : &it->second;
+}
+
+namespace {
+
+/** latin1 bytes up to the first NUL (format strings are checked per byte, as the JavaScript reader sees them) */
+std::string readRaw(const std::uint8_t* p, std::size_t n) {
+  std::string s;
+  for (std::size_t i = 0; i < n && p[i]; i++) s.push_back(static_cast<char>(p[i]));
+  return s;
+}
+
+/** one latin1 character as UTF-8 */
+std::string latin1Char(unsigned char c) {
+  std::string s;
+  if (c < 0x80) {
+    s.push_back(static_cast<char>(c));
+  } else {
+    s.push_back(static_cast<char>(0xC0 | (c >> 6)));
+    s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+  }
+  return s;
+}
+
+/** empty when an FMT definition is consistent, otherwise why it is not */
+std::string fmtProblem(int type, int len, const std::string& name, const std::string& rawFormat, std::size_t nLabels) {
+  bool nameOk = !name.empty() && name.size() <= 4;
+  for (const char ch : name)
+    if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) nameOk = false;
+  if (!nameOk) return "invalid name";
+  if (type == kFmtType) return name == "FMT" && len == kFmtLen ? std::string() : "redefines the FMT record";
+  int size = 3;
+  for (const char ch : rawFormat) {
+    const FC fc = formatChar(ch);
+    if (fc.kind == Kind::None) return "unknown format character '" + latin1Char(static_cast<unsigned char>(ch)) + "'";
+    size += fc.size;
+  }
+  if (rawFormat.empty()) return "empty format";
+  if (size != len) return "length " + std::to_string(len) + " does not match its format (" + std::to_string(size) + " bytes)";
+  if (nLabels != rawFormat.size()) return std::to_string(nLabels) + " labels for " + std::to_string(rawFormat.size()) + " fields";
+  return {};
+}
+
+}  // namespace
+
+FileFormat sniffFormat(const std::uint8_t* buf, std::size_t N) {
+  if (!N) return {"empty", false, "The file is empty."};
+  // a DataFlash log starts with its FMT records; allow a little junk in front
+  const std::size_t lim = std::min<std::size_t>(N, 4096);
+  for (std::size_t i = 0; i + 3 <= lim; i++)
+    if (buf[i] == kHead1 && buf[i + 1] == kHead2 && buf[i + 2] == kFmtType) return {"dataflash", true, ""};
+  // Mission Planner telemetry log: 8-byte time stamp (microseconds since 1970, big-endian) + a MAVLink frame
+  if (N >= 10 && (buf[8] == 0xfe || buf[8] == 0xfd)) {
+    const double us = static_cast<double>(u64be(buf));
+    if (us > 9.4e14 && us < 4.2e15)
+      return {"tlog", false,
+              "This is a MAVLink telemetry log (.tlog), not a DataFlash log (.bin). Telemetry logs do not hold the "
+              "rate-loop data at a usable rate. Use the .bin log from the flight controller (Mission Planner: DataFlash "
+              "Logs > Download DataFlash Log Via Mavlink, or copy it from the SD card)."};
+  }
+  const std::size_t m = std::min<std::size_t>(N, 512);
+  std::size_t printable = 0;
+  for (std::size_t i = 0; i < m; i++) {
+    const std::uint8_t c = buf[i];
+    if (c == 9 || c == 10 || c == 13 || (c >= 32 && c < 127)) printable++;
+  }
+  if (printable == m) {
+    // /^\s*FMT\s*,/
+    auto space = [](std::uint8_t c) { return c == 9 || c == 10 || c == 13 || c == 32; };
+    std::size_t k = 0;
+    while (k < m && space(buf[k])) k++;
+    bool fmt = k + 3 <= m && buf[k] == 'F' && buf[k + 1] == 'M' && buf[k + 2] == 'T';
+    if (fmt) {
+      k += 3;
+      while (k < m && space(buf[k])) k++;
+      fmt = k < m && buf[k] == ',';
+    }
+    if (fmt)
+      return {"dataflash-text", false,
+              "This is a DataFlash log converted to text (.log). AP Tuner reads the binary .bin log: use the .bin file "
+              "the text was made from."};
+    return {"text", false, "This is a text file (for example CSV), not an ArduPilot DataFlash log (.bin)."};
+  }
+  return {"unknown", false,
+          "This is not an ArduPilot DataFlash log (.bin): it does not start with the log format records. If it is a "
+          ".bin log, the start of the file is missing."};
+}
+
 LogData parseBin(const std::uint8_t* buf, std::size_t N, const std::set<std::string>& want) {
   LogData out;
   Fmt fmtFmt;
@@ -187,51 +299,108 @@ LogData parseBin(const std::uint8_t* buf, std::size_t N, const std::set<std::str
   fmtStore[kFmtType] = std::make_unique<Fmt>(fmtFmt);
   fmts[kFmtType] = fmtStore[kFmtType].get();
   out.fmts[kFmtType] = fmtFmt;
+  Integrity& integ = out.integrity;
+  integ.format = sniffFormat(buf, N);
+  integ.bytes = N;
+  if (!integ.format.supported) return out;
+  // zero / 0xFF bytes at the end of the file (unused flash or SD blocks) are padding, not data; the last record
+  // itself may end with such bytes, so records are still read up to the end of the file
+  std::size_t padStart = N;
+  while (padStart > 0 && (buf[padStart - 1] == 0 || buf[padStart - 1] == 0xff)) padStart--;
+  std::map<std::string, int> nameOwner{{"FMT", kFmtType}};   // message name -> type that defined it
+  std::unordered_map<std::string, double> lastParam;           // latest logged value of each parameter
   std::array<ColBuilder*, 256> colOf{};
   std::array<int, 256> msgOff{};
   msgOff.fill(-1);
   std::map<std::string, ColBuilder> cols;
+  // a record header at j whose type is defined (or j is at the end of the data)
+  auto headerAt = [&](std::size_t j) {
+    return j + 3 > N || j >= padStart || (buf[j] == kHead1 && buf[j + 1] == kHead2 && fmts[buf[j + 2]] != nullptr);
+  };
   std::size_t i = 0;
-  while (i + 3 <= N) {
-    if (buf[i] != kHead1 || buf[i + 1] != kHead2) {
-      i++;
-      continue;
+  bool skipping = false, truncated = false;
+  while (i < padStart) {
+    if (i + 3 > N) {
+      integ.truncatedBytes = N - i;
+      truncated = true;
+      break;
     }
     const int t = buf[i + 2];
-    Fmt* fm = fmts[static_cast<std::size_t>(t)];
+    Fmt* fm = buf[i] == kHead1 && buf[i + 1] == kHead2 ? fmts[static_cast<std::size_t>(t)] : nullptr;
     if (!fm) {
       i++;
+      integ.skippedBytes++;
+      skipping = true;
       continue;
     }
-    if (i + static_cast<std::size_t>(fm->len) > N) break;
+    if (i + static_cast<std::size_t>(fm->len) > N) {
+      integ.truncatedBytes = N - i;
+      truncated = true;
+      break;
+    }
+    // the next record must start right after this one: a corrupted header or a false sync inside data fails this
+    // (an FMT record may be followed by the first record of the type it defines)
+    const std::size_t next = i + static_cast<std::size_t>(fm->len);
+    const bool chained = headerAt(next) || (t == kFmtType && next + 3 <= N && buf[next] == kHead1 &&
+                                            buf[next + 1] == kHead2 && buf[next + 2] == buf[i + 3]);
+    if (!chained) {
+      i++;
+      integ.skippedBytes++;
+      skipping = true;
+      continue;
+    }
+    if (skipping) {
+      integ.resyncs++;
+      skipping = false;
+    }
     const std::uint8_t* body = buf + i + 3;
     if (t == kFmtType) {
       const int type = body[0], len = body[1];
-      if (!fmts[static_cast<std::size_t>(type)] || type != kFmtType) {
-        auto f = std::make_unique<Fmt>();
-        f->type = type;
-        f->len = len;
-        f->name = readStr(body + 2, 4);
-        f->format = readStr(body + 6, 16);
-        f->labels = splitComma(readStr(body + 22, 64));
-        fmtStore[static_cast<std::size_t>(type)] = std::move(f);
-        fmts[static_cast<std::size_t>(type)] = fmtStore[static_cast<std::size_t>(type)].get();
-        colOf[static_cast<std::size_t>(type)] = nullptr;
-        msgOff[static_cast<std::size_t>(type)] = -1;
-        out.fmts[type] = *fmts[static_cast<std::size_t>(type)];
+      const std::string name = readStr(body + 2, 4), format = readStr(body + 6, 16), rawFormat = readRaw(body + 6, 16);
+      const std::vector<std::string> labels = splitComma(readStr(body + 22, 64));
+      const Fmt* old = fmts[static_cast<std::size_t>(type)];
+      if (old) {
+        // the same definition again is harmless; a different one would change how existing records are read
+        if (type != kFmtType && (old->len != len || old->name != name || old->format != format || old->labels != labels))
+          integ.fmtConflicts++;
+      } else {
+        std::string why = fmtProblem(type, len, name, rawFormat, labels.size());
+        if (why.empty() && nameOwner.count(name)) why = "name already used by type " + std::to_string(nameOwner[name]);
+        if (!why.empty()) {
+          integ.badFmtCount++;
+          if (integ.badFmts.size() < 20) integ.badFmts.push_back({type, name, why});
+        } else {
+          auto f = std::make_unique<Fmt>();
+          f->type = type;
+          f->len = len;
+          f->name = name;
+          f->format = format;
+          f->labels = labels;
+          fmtStore[static_cast<std::size_t>(type)] = std::move(f);
+          fmts[static_cast<std::size_t>(type)] = fmtStore[static_cast<std::size_t>(type)].get();
+          out.fmts[type] = *fmts[static_cast<std::size_t>(type)];
+          nameOwner[name] = type;
+        }
       }
       out.counts["FMT"]++;
       i += static_cast<std::size_t>(fm->len);
       continue;
     }
     out.counts[fm->name]++;
-    if (fm->name == "PARM") {
-      // Q N f (TimeUS, Name, Value) [+ Default]
+    if (fm->name == "PARM" && fm->format.rfind("QNf", 0) == 0) {
+      // Q N f (TimeUS, Name, Value) [+ Default]; first value = boot value, every later new value is a change
       const std::string name = readStr(body + 8, 16);
       const double val = f32(body + 24);
-      if (!out.params.has(name)) out.params.set(name, val);   // first value = boot value
-      const double first = *out.params.get(name);
-      if (first != val) out.changes.push_back({static_cast<double>(u64(body)) / 1e6, name, val});
+      if (!out.params.has(name)) {
+        out.params.set(name, val);
+        lastParam[name] = val;
+      } else {
+        const double last = lastParam[name];
+        if (last != val && !(std::isnan(val) && std::isnan(last))) {
+          out.changes.push_back({static_cast<double>(u64(body)) / 1e6, name, val});
+          lastParam[name] = val;
+        }
+      }
       i += static_cast<std::size_t>(fm->len);
       continue;
     }
@@ -293,6 +462,7 @@ LogData parseBin(const std::uint8_t* buf, std::size_t N, const std::set<std::str
     c->n++;
     i += static_cast<std::size_t>(fm->len);
   }
+  if (!truncated) integ.paddingBytes = N > i ? N - i : 0;
   for (auto& [name, c] : cols) {
     MsgTable m;
     m.n = c.n;

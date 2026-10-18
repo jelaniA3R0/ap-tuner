@@ -8,7 +8,7 @@
 namespace aptuner::core {
 
 FreqResponse freqResponse(const double* x, const double* y, std::size_t N, double fs, std::size_t windowSize,
-                          double overlap, double minRms) {
+                          double overlap, double minRms, const Blocks* blocks) {
   const Vec w = hann(windowSize);
   const FFT fft(windowSize);
   const std::size_t nb = windowSize / 2 + 1;
@@ -18,7 +18,9 @@ FreqResponse freqResponse(const double* x, const double* y, std::size_t N, doubl
   int nWin = 0;
   Vec xr(windowSize), xi(windowSize), yr(windowSize), yi(windowSize);
   const double ws = static_cast<double>(windowSize);
-  for (std::size_t s = 0; s + windowSize <= N; s += step) {
+  const Blocks all{{0, N}};
+  for (const auto& [b0, b1] : blocks ? *blocks : all)
+  for (std::size_t s = b0; s + windowSize <= std::min(b1, N); s += step) {
     // detrend (mean removal) + window
     double mx = 0, my = 0;
     for (std::size_t i = 0; i < windowSize; i++) {
@@ -78,7 +80,7 @@ FreqResponse freqResponse(const double* x, const double* y, std::size_t N, doubl
   return r;
 }
 
-Psd psd(const double* x, std::size_t n, double fs, std::size_t windowSize, double overlap) {
+Psd psd(const double* x, std::size_t n, double fs, std::size_t windowSize, double overlap, const Blocks* blocks) {
   const Vec w = hann(windowSize);
   const FFT fft(windowSize);
   const std::size_t nb = windowSize / 2 + 1;
@@ -88,7 +90,9 @@ Psd psd(const double* x, std::size_t n, double fs, std::size_t windowSize, doubl
   int nWin = 0;
   Vec xr(windowSize), xi(windowSize);
   const double wsz = static_cast<double>(windowSize);
-  for (std::size_t s = 0; s + windowSize <= n; s += step) {
+  const Blocks all{{0, n}};
+  for (const auto& [b0, b1] : blocks ? *blocks : all)
+  for (std::size_t s = b0; s + windowSize <= std::min(b1, n); s += step) {
     double m = 0;
     for (std::size_t i = 0; i < windowSize; i++) m += x[s + i];
     m /= wsz;
@@ -120,6 +124,15 @@ Psd psd(const double* x, std::size_t n, double fs, std::size_t windowSize, doubl
   r.windowSize = windowSize;
   r.fs = fs;
   return r;
+}
+
+std::size_t countWindows(const Blocks& blocks, std::size_t windowSize, double overlap) {
+  const std::size_t step =
+      static_cast<std::size_t>(std::max(1.0, jsRound(static_cast<double>(windowSize) * (1 - overlap))));
+  std::size_t k = 0;
+  for (const auto& [b0, b1] : blocks)
+    if (b1 - b0 >= windowSize) k += (b1 - b0 - windowSize) / step + 1;
+  return k;
 }
 
 double bandRms(const Psd& sp, double f1, double f2) {

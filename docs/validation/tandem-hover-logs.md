@@ -64,6 +64,34 @@ Why they differ:
 - **Roll** gets no proposal: the hover data fit does not replay the roll rate (gusts dominate), so the app
   says so instead of proposing gains. Pitch fits well (replays 62-78%) and gets a lower-confidence 2x step.
 
+## After the log-integrity fixes (2026-10-17, branch `fix/log-integrity`)
+
+Same logs, `cd07d42` (before) vs the fixed analysis (after); JavaScript and C++ give identical results.
+
+| | 04-20-29 | 04-33-02 | 04-43-00 |
+|---|---|---|---|
+| data before | 162.7 s on a 200 Hz grid, the 51.8 s logging gap bridged by straight lines | 100.5 s up-sampled to 400 Hz | 29.6 s up-sampled to 400 Hz |
+| data after | 300.03 Hz as logged; gap 230.5-282.3 s reported and left out; 110.9 s logged, 44.3 s airborne used | 300.03 Hz; 62.6 s airborne | 300.03 Hz; 12.1 s airborne |
+| "parameter changes" | 65 -> 0 tuning-relevant (65 STAT_* / baro values) | 123 -> 0 (126 housekeeping) | 14 -> 0 |
+| roll | no model -> frequency-response model; P/I 0.25 -> 0.5, D 0.0036 -> 0.0070, ANG 4.5 -> 3 | no model -> P/I 0.5, D 0.0054, ANG 3 | no model (fit does not replay the rate) |
+| pitch | P/I 0.5, D 0.0054, ANG 3 (unchanged) | unchanged | P/I 0.25 -> 0.5 became 0.25 -> 0.125 (see below) |
+| yaw | P 0.36, I 0.036, IMAX 0.75, ANG 3 (unchanged) | unchanged | none (unchanged) |
+| notch | "no peak" -> none: flight too short to check that the peaks repeat | none: peaks do not repeat (unchanged) | none: too short (unchanged) |
+
+RMS rate errors are higher now (roll 5.99 -> 9.40 deg/s on 04-20-29) because ground time, where the error is
+near zero, no longer dilutes them.
+
+To treat with care:
+- **04-43-00 pitch**: only 12 s airborne; the hover-data fit replays just 11% of the measured rate but passes,
+  because the gate accepts max(r2, replay). Its P 0.125 (-50%) should not be used; requiring a replay of at
+  least 30% (roadmap R2) would reject it.
+- **Roll** on 04-20-29 / 04-33-02 now passes the frequency-response gates on airborne-only data, but the
+  excitation is gusts, not stick input (bias F-58): confirm with stick inputs before trusting it.
+- The six SITL demo logs (`demo/quad`, `demo/quadplane`) lost 19-45% of the analysed window in the logger
+  (`DSF.Dp` 69,247 to 438,260 dropped messages): the rate data come in unbroken pieces of 0.05-3.7 s, and
+  identification is now refused with the reason (no unbroken stretch long enough, too few spectrum windows, or
+  too little coherence) instead of being fitted on interpolated data.
+
 ## Regression on well-excited SITL logs
 
 `demo/quad/{before,tuning,after}.BIN` and `demo/quadplane/{before,tuning,after}.BIN`, old (installed) vs

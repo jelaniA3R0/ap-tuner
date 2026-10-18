@@ -1,0 +1,22 @@
+# Runs the JavaScript tests (the reference implementation the C++ port is compared with).
+name: js
+on:
+  push:
+    paths: ['src/**', 'test/**', 'tools/**', '.github/workflows/js.yml']
+  pull_request:
+    paths: ['src/**', 'test/**', 'tools/**', '.github/workflows/js.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test
+        run: node test/run-all.js

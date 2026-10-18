@@ -68,18 +68,53 @@ struct TextMsg {
   std::string msg;
 };
 
+/** what kind of file a buffer holds (sniffFormat) */
+struct FileFormat {
+  std::string kind;       // "dataflash" | "tlog" | "dataflash-text" | "text" | "empty" | "unknown"
+  bool supported = false;
+  std::string message;    // why it cannot be analysed (empty when supported)
+};
+FileFormat sniffFormat(const std::uint8_t* buf, std::size_t size);
+
+struct BadFmt {
+  int type = 0;
+  std::string name, reason;
+};
+
+/** how well the file could be read */
+struct Integrity {
+  FileFormat format;
+  std::size_t bytes = 0;
+  std::size_t skippedBytes = 0;    // bytes that were not part of a verified record
+  std::size_t resyncs = 0;         // times reading picked up again after skipped bytes
+  std::size_t truncatedBytes = 0;  // an incomplete record at the end
+  std::size_t paddingBytes = 0;    // zero / 0xFF bytes after the last record
+  std::vector<BadFmt> badFmts;     // the first 20 invalid FMT definitions
+  std::size_t badFmtCount = 0;
+  std::size_t fmtConflicts = 0;    // a type defined again with a different layout (the first one is kept)
+};
+
 struct LogData {
   std::map<int, Fmt> fmts;
   std::map<std::string, std::size_t> counts;
   std::map<std::string, MsgTable> msgs;
   Params params;                       // first value of each parameter (boot value)
-  std::vector<ParamChange> changes;    // later in-flight changes
+  std::vector<ParamChange> changes;    // later in-flight changes (every new value, also a change back)
   std::vector<TextMsg> text;
+  Integrity integrity;
 
   const MsgTable* msg(const std::string& name) const;
+  MsgTable* msg(const std::string& name);
 };
 
-/** parse a whole .bin image; want = message names to keep as columns (empty = all) */
+/** IEEE 754 half precision (DataFlash format character 'g') */
+double f16(std::uint16_t u);
+
+/**
+ * parse a whole .bin image; want = message names to keep as columns (empty = all). Files that are not
+ * DataFlash logs are not parsed (integrity.format says why); FMT definitions are validated; every record must
+ * be followed by the next record header (or the end of the file).
+ */
 LogData parseBin(const std::uint8_t* buf, std::size_t size, const std::set<std::string>& want = {});
 LogData parseBinFile(const std::string& path, const std::set<std::string>& want = {});   // throws on read errors
 std::vector<std::uint8_t> readFile(const std::string& path);

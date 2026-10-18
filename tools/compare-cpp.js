@@ -49,7 +49,8 @@ for (const file of process.argv.slice(2)) {
   const js = JSON.parse(JSON.stringify(analyzeLog(file, {})));
   const tJs = Date.now() - t0;
   const t1 = Date.now();
-  execFileSync(exe, [file, '--json', tmp], { stdio: ['ignore', 'ignore', 'inherit'] });
+  // exit code 3: the file was refused (not a DataFlash log); the result is still written and compared
+  try { execFileSync(exe, [file, '--json', tmp], { stdio: ['ignore', 'ignore', 'inherit'] }); } catch (e) { if (e.status !== 3) throw e; }
   const tCpp = Date.now() - t1;
   const cpp = JSON.parse(fs.readFileSync(tmp, 'utf8')); fs.unlinkSync(tmp);
   delete js.counts; delete cpp.counts;   // key order only (same values)

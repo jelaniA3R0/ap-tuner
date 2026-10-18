@@ -1,13 +1,13 @@
 // Shared per-axis analysis used by both the live tuner and the log analyser:
 //   uniformly sampled data -> identification -> synthesis -> prediction -> diagnostics.
 'use strict';
-const { freqResponse, psd, bandRms } = require('../dsp/spectra');
+const { freqResponse, psd, bandRms, countWindows } = require('../dsp/spectra');
 const { stepResponse, stepMetrics } = require('../dsp/stepresp');
 const { C, gyroChain, notchBaseFreq } = require('../model/controller');
 const { fitPlant, evalPlant } = require('../model/plant');
 const { synthesize, synthesizeQuik, simulateRateStep, margins, openLoop, closedLoop, logspace } = require('../model/synth');
 const { PRESETS, filterRules, iRule, gainLimits, angleRule } = require('../model/rules');
-const { nextPow2 } = require('../dsp/fft');
+const { nextPow2, prevPow2 } = require('../dsp/fft');
 const { identifyTimeDomain } = require('../model/timeid');
 
 /** compact copy of a time-domain fit for the result (no per-chunk arrays beyond the trims) */
@@ -16,26 +16,36 @@ function slimTd(f) {
   return { bDegs2: r(f.K), bRads2: r(f.K / 57.2957795), a: r(f.a), tau: r(f.tau), Td: r(f.Td), uLimit: f.uLimit, limitPct: r(f.limitPct || 0), trimMean: r(f.trimMean), trimMin: r(f.trimMin), trimMax: r(f.trimMax), r2: r(f.r2), vaf: r(f.vaf), bRelErr: r(f.bRelErr), method: f.method, airborneS: r(f.airborneS), segments: f.segments, fitQuality: r(f.fitQuality) };
 }
 
-/** Build the gyro filter chain description from parameters (first notch set resolved at hover throttle) */
+/**
+ * Build the gyro filter chain description from parameters, with the notch sets resolved at the operating point.
+ * op: { throttle (0..1), rpm, escRpm (rpm), fftHz, backendHz }. backendHz: the rate the gyro filters run at,
+ * logged as IMU.GHz (the firmware filters at each IMU's own rate); without it 1000 * 2^INS_GYRO_RATE.
+ * Each notch keeps its configured FREQ / BW (refFreq / refBw): the firmware fixes the notch shape from them.
+ */
 function gyroChainFromParams(params, op = {}) {
   const rate = params.INS_GYRO_RATE | 0;
-  const backendHz = 1000 * Math.pow(2, Math.max(0, rate));
+  const logged = op.backendHz > 0;
+  const backendHz = logged ? op.backendHz : 1000 * Math.pow(2, Math.max(0, rate));
   const notches = [];
   for (const pre of ['INS_HNTCH_', 'INS_HNTC2_']) {
     if (!(params[pre + 'ENABLE'] > 0)) continue;
     const p = { mode: params[pre + 'MODE'] | 0, freq: params[pre + 'FREQ'] || 0, ref: params[pre + 'REF'] ?? 0, fm_rat: params[pre + 'FM_RAT'] ?? 1 };
-    notches.push({ enable: 1, freq: notchBaseFreq(p, op), bw: params[pre + 'BW'] || 0, att: params[pre + 'ATT'] ?? 40, hmncs: params[pre + 'HMNCS'] ?? 3, opts: params[pre + 'OPTS'] | 0 });
+    const bw = params[pre + 'BW'] || 0;
+    notches.push({ enable: 1, freq: notchBaseFreq(p, op), bw, att: params[pre + 'ATT'] ?? 40, hmncs: params[pre + 'HMNCS'] ?? 3, opts: params[pre + 'OPTS'] | 0, refFreq: p.freq, refBw: bw });
   }
-  return { backendHz, gyroFilterHz: params.INS_GYRO_FILTER ?? 20, notches };
+  return { backendHz, backendSource: logged ? 'IMU.GHz' : 'INS_GYRO_RATE', gyroFilterHz: params.INS_GYRO_FILTER ?? 20, notches };
 }
 
 /**
- * Resample irregular samples (t ascending, seconds) onto a uniform grid at fs.
- * Returns {fs, t0, n, cols:{name: Float64Array}}. Gaps longer than maxGap are left NaN-free by holding.
+ * Resample irregular samples (t ascending, seconds) onto a uniform grid at fs by linear interpolation.
+ * Returns {fs, t0, n, cols:{name: Float64Array}}, or null for fewer than 4 samples or a time base that does
+ * not increase. Any gap is bridged by a straight line, so the log analysis does not use it (it splits the data
+ * at gaps and keeps the native samples, see loganalysis.axisData); the live tuner's telemetry windows do.
  */
 function resample(t, cols, fs) {
   const n = t.length; if (n < 4) return null;
   const t0 = t[0], t1 = t[n - 1];
+  if (!(t1 > t0)) return null;
   const m = Math.floor((t1 - t0) * fs) + 1;
   const out = {}; for (const k of Object.keys(cols)) out[k] = new Float64Array(m);
   let j = 0;
@@ -47,6 +57,44 @@ function resample(t, cols, fs) {
   }
   return { fs, t0, n: m, cols: out };
 }
+
+/**
+ * The samples an analysis may use: real samples (data.valid: not in a logging gap), airborne (data.airborne)
+ * and finite (a NaN or infinity in target, actual or output is never used). null when every sample is usable.
+ */
+function usableMask(data) {
+  const n = data.target.length;
+  let m = null;
+  for (const mask of [data.valid, data.airborne]) {
+    if (!mask) continue;
+    if (!m) { m = new Uint8Array(n); for (let i = 0; i < n; i++) m[i] = mask[i] ? 1 : 0; } else for (let i = 0; i < n; i++) if (!mask[i]) m[i] = 0;
+  }
+  for (const k of ['target', 'actual', 'u']) {
+    const a = data[k]; if (!a) continue;
+    for (let i = 0; i < n; i++) if (!Number.isFinite(a[i])) { if (!m) m = new Uint8Array(n).fill(1); m[i] = 0; }
+  }
+  return m;
+}
+
+/** unbroken runs [i0, i1) of usable samples at least minLen long (mask null: the whole array) */
+function blocksOf(mask, n, minLen = 1) {
+  if (!mask) return n >= minLen && n > 0 ? [[0, n]] : [];
+  const out = []; let i = 0;
+  while (i < n) { if (!mask[i]) { i++; continue; } let j = i; while (j < n && mask[j]) j++; if (j - i >= minLen) out.push([i, j]); i = j; }
+  return out;
+}
+/** the array itself when every value is finite, else a copy where each non-finite value holds the last finite one */
+function finiteHold(a) {
+  let bad = -1; for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) { bad = i; break; }
+  if (bad < 0) return a;
+  const o = Float64Array.from(a);
+  let last = null; for (let i = 0; i < o.length && last === null; i++) if (Number.isFinite(o[i])) last = o[i];
+  if (last === null) last = 0;
+  for (let i = 0; i < o.length; i++) { if (Number.isFinite(o[i])) last = o[i]; else o[i] = last; }
+  return o;
+}
+const blockSamples = blocks => blocks.reduce((s, [a, b]) => s + b - a, 0);
+const longestBlock = blocks => blocks.reduce((m, [a, b]) => Math.max(m, b - a), 0);
 
 /** average sample rate over the samples given (robust to bursty telemetry) */
 function estimateRate(t) {
@@ -60,16 +108,21 @@ function estimateRate(t) {
  * data: { fs, target, actual, u } uniform arrays (u = P+I+D+FF+DFF: the actuator demand);
  * gyro: chain description; family for initial guesses; scaler2: mean (speed scaler)^2 (plane) else 1
  */
-function identify(data, gyro, family, { scaler2 = 1, windowS = null } = {}) {
+function identify(data, gyro, family, { scaler2 = 1, windowS = null, blocks = null } = {}) {
   // planes respond slowly (roll mode ~1-2 Hz): long windows give the frequency resolution needed
   if (!windowS) windowS = family === 'plane' ? 10.24 : 2.56;
   const fs = data.fs;
   const n = Math.min(data.target.length, data.actual.length, data.u.length);
-  if (n < fs * 8) return { ok: false, reason: 'not enough data (' + (n / fs).toFixed(1) + ' s)' };
-  let win = nextPow2(Math.round(windowS * fs)); win = Math.max(32, Math.min(win, nextPow2(n / 4)));
+  // Welch windows only inside unbroken, usable stretches (no gap, no ground time, no invalid sample)
+  if (!blocks) blocks = blocksOf(usableMask(data), n);
+  const nUse = blockSamples(blocks);
+  if (nUse < fs * 8) return { ok: false, reason: 'not enough data (' + (nUse / fs).toFixed(1) + ' s)' };
+  const fit2 = prevPow2(longestBlock(blocks));
+  if (fit2 < 32) return { ok: false, reason: 'no unbroken stretch of data long enough to measure (longest ' + (longestBlock(blocks) / fs).toFixed(2) + ' s)' };
+  let win = nextPow2(Math.round(windowS * fs)); win = Math.max(32, Math.min(win, nextPow2(nUse / 4), fit2));
   const minIn = 2; // deg/s
-  const ry = freqResponse(data.target, data.actual, fs, win, 0.75, minIn);
-  const ru = freqResponse(data.target, data.u, fs, win, 0.75, minIn);
+  const ry = freqResponse(data.target, data.actual, fs, win, 0.75, minIn, blocks);
+  const ru = freqResponse(data.target, data.u, fs, win, 0.75, minIn, blocks);
   if (ry.nWin < 8) return { ok: false, reason: 'not enough pilot/autopilot excitation (' + ry.nWin + ' windows)' };
   const Hmeas = C.div(ry.H, ru.H);
   const coh = new Float64Array(ry.f.length); for (let i = 0; i < coh.length; i++) coh[i] = Math.min(ry.coh[i], ru.coh[i]);
@@ -86,9 +139,10 @@ function identify(data, gyro, family, { scaler2 = 1, windowS = null } = {}) {
 }
 
 /** Gyro noise PSD measured from the (post-filter) actual-rate signal: use the high band where the loop is quiet */
-function noiseFromActual(actual, fs) {
-  const win = Math.max(64, Math.min(1024, nextPow2(fs * 1)));
-  const sp = psd(actual, fs, win, 0.5);
+function noiseFromActual(actual, fs, blocks = null) {
+  let win = Math.max(64, Math.min(1024, nextPow2(fs * 1)));
+  if (blocks) win = Math.min(win, Math.max(64, prevPow2(longestBlock(blocks))));
+  const sp = psd(actual, fs, win, 0.5, blocks);
   // uniform grid as psd gives; return as {f, psd}
   return { f: sp.f, psd: sp.psd, rmsHigh: bandRms(sp, Math.min(20, fs * 0.25), fs * 0.49) };
 }
@@ -104,14 +158,22 @@ function analyzeAxis({ family, axis, data, params, preset = 'normal', gyroOp = {
   const gyro = gyroChainFromParams(params, gyroOp);
   const cur = currentGains(family, axis, params);
   const res = { family, axis, preset, loopHz, gyro, current: cur, warnings: [] };
+  // every measurement below uses only usable samples (no logging gap, airborne, finite), and spectra only
+  // windows that lie inside one unbroken stretch of them
+  const n = data.target.length;
+  const use = usableMask(data);
+  const blocks = blocksOf(use, n);
   // measured closed-loop step response (data-driven, no model)
-  const sr = stepResponse(data.target, data.actual, data.fs, { windowSize: Math.max(64, Math.min(1024, nextPow2(data.fs * (fam === 'plane' ? 5.12 : 1.28)))), durationS: fam === 'plane' ? 2.0 : 0.5, minInput: 15 });
+  const sr = stepResponse(data.target, data.actual, data.fs, { windowSize: Math.max(64, Math.min(1024, nextPow2(data.fs * (fam === 'plane' ? 5.12 : 1.28)))), durationS: fam === 'plane' ? 2.0 : 0.5, minInput: 15, blocks });
   if (sr.count > 0) { const norm = sr.mean; res.measuredStep = { t: sr.t, y: norm, count: sr.count, metrics: stepMetrics(sr.t, norm) }; }
   // diagnostics on the raw data
-  res.diagnostics = diagnostics(data, cur, fam, axis);
-  if (fam === 'plane') res.ffEvents = planeFFEvents(data);
+  res.diagnostics = diagnostics(data, cur, fam, axis, { gyroFilterHz: gyro.gyroFilterHz });
+  if (fam === 'plane') res.ffEvents = planeFFEvents(data, blocks);
   // identification
-  const id = identify(data, gyro, fam, { scaler2 });
+  const id = identify(data, gyro, fam, { scaler2, blocks });
+  // rate data logged slower than the loop: faster content folds into the measured band (aliasing)
+  const fBand = Math.min(60, data.fs * 0.4, gyro.gyroFilterHz > 0 ? gyro.gyroFilterHz * 0.9 : 60);
+  if (data.fs - fBand < 3 * (gyro.gyroFilterHz > 0 ? gyro.gyroFilterHz : 20)) res.warnings.push(`The rate data are logged at only ${+data.fs.toFixed(1)} Hz: motion faster than ${+(data.fs / 2).toFixed(1)} Hz (which the ${gyro.gyroFilterHz} Hz gyro filter lets through) folds down into the measured band (aliasing), so the model and the oscillation check are less reliable. Log the rate loop faster (copter: LOG_BITMASK with fast attitude / PID logging; plane: the RATE message).`);
   res.identification = id.ok ? { fit: id.fit, nWin: id.nWin, fCoh: id.fCoh, win: id.win } : { ok: false, reason: id.reason };
   if (id.ok) {
     const f = id.f, keep = [];
@@ -119,7 +181,7 @@ function analyzeAxis({ family, axis, data, params, preset = 'normal', gyroOp = {
     const Gfit = evalPlant(Float64Array.from(keep.map(i => f[i])), id.fit);
     res.identification.bode = { f: keep.map(i => +f[i].toFixed(3)), magMeas: keep.map(i => +Math.hypot(id.Hbare.re[i], id.Hbare.im[i]).toPrecision(4)), phMeas: keep.map(i => +(Math.atan2(id.Hbare.im[i], id.Hbare.re[i]) * 180 / Math.PI).toFixed(1)), coh: keep.map(i => +id.coh[i].toFixed(3)), magFit: Array.from(Gfit.re, (v, k) => +Math.hypot(v, Gfit.im[k]).toPrecision(4)), phFit: Array.from(Gfit.re, (v, k) => +(Math.atan2(Gfit.im[k], v) * 180 / Math.PI).toFixed(1)) };
     res.identification.ok = id.fit.fitQuality >= 0.4 && id.fCoh >= (fam === 'plane' ? 0.8 : 1.5);
-    if (id.fit.Td >= 0.075) { res.identification.ok = false; res.warnings.push('The delay estimate hit its limit (' + (id.fit.Td * 1000).toFixed(0) + ' ms): the data rate (' + data.fs + ' Hz) is too low to resolve the loop dynamics. Log/stream the PID data faster (copter: LOG_BITMASK fast attitude; live: a faster link) before trusting P and D.'); }
+    if (id.fit.Td >= 0.075) { res.identification.ok = false; res.warnings.push('The delay estimate hit its limit (' + (id.fit.Td * 1000).toFixed(0) + ' ms): ' + (data.fs < 100 ? 'the data rate (' + +data.fs.toFixed(1) + ' Hz) is too low to resolve the loop dynamics. Log/stream the PID data faster (copter: LOG_BITMASK fast attitude; live: a faster link) before trusting P and D.' : 'the flight does not show the loop delay (too little stick input at the frequencies where it matters). Fly sharp stick taps before trusting P and D.')); }
     if (!res.identification.ok) res.warnings.push('Model fit is weak (quality ' + id.fit.fitQuality.toFixed(2) + ', trusted to ' + id.fCoh.toFixed(1) + ' Hz). Fly sharper stick inputs or use SystemID mode.');
   }
   // ArduPilot copter/VTOL/heli rate PIDs work in rad/s, plane in deg/s. The data and the identified
@@ -143,7 +205,9 @@ function analyzeAxis({ family, axis, data, params, preset = 'normal', gyroOp = {
   } else if (timeDomain && fam !== 'plane' && data.u) {
     // Fallback for ordinary hovers with little stick input: fit the airframe in the time domain (see
     // model/timeid.js). Lower confidence, so the design keeps a larger distance from the oscillation point.
-    const td = identifyTimeDomain(data, { axis });
+    // its filters run over the whole record: unusable samples are excluded by the mask, and a non-finite one is
+    // replaced by the last finite value so it cannot poison the filters
+    const td = identifyTimeDomain(Object.assign({}, data, { actual: finiteHold(data.actual), u: finiteHold(data.u), airborne: use }), { axis });
     res.timeDomain = td.fit ? Object.assign({ ok: td.ok, reason: td.reason }, slimTd(td.fit)) : { ok: false, reason: td.reason };
     if (td.ok) {
       tdFit = td.fit; lowConf = true;
@@ -161,7 +225,7 @@ function analyzeAxis({ family, axis, data, params, preset = 'normal', gyroOp = {
     const ctx = { fsLoop: loopHz, gyro, plant };
     const lim = gainLimits(fam, axis);
     const filters = filterRules(fam, axis, cur, gyro.gyroFilterHz, cur.tconst || 0.5);
-    const noise = noiseFromActual(data.actual, data.fs);
+    const noise = noiseFromActual(data.actual, data.fs, blocks);
     noise.psd = Float64Array.from(noise.psd, v => v / (us * us));
     // a yaw axis that runs near its mixer limit only has the headroom above the trim left for control
     const uMax = fam === 'plane' ? 45 : (tdFit && tdFit.uLimit ? Math.max(0.1, tdFit.uLimit - Math.abs(tdFit.trimMean || 0)) : 1);
@@ -326,41 +390,74 @@ function describeChanges(cur, nw) {
  * Flight-data diagnostics for an axis: tracking error, oscillation energy, saturation, noise,
  * D-term share, I-term offset (trim), slew-rate activity.
  */
-function diagnostics(data, cur, family, axis) {
+function diagnostics(data, cur, family, axis, { gyroFilterHz = null } = {}) {
   const fs = data.fs; const n = data.target.length;
-  const err = new Float64Array(n); let eSq = 0, tSq = 0;
-  for (let i = 0; i < n; i++) { err[i] = data.target[i] - data.actual[i]; eSq += err[i] * err[i]; tSq += data.target[i] * data.target[i]; }
-  const rmsErr = Math.sqrt(eSq / n), rmsTarget = Math.sqrt(tSq / n);
-  const out = { rmsErrorDegs: rmsErr, rmsTargetDegs: rmsTarget, trackingPct: rmsTarget > 1 ? 100 * Math.max(0, 1 - rmsErr / rmsTarget) : null };
+  // only usable samples count (no logging gap, airborne, finite); spectra only use unbroken stretches of them
+  const use = usableMask(data);
+  const err = new Float64Array(n); let eSq = 0, tSq = 0, c = 0;
+  for (let i = 0; i < n; i++) { err[i] = data.target[i] - data.actual[i]; if (use && !use[i]) continue; eSq += err[i] * err[i]; tSq += data.target[i] * data.target[i]; c++; }
+  const rmsErr = c ? Math.sqrt(eSq / c) : NaN, rmsTarget = c ? Math.sqrt(tSq / c) : NaN;
+  const out = { rmsErrorDegs: rmsErr, rmsTargetDegs: rmsTarget, trackingPct: rmsTarget > 1 ? 100 * Math.max(0, 1 - rmsErr / rmsTarget) : null, usableSeconds: c / fs };
   // spectral content of the actual rate: oscillation band (2 - 0.4*fs or 30 Hz) vs control band
   const win = Math.max(64, Math.min(1024, nextPow2(fs)));
-  if (n >= win * 2) {
-    const spA = psd(data.actual, fs, win, 0.5), spE = psd(err, fs, win, 0.5), spT = psd(data.target, fs, win, 0.5);
+  const blocks = blocksOf(use, n, win);
+  if (countWindows(blocks, win, 0.5) >= 3) {
+    const spA = psd(data.actual, fs, win, 0.5, blocks), spE = psd(err, fs, win, 0.5, blocks), spT = psd(data.target, fs, win, 0.5, blocks);
     const fHi = Math.min(30, fs * 0.45);
     out.oscRmsDegs = bandRms(spE, 2, fHi);          // error energy in the oscillation band
     out.lowRmsDegs = bandRms(spA, 0.05, 2);
-    // dominant peak in the error spectrum above 1 Hz
-    let pk = 0, pf = 0, pi = 0; for (let i = 1; i < spE.f.length; i++) if (spE.f[i] > 1 && spE.f[i] <= fHi && spE.psd[i] > pk) { pk = spE.psd[i]; pf = spE.f[i]; pi = i; }
-    const med = Float64Array.from(spE.psd.slice(1)).sort()[Math.floor(spE.psd.length / 2)] || 1e-12;
-    out.peakHz = pf; out.peakProminence = pk / med;
-    const targetAtPeak = spT.psd[pi] || 0;
-    out.peakVsTarget = targetAtPeak > 0 ? pk / targetAtPeak : Infinity;
-    out.oscillating = out.peakProminence > 40 && out.oscRmsDegs > 3 && out.peakVsTarget > 4;
+    // the dominant peak of the error spectrum above 1 Hz: a true local maximum that stands out of the bins
+    // around it (the first bin of a falling spectrum is not a peak)
+    const pk = localPeak(spE, 1, fHi);
+    out.peakHz = pk ? pk.f : null; out.peakProminence = pk ? pk.prominence : 0;
+    const targetAtPeak = pk ? spT.psd[pk.i] : 0;
+    out.peakVsTarget = pk ? (targetAtPeak > 0 ? spE.psd[pk.i] / targetAtPeak : Infinity) : 0;
+    const strong = !!pk && out.peakProminence > PEAK_PROMINENCE && out.oscRmsDegs > 3 && out.peakVsTarget > 4;
+    // aliasing: the logged rate is a sample of the loop's signal; whatever the gyro filter lets through above
+    // fs/2 folds into the band. Content from fs - fHi upwards lands in it; it must be well inside the filter's
+    // stop band (3x INS_GYRO_FILTER: -19 dB) for a peak frequency to mean anything.
+    out.aliasRisk = fs - fHi < 3 * (gyroFilterHz > 0 ? gyroFilterHz : 20);
+    out.oscillating = strong && !out.aliasRisk;
+    if (strong && out.aliasRisk) { out.peakAmbiguous = true; out.dataRateHz = fs; }
     out.noiseRmsDegs = bandRms(spA, Math.min(20, fs * 0.3), fs * 0.49);
   }
   // PID term shares and saturation
   if (data.P && data.D && data.I) {
-    let p2 = 0, d2 = 0, iSum = 0, sat = 0, uMax = family === 'plane' ? 44 : 0.98;
-    for (let i = 0; i < n; i++) { p2 += data.P[i] * data.P[i]; d2 += data.D[i] * data.D[i]; iSum += data.I[i]; if (Math.abs(data.u[i]) >= uMax) sat++; }
+    let p2 = 0, d2 = 0, iSum = 0, sat = 0, m = 0; const uMax = family === 'plane' ? 44 : 0.98;
+    for (let i = 0; i < n; i++) { if (use && !use[i]) continue; p2 += data.P[i] * data.P[i]; d2 += data.D[i] * data.D[i]; iSum += data.I[i]; if (Math.abs(data.u[i]) >= uMax) sat++; m++; }
     out.dOverP = p2 > 0 ? Math.sqrt(d2 / p2) : 0;
-    out.iMean = iSum / n;
-    out.saturationPct = 100 * sat / n;
+    out.iMean = m ? iSum / m : 0;
+    out.saturationPct = m ? 100 * sat / m : 0;
   }
-  if (data.srate) { let m = 0, c = 0; for (let i = 0; i < n; i++) { if (data.srate[i] > m) m = data.srate[i]; if (data.srate[i] > 3) c++; } out.srateMax = m; out.sratePctAbove3 = 100 * c / n; }
-  if (data.dmod) { let m = 1; for (let i = 0; i < n; i++) if (data.dmod[i] < m) m = data.dmod[i]; out.dmodMin = m; }
+  if (data.srate) { let m = 0, k = 0, cnt = 0; for (let i = 0; i < n; i++) { if (use && !use[i]) continue; if (data.srate[i] > m) m = data.srate[i]; if (data.srate[i] > 3) k++; cnt++; } out.srateMax = m; out.sratePctAbove3 = cnt ? 100 * k / cnt : 0; }
+  if (data.dmod) { let m = 1; for (let i = 0; i < n; i++) { if (use && !use[i]) continue; if (data.dmod[i] < m) m = data.dmod[i]; } out.dmodMin = m; }
   out.saturation = saturationCheck(data, cur, family, out);
   out.grade = gradeAxis(out);
   return out;
+}
+
+/** prominence (peak over the median of its neighbourhood) a rate-error peak needs to count as an oscillation */
+const PEAK_PROMINENCE = 10;
+
+/**
+ * Strongest true local maximum of a spectrum in (fLo, fHi]: above its left neighbour and not below its right
+ * one. Prominence = its value over the median of the bins within +-8 of it (its own main lobe, +-2 bins, left
+ * out). The peak with the highest prominence wins. {i, f, prominence} or null when the band has no local maximum.
+ */
+function localPeak(sp, fLo, fHi) {
+  const p = sp.psd, f = sp.f, n = p.length;
+  let best = null;
+  for (let i = 1; i + 1 < n; i++) {
+    if (!(f[i] > fLo && f[i] <= fHi)) continue;
+    if (!(p[i] > p[i - 1] && p[i] >= p[i + 1])) continue;
+    const around = [];
+    for (let k = Math.max(1, i - 8); k <= Math.min(n - 1, i + 8); k++) if (Math.abs(k - i) > 2) around.push(p[k]);
+    around.sort((a, b) => a - b);
+    const base = around.length ? around[Math.floor(around.length / 2)] : 0;
+    const prominence = base > 0 ? p[i] / base : (p[i] > 0 ? Infinity : 0);
+    if (!best || prominence > best.prominence) best = { i, f: f[i], prominence };
+  }
+  return best;
 }
 
 /**
@@ -370,7 +467,7 @@ function diagnostics(data, cur, family, axis) {
  */
 function saturationCheck(data, cur, family, d) {
   if (family === 'plane') return null;
-  const n = data.target.length, air = data.airborne;
+  const n = data.target.length, air = usableMask(data);
   let sT = 0, sA = 0, sU = 0, c = 0;
   for (let i = 0; i < n; i++) { if (air && !air[i]) continue; sT += data.target[i]; sA += data.actual[i]; sU += data.u[i]; c++; }
   if (c < 10) return null;
@@ -399,6 +496,7 @@ function gradeAxis(d, ctx = {}) {
   const notes = [];
   let score = 100;
   if (d.oscillating) { score -= 40; notes.push(d.peakHz > 15 ? `Strong ${d.peakHz.toFixed(1)} Hz content in the rate error (${d.oscRmsDegs.toFixed(1)} deg/s RMS): at this frequency it is almost certainly motor/vibration noise reaching the controller, not a tuning oscillation. Set up the harmonic notch (Log tab, noise section) before tuning.` : `Oscillation at ${d.peakHz.toFixed(1)} Hz (${d.oscRmsDegs.toFixed(1)} deg/s RMS)`); }
+  else if (d.peakAmbiguous) { if (d.oscRmsDegs > 4) score -= 15; notes.push(`Rate-error peak at ${d.peakHz.toFixed(1)} Hz (${d.oscRmsDegs.toFixed(1)} deg/s RMS), but the rate data are logged at only ${+d.dataRateHz.toFixed(1)} Hz: faster vibration or oscillation folds down to low frequencies (aliasing), so it cannot be told what this is. Log the rate loop faster before judging it.`); }
   else if (d.oscRmsDegs > 4) { score -= 15; notes.push('Noticeable high-frequency error energy'); }
   if (d.trackingPct !== null) { if (d.trackingPct < 50) { score -= 25; notes.push(`Poor rate tracking (${d.trackingPct.toFixed(0)}%)`); } else if (d.trackingPct < 70) { score -= 10; notes.push(`Soft rate tracking (${d.trackingPct.toFixed(0)}%)`); } }
   if (d.saturationPct > 2) { score -= 15; notes.push(`Actuator saturated ${d.saturationPct.toFixed(1)}% of the time`); }
@@ -432,24 +530,30 @@ function gradeAxis(d, ctx = {}) {
  * 40% of the usual demand) FF_single = max_actuator / (max_rate * scaler), actuator = FF+P+D (no I),
  * all filtered at 0.75 Hz; the estimate is the median over events.
  */
-function planeFFEvents(data) {
+function planeFFEvents(data, blocks = null) {
   if (!data.P || !data.FF) return null;
   const n = data.target.length, fs = data.fs;
+  const bl = blocks || blocksOf(usableMask(data), n);
   const lp = (fc) => { const al = 1 / (1 + fs / (2 * Math.PI * fc)); let s = 0; return v => { s += al * (v - s); return s; }; };
-  const fa = lp(0.75), fr = lp(0.75), ftg = lp(4);
-  const absT = Array.from(data.target).map(Math.abs).sort((x, y) => x - y); const p95 = absT[Math.floor(absT.length * 0.95)] || 0;
+  const absT = []; for (const [a, b] of bl) for (let i = a; i < b; i++) absT.push(Math.abs(data.target[i]));
+  absT.sort((x, y) => x - y); const p95 = absT[Math.floor(absT.length * 0.95)] || 0;
   if (p95 < 10) return { ff: null, events: 0, reason: 'too little rate demand' };
   const thr1 = 0.4 * p95, thr2 = 0.25 * thr1;
-  let state = 0, maxA = 0, minA = 0, maxR = 0, minR = 0; const ffs = [];
-  for (let i = 0; i < n; i++) {
-    const u = data.P[i] + (data.D ? data.D[i] : 0) + data.FF[i] + (data.I ? data.I[i] : 0);
-    const clipped = Math.max(-45, Math.min(45, u)) - (data.I ? data.I[i] : 0);
-    const act = fa(clipped), rat = fr(data.actual[i]), r = ftg(data.target[i]);
-    const ss = data.ss ? data.ss[i] : Math.sqrt(data.scaler2 || 1);
-    if (state === 0) { if (r > thr1) { state = 1; maxA = minA = maxR = minR = 0; } else if (r < -thr1) { state = -1; maxA = minA = maxR = minR = 0; } }
-    else {
-      maxA = Math.max(maxA, act); minA = Math.min(minA, act); maxR = Math.max(maxR, rat); minR = Math.min(minR, rat);
-      if ((state === 1 && r < thr2) || (state === -1 && r > -thr2)) { const ff = state === 1 ? maxA / (maxR * ss) : minA / (minR * ss); if (isFinite(ff) && ff > 0 && ff < 5) ffs.push(ff); state = 0; }
+  const ffs = [];
+  // filters and the event detector start again in every unbroken stretch (never across a gap)
+  for (const [b0, b1] of bl) {
+    const fa = lp(0.75), fr = lp(0.75), ftg = lp(4);
+    let state = 0, maxA = 0, minA = 0, maxR = 0, minR = 0;
+    for (let i = b0; i < b1; i++) {
+      const u = data.P[i] + (data.D ? data.D[i] : 0) + data.FF[i] + (data.I ? data.I[i] : 0);
+      const clipped = Math.max(-45, Math.min(45, u)) - (data.I ? data.I[i] : 0);
+      const act = fa(clipped), rat = fr(data.actual[i]), r = ftg(data.target[i]);
+      const ss = data.ss ? data.ss[i] : Math.sqrt(data.scaler2 || 1);
+      if (state === 0) { if (r > thr1) { state = 1; maxA = minA = maxR = minR = 0; } else if (r < -thr1) { state = -1; maxA = minA = maxR = minR = 0; } }
+      else {
+        maxA = Math.max(maxA, act); minA = Math.min(minA, act); maxR = Math.max(maxR, rat); minR = Math.min(minR, rat);
+        if ((state === 1 && r < thr2) || (state === -1 && r > -thr2)) { const ff = state === 1 ? maxA / (maxR * ss) : minA / (minR * ss); if (isFinite(ff) && ff > 0 && ff < 5) ffs.push(ff); state = 0; }
+      }
     }
   }
   ffs.sort((x, y) => x - y);
@@ -457,4 +561,4 @@ function planeFFEvents(data) {
   return { ff: ffs[Math.floor(ffs.length / 2)], p25: ffs[Math.floor(ffs.length * 0.25)], p75: ffs[Math.floor(ffs.length * 0.75)], events: ffs.length };
 }
 
-module.exports = { gradeAxis, saturationCheck, planeFFEvents, analyzeAxis, identify, resample, estimateRate, gyroChainFromParams, diagnostics, noiseFromActual, currentGains };
+module.exports = { gradeAxis, saturationCheck, planeFFEvents, analyzeAxis, identify, resample, estimateRate, gyroChainFromParams, diagnostics, noiseFromActual, currentGains, usableMask, blocksOf, localPeak, PEAK_PROMINENCE };

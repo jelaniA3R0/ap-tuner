@@ -7,6 +7,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "aptuner/core/cx.hpp"
@@ -20,6 +21,10 @@ CVec biquadLpf(const Vec& freqs, double fs, double fc);
 CVec biquad(const Vec& freqs, double fs, double b0, double b1, double b2, double a0, double a1, double a2);
 /** ArduPilot NotchFilter: centre, bandwidth (Hz), attenuation (dB) */
 CVec notch(const Vec& freqs, double fs, double center, double bw, double attDb);
+/** quality factor of an ArduPilot notch from its centre and bandwidth (NotchFilter::calculate_A_and_Q) */
+double notchQ(double center, double bw);
+/** NotchFilter with a given Q (NotchFilter::init_with_A_and_Q): how a moving harmonic notch is updated */
+CVec notchAQ(const Vec& freqs, double fs, double center, double Q, double attDb);
 
 /** one harmonic-notch set, base frequency already resolved for the operating point */
 struct NotchDef {
@@ -30,6 +35,9 @@ struct NotchDef {
   int hmncs = 3;   // harmonics bitmask
   int opts = 0;    // bit0 double notch, bit4 triple notch
   int chained = 1;
+  // configured INS_HNTCH_FREQ / BW: the firmware fixes A, Q and the composite spread from them and only moves the
+  // centres with the operating point; 0 = the notch sits at its configured frequency (freq / bw)
+  double refFreq = 0, refBw = 0;
 };
 CVec harmonicNotch(const Vec& freqs, double fs, const NotchDef& n);
 
@@ -40,16 +48,24 @@ struct NotchParams {
   double ref = 0;
   std::optional<double> fmRat;   // INS_HNTCH_FM_RAT (default 1)
 };
-/** operating point used to resolve the notch frequency */
+/** operating point used to resolve the notch frequency (0 = not measured) */
 struct NotchOp {
   std::optional<double> throttle;   // 0..1
-  double rpm = 0, escRpm = 0, fftHz = 0;
+  double rpm = 0, rpm2 = 0;         // RPM sensors 1 and 2
+  double escRpm = 0;                // average ESC motor rpm
+  double fftHz = 0;                 // in-flight FFT noise frequency
+  double backendHz = 0;             // rate the gyro filters run at (IMU.GHz)
 };
-/** base notch frequency at an operating point, as HarmonicNotchFilter does per mode */
+/**
+ * base notch frequency at an operating point, as AP_Vehicle::update_dynamic_notch sets it: FREQ (mode 0, or REF 0);
+ * throttle FREQ * max(FM_RAT, sqrt(thr / REF)); RPM / ESC max(FREQ * FM_RAT, rpm / 60 * REF); FFT
+ * max(FREQ * FM_RAT, fftHz); without a measurement the floor FREQ * FM_RAT
+ */
 double notchBaseFreq(const NotchParams& p, const NotchOp& op);
 
 struct GyroChain {
   double backendHz = 1000;
+  std::string backendSource = "INS_GYRO_RATE";   // or "IMU.GHz" (the logged gyro rate)
   double gyroFilterHz = 20;
   std::vector<NotchDef> notches;
 };

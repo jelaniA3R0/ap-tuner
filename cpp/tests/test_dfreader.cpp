@@ -66,7 +66,7 @@ LogBuilder sampleLog() {
     L.i32(static_cast<std::int32_t>(515000000 + k));
     L.i32(-7 * k);
     if (k == 4) {
-      L.u8(0x55);   // garbage byte: the reader must resync
+      L.u8(0x55);   // garbage byte: record 4 cannot be verified (no header after it) and is dropped; reading resumes
     }
   }
   parm(30000, "ATC_RAT_RLL_P", 0.2f);   // in-flight change
@@ -84,20 +84,24 @@ TEST(dfreader_parses_synthetic_log) {
   CHECK(log.changes.size() == 1 && log.changes[0].name == "ATC_RAT_RLL_P" && log.changes[0].t == 0.03);
   CHECK(log.text.size() == 1 && log.text[0].msg == "ArduCopter V4.6.0 (abc)" && log.text[0].t == 0.003);
   const MsgTable* t = log.msg("TST");
-  CHECK(t && t->n == 10);
+  CHECK(t && t->n == 9);
   if (!t) return;
   CHECK((*t->col("TimeUS"))[3] == 13000);
+  CHECK((*t->col("TimeUS"))[4] == 15000);   // record 4 (14000) was followed by the junk byte
   CHECK((*t->col("Val"))[3] == 1.5);
   CHECK_NEAR((*t->col("Scaled"))[0], -1.5, 1e-15);
   CHECK_NEAR((*t->col("Lat"))[2], 51.5000002, 1e-12);
-  CHECK((*t->col("Raw"))[9] == -63);
-  CHECK(log.counts.at("TST") == 10 && log.counts.at("FMT") == 3 && log.counts.at("PARM") == 3);
+  CHECK((*t->col("Raw"))[8] == -63);
+  CHECK(log.counts.at("TST") == 9 && log.counts.at("FMT") == 3 && log.counts.at("PARM") == 3);
+  CHECK(log.integrity.format.kind == "dataflash" && log.integrity.format.supported);
+  CHECK(log.integrity.skippedBytes == 26 + 1 && log.integrity.resyncs == 1);   // the unverifiable record + the junk byte
+  CHECK(log.integrity.truncatedBytes == 0 && log.integrity.badFmtCount == 0);
   const auto inst = splitByInstance(*t, "I");
-  CHECK(inst.size() == 2 && inst.at(0).n == 5 && inst.at(1).n == 5);
+  CHECK(inst.size() == 2 && inst.at(0).n == 4 && inst.at(1).n == 5);
   CHECK((*inst.at(1).col("Val"))[0] == 0.5);
   // only the wanted messages become columns
   const LogData only = parseBin(L.b.data(), L.b.size(), {"PARM"});
-  CHECK(only.msg("TST") == nullptr && only.counts.at("TST") == 10);
+  CHECK(only.msg("TST") == nullptr && only.counts.at("TST") == 9);
 }
 
 TEST(dfreader_partial_log_helpers) {

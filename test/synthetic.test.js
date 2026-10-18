@@ -80,7 +80,9 @@ function runCase(name, truePlant, startGains, fs, gyroHz, kind, opts = {}) {
   const met = stepMetrics(st.t, st.y.map(v => v / 30));
   const st0 = simulateRateStep(ctxTrue, startGains, { stepDegs: 30, durationS: 1.0, uMax: 1 });
   const met0 = stepMetrics(st0.t, st0.y.map(v => v / 30));
-  console.log(`  step before: rise=${(met0.riseTime * 1000).toFixed(0)}ms overshoot=${met0.overshootPct.toFixed(0)}% settle=${(met0.settlingTime * 1000).toFixed(0)}ms | after: rise=${(met.riseTime * 1000).toFixed(0)}ms overshoot=${met.overshootPct.toFixed(0)}% settle=${(met.settlingTime * 1000).toFixed(0)}ms`);
+  const stepTxt = m => (m.settled ? `rise=${(m.riseTime * 1000).toFixed(0)}ms overshoot=${m.overshootPct.toFixed(0)}% settle=${(m.settlingTime * 1000).toFixed(0)}ms` : 'not settled within 1 s');
+  console.log(`  step before: ${stepTxt(met0)} | after: ${stepTxt(met)}`);
+  assert(met.settled, name + ': step response with the proposed gains does not settle');
   assert(met.overshootPct < 25, name + ': overshoot too large');
   assert(met.riseTime < 0.25, name + ': too slow');
   // frequency-domain prediction vs time simulation consistency (closed-loop DC gain ~ 1 and bandwidth sane)

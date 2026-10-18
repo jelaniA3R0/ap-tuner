@@ -38,5 +38,7 @@ class FFT {
 
 function hann(n) { const w = new Float64Array(n); for (let i = 0; i < n; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / n); return w; }
 function nextPow2(n) { let p = 1; while (p < n) p <<= 1; return p; }
+/** largest power of two <= n (0 for n < 1) */
+function prevPow2(n) { if (!(n >= 1)) return 0; let p = 1; while (p * 2 <= n) p *= 2; return p; }
 
-module.exports = { FFT, hann, nextPow2 };
+module.exports = { FFT, hann, nextPow2, prevPow2 };

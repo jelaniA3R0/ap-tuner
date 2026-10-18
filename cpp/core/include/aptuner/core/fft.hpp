@@ -29,5 +29,7 @@ Vec hann(std::size_t n);
 
 /** smallest power of two >= n (n may be fractional, as in the JavaScript version) */
 std::size_t nextPow2(double n);
+/** largest power of two <= n (0 for n < 1) */
+std::size_t prevPow2(double n);
 
 }  // namespace aptuner::core

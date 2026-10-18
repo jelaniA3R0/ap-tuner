@@ -50,13 +50,24 @@ function biquad(freqs, fs, b0, b1, b2, a0, a1, a2) {
   return C.div(num, den);
 }
 
+/** quality factor of an ArduPilot notch from its centre and bandwidth (NotchFilter::calculate_A_and_Q) */
+function notchQ(center, bw) {
+  const octaves = Math.log2(center / (center - bw / 2)) * 2;
+  return Math.sqrt(Math.pow(2, octaves)) / (Math.pow(2, octaves) - 1);
+}
+
 // ArduPilot NotchFilter (libraries/Filter/NotchFilter.cpp): center, bandwidth, attenuation dB
 function notch(freqs, fs, center, bw, attDb) {
   const n = freqs.length;
   if (!(center > 0.5 * bw) || !(center < 0.5 * fs)) return C.one(n);
+  return notchAQ(freqs, fs, center, notchQ(center, bw), attDb);
+}
+
+/** NotchFilter with a given Q (NotchFilter::init_with_A_and_Q): how a moving harmonic notch is updated */
+function notchAQ(freqs, fs, center, Q, attDb) {
+  const n = freqs.length;
+  if (!(center > 0) || !(center < 0.5 * fs) || !(Q > 0)) return C.one(n);
   const A = Math.pow(10, -attDb / 40);
-  const octaves = Math.log2(center / (center - bw / 2)) * 2;
-  const Q = Math.sqrt(Math.pow(2, octaves)) / (Math.pow(2, octaves) - 1);
   const omega = 2 * Math.PI * center / fs, alpha = Math.sin(omega) / (2 * Q);
   const b0 = 1 + alpha * A * A, b1 = -2 * Math.cos(omega), b2 = 1 - alpha * A * A;
   const a0 = 1 + alpha, a1 = b1, a2 = 1 - alpha;
@@ -67,39 +78,56 @@ function notch(freqs, fs, center, bw, attDb) {
  * Harmonic notch set as ArduPilot builds it (HarmonicNotchFilter.cpp): base frequency given by the
  * caller (already resolved for the operating point: throttle/RPM/FFT), harmonics bitmask, options
  * (bit0 double, bit4 triple), bandwidth, attenuation.
+ * refFreq / refBw: the configured INS_HNTCH_FREQ / BW. The firmware computes A, Q and the spread of the
+ * double / triple notches once from them (HarmonicNotchFilter::init) and only moves the centres when the
+ * operating point changes, so a notch that tracks to a higher frequency keeps its Q (it gets wider in Hz).
+ * Without refFreq the notch is treated as sitting at its configured frequency.
  */
-function harmonicNotch(freqs, fs, { enable, freq, bw, att = 40, hmncs = 3, opts = 0, chained = 1 }) {
+function harmonicNotch(freqs, fs, { enable, freq, bw, att = 40, hmncs = 3, opts = 0, chained = 1, refFreq = 0, refBw = 0 }) {
   let H = C.one(freqs.length);
   if (!enable || !(freq > 0)) return H;
   const composite = (opts & 1) ? 2 : (opts & 16) ? 3 : 1;
+  const f0 = refFreq > 0 ? refFreq : freq, b0 = refFreq > 0 && refBw > 0 ? refBw : bw;
+  if (!(f0 > 0.5 * b0 / composite)) return H;
+  const Q = notchQ(f0, b0 / composite), spread = b0 / (32 * f0);
   for (let h = 0; h < 8; h++) {
     if (!(hmncs & (1 << h))) continue;
     const mul = h + 1;
     let center = freq * mul; const bwh = bw * mul;
     const nyq = fs * 0.48, bwl = bwh * 0.52;
-    const spread = bwh / (32 * center);
     center = Math.min(Math.max(center, bwl), nyq);
     for (let c = 0; c < chained; c++) {
-      if (composite !== 2 && center < nyq) H = C.mul(H, notch(freqs, fs, center, bwh / composite, att));
+      if (composite !== 2 && center < nyq) H = C.mul(H, notchAQ(freqs, fs, center, Q, att));
       if (composite > 1) {
         const lo = center * (1 - spread), hi = center * (1 + spread);
-        if (lo < nyq) H = C.mul(H, notch(freqs, fs, lo, bwh / composite, att));
-        if (hi < nyq) H = C.mul(H, notch(freqs, fs, hi, bwh / composite, att));
+        if (lo < nyq) H = C.mul(H, notchAQ(freqs, fs, lo, Q, att));
+        if (hi < nyq) H = C.mul(H, notchAQ(freqs, fs, hi, Q, att));
       }
     }
   }
   return H;
 }
 
-/** Resolve the notch base frequency for an operating point, as HarmonicNotchFilter does per mode */
+/**
+ * The notch base frequency at an operating point, as AP_Vehicle::update_dynamic_notch sets it:
+ *  mode 0 (fixed): FREQ; REF = 0 also keeps the notch at FREQ (dynamic updates off)
+ *  mode 1 (throttle): FREQ * max(FM_RAT, sqrt(throttle / REF))
+ *  mode 2 / 5 (RPM sensor 1 / 2): max(FREQ * FM_RAT, rpm / 60 * REF)
+ *  mode 3 (ESC telemetry): max(FREQ * FM_RAT, average motor rpm / 60 * REF)
+ *  mode 4 (in-flight FFT): max(FREQ * FM_RAT, measured noise frequency)
+ * FREQ * FM_RAT is the lowest frequency the firmware lets the notch go. Without a measurement (no RPM / ESC /
+ * FFT data) the notch is modelled at that floor.
+ * p: {mode, freq, ref, fm_rat}; op: {throttle (0..1), rpm, rpm2 (RPM sensors 1 / 2), escRpm (rpm), fftHz}
+ */
 function notchBaseFreq(p, op = {}) {
-  // p: {mode, freq, ref, fm_rat}; op: {throttle (0..1), rpm, escRpm, fftHz}
   const mode = p.mode | 0;
-  if (mode === 0) return p.freq;
-  if (mode === 1) { const thr = Math.max(0, op.throttle ?? p.ref); return p.freq * Math.max(p.fm_rat ?? 1, Math.sqrt(thr / (p.ref || 1))); }
-  if (mode === 2 || mode === 5) return Math.max((op.rpm || 0) / 60, p.freq) * (p.ref || 1);
-  if (mode === 3) return Math.max((op.escRpm || 0) / 60, p.freq) * (p.ref || 1);
-  if (mode === 4) return Math.max(op.fftHz || p.freq, p.freq) * (p.ref || 1);
+  if (mode === 0 || !(p.ref > 0)) return p.freq;
+  const fmRat = p.fm_rat ?? 1, floor = p.freq * fmRat;
+  if (mode === 1) { const thr = Math.max(0, op.throttle ?? p.ref); return p.freq * Math.max(fmRat, Math.sqrt(thr / p.ref)); }
+  if (mode === 2) return op.rpm > 0 ? Math.max(floor, op.rpm / 60 * p.ref) : floor;
+  if (mode === 5) return op.rpm2 > 0 ? Math.max(floor, op.rpm2 / 60 * p.ref) : floor;
+  if (mode === 3) return op.escRpm > 0 ? Math.max(floor, op.escRpm / 60 * p.ref) : floor;
+  if (mode === 4) return op.fftHz > 0 ? Math.max(floor, op.fftHz) : floor;
   return p.freq;
 }
 
@@ -132,4 +160,4 @@ function acPid(freqs, fs, g) {
   return { T, Cfb, Cff, parts: { P, I, D } };
 }
 
-module.exports = { C, lpf1, biquadLpf, notch, harmonicNotch, notchBaseFreq, gyroChain, acPid };
+module.exports = { C, lpf1, biquadLpf, notch, notchQ, notchAQ, harmonicNotch, notchBaseFreq, gyroChain, acPid };

@@ -63,6 +63,13 @@ Vec hann(std::size_t n) {
   return w;
 }
 
+std::size_t prevPow2(double n) {
+  if (!(n >= 1)) return 0;
+  std::size_t p = 1;
+  while (static_cast<double>(p * 2) <= n) p *= 2;
+  return p;
+}
+
 std::size_t nextPow2(double n) {
   std::size_t p = 1;
   while (static_cast<double>(p) < n) p <<= 1;

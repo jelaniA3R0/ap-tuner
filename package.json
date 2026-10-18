@@ -5,7 +5,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js --open",
-    "test": "node test/synthetic.test.js && node test/watchdog.test.js && node test/live-safety.test.js && node test/web-escape.test.js && node test/server-security.test.js"
+    "test": "node test/run-all.js"
   },
   "license": "MIT",
   "private": true

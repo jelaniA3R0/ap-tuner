@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace aptuner::core {
@@ -152,8 +153,21 @@ std::optional<PlantFit> fitPlant(const Vec& freqs, const CVec& H, const Vec& coh
   p.nBins = static_cast<int>(m);
   p.fitBandLo = fsub.front();
   p.fitBandHi = fsub.back();
-  // fit quality: 1 at zero cost, ~0.5 at cost 0.3 (~30% magnitude / 20 deg phase errors)
-  p.fitQuality = 1 / (1 + best->f / 0.3);
+  // fit quality from the weighted mean error (divided by the sum of the weights, so the same misfit gives the
+  // same quality whatever the coherence): 1 at zero error, ~0.5 at 0.3 (~30% magnitude / 20 deg phase errors)
+  {
+    const CVec G = evalPlant(fsub, p);
+    double e = 0, w = 0;
+    for (std::size_t k = 0; k < m; k++) {
+      const double em = std::log(std::hypot(G.re[k], G.im[k]) / (mag[k] != 0 ? mag[k] : 1e-9));
+      double ep = std::atan2(G.im[k], G.re[k]) - ph[k];
+      ep = std::atan2(std::sin(ep), std::cos(ep));
+      e += wgt[k] * (em * em + 2 * ep * ep);
+      w += wgt[k];
+    }
+    p.misfit = w > 0 ? e / w : std::numeric_limits<double>::infinity();
+  }
+  p.fitQuality = 1 / (1 + p.misfit / 0.3);
   p.dcGain = p.K / p.a;   // deg/s per unit u in steady state
   p.bandwidthHz = std::min(p.a, 1 / p.tau) / (2 * kPi);
   return p;
