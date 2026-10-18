@@ -581,7 +581,7 @@ rt::Task<Json> GroundTune::write(std::vector<std::string> names, Json approval) 
     std::string list;
     for (const auto& x : rebootPending_.arr()) list += (list.empty() ? "" : ", ") + x["name"].str();
     for (const auto& x : afterReboot_.arr()) list += (list.empty() ? "" : ", ") + x["name"].str();
-    tail = " " + list + " take effect only after a reboot: press Reboot (disarmed)";
+    tail = " " + list + (rebootPending_.size() + afterReboot_.size() == 1 ? " takes" : " take") + " effect only after a reboot: press Reboot (disarmed)";
   }
   setPhase("done", txn["ok"].asBool() ? "all " + core::jsToString(static_cast<double>(rows.size() - later.size())) + " written and read back." + tail : txnText(txn));
   co_return writes_;
@@ -638,9 +638,11 @@ Json GroundTune::rowResult(const Json& r, const Json& txn) const {
 rt::Task<Json> GroundTune::rebootNow() {
   if (phase_ != "done") throw rt::Error("nothing written yet");
   if (!rebootPending_.size() && !afterReboot_.size()) throw rt::Error("nothing written here needs a reboot");
+  // what the vehicle holds now: the value written, or after an Undo the value from before
   Json expect = Json::array();
   for (const auto& w : writes_.arr())
-    if (w["status"].str() == "verified") expect.push(Json::obj({{"name", w["name"]}, {"value", w["to"]}}));
+    if (w["status"].str() == "verified")
+      expect.push(Json::obj({{"name", w["name"]}, {"value", w["undo"].isString() && w["undoHolds"].isNumber() ? w["undoHolds"] : w["to"]}}));
   setPhase("rebooting", "rebooting the autopilot: it disconnects for a few seconds");
   RebootOpts ro;
   ro.journal = [this](const std::string& k, const Json& d) { audit_->append(k, d); };
@@ -748,7 +750,8 @@ rt::Task<void> GroundTune::undo() {
   std::string pend;
   for (const auto& x : rebootPending_.arr()) pend += (pend.empty() ? "" : ", ") + x["name"].str();
   setPhase("done", !bad.empty() ? "undo incomplete: " + bad + ". Load the UNDO file in Mission Planner to go back"
-                                : "previous values written back and read back" + (pend.empty() ? "" : "; " + pend + " take effect after a reboot (press Reboot)"));
+                                : "previous values written back and read back" +
+                                      (pend.empty() ? "" : "; " + pend + (rebootPending_.size() == 1 ? " takes" : " take") + " effect after a reboot (press Reboot)"));
 }
 
 Json GroundTune::snapshot() const {

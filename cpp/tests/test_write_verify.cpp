@@ -4,12 +4,19 @@
 //   F-29 / F-30 exact verification by type                                  F-32 transactions, verified rollback
 //   F-33 approval bound to the proposal id + hash, IMAX written             F-35 reboot-only values, reboot workflow
 //   F-39 the append-only journal                                            F-43 .param export checks
+// wv_sitl_ground_write runs the ground write on ArduCopter SITL (tools/sitl-ground-write.js --cpp); skipped otherwise.
 // The objects of a test are left alive on purpose (timers of the event loop may still point at them).
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <regex>
+#include <set>
 #include <sstream>
 
+#include "aptuner/core/jsnum.hpp"
 #include "aptuner/core/parammeta.hpp"
 #include "aptuner/engine/analysis.hpp"
 #include "aptuner/engine/identity.hpp"
@@ -900,6 +907,24 @@ TEST(wv_ground_notch_reboot_workflow_with_values_after_reboot) {
   for (const auto& w : G.g->writes().arr())
     if (w["afterReboot"].isString() && !has(w["afterReboot"].str(), "read back after the reboot")) allBack = false;
   CHECK(allBack);
+  // Undo: REF waits for a reboot again; the reboot checks the values from before (not the values written)
+  std::map<std::string, Json> before;
+  for (const auto& w : G.g->writes().arr()) before[w["name"].str()] = w["from"];
+  valueOf(G.g->undo().future());
+  CHECK(fieldList(G.g->writes(), "undo") == "undone,undone,undone,undone,null");   // HMNCS did not change
+  CHECK(fieldList(G.g->rebootPending(), "name") == "INS_HNTCH_REF");
+  valueOf(G.g->rebootNow().future());
+  CHECK(G.fv->reboots == 3 && G.g->rebootPending().size() == 0);
+  CHECK(has(G.g->info(), "rebooted: every value written here was read back after the reboot"));
+  const Json rb = G.g->snapshot()["reboot"];
+  bool same = rb["ok"].asBool() && rb["rows"].size() == 4;
+  for (const auto& x : rb["rows"].arr())
+    if (!x["ok"].asBool() || !x["holds"].isNumber() || x["holds"].num() != before[x["name"].str()].num()) same = false;
+  CHECK(same);
+  allBack = true;
+  for (const auto& w : G.g->writes().arr())
+    if (w["afterReboot"].isString() && !has(w["afterReboot"].str(), "read back after the reboot")) allBack = false;
+  CHECK(allBack);
   G.fv->stop();
   runFor(30);
 }
@@ -1001,4 +1026,197 @@ TEST(wv_unwritable_journal_blocks_forward_writes) {
   rt::detach(tuner->stop().future());
   fv->stop();
   runFor(30);
+}
+
+// ---------------- SITL: the ground write on ArduCopter SITL (tools/sitl-ground-write.js --cpp starts the simulator and
+// sets APT_SITL_TCP; without it this test is skipped). The same phases as the JavaScript edition of the script.
+
+namespace {
+double readP(io::Link& link, const std::string& name) {
+  auto f = link.requestParam(name, 1500, 2);
+  settle(f, 8000);
+  return f.ready() && !f.error() ? f.get() : NAN;
+}
+std::string fmtv(double v) { return std::isfinite(v) ? core::jsToString(core::jsRoundPrecision(v, 6)) : "undefined"; }
+void step(bool ok, const std::string& what) {
+  std::printf("    %s %s\n", ok ? "PASS" : "FAIL", what.c_str());
+  std::fflush(stdout);
+  CHECK(ok);
+}
+/** the review as after a log download from this vehicle: the log holds the values it has now */
+Json sitlReview(app::GroundTune& g, io::Link& link, const Json& rows) {
+  const Json id = link.identity();
+  std::string fw = id["fw"].strOr("");
+  const auto dash = fw.find('-');
+  if (dash != std::string::npos) fw = fw.substr(0, dash);
+  g.result = Json::obj({{"family", "copter"},
+                        {"firmware", "ArduCopter V" + fw + " (" + id["gitHash"].strOr("") + ")"},
+                        {"params", Json::obj({{"MAV_SYSID", id["sysid"]}})},
+                        {"axes", Json::object()},
+                        {"chosenAxes", Json::array()}});
+  Json rs = Json::array();
+  for (const auto& r : rows.arr()) {
+    Json x = Json::obj({{"group", "sitl"}, {"label", r["name"]}});
+    for (const auto& [k, v] : r.items()) x.set(k, v);
+    rs.push(x);
+  }
+  GroundTestAccess::setRows(g, rs);
+  auto f = GroundTestAccess::review(g);
+  CHECK(settle(f));
+  CHECK(errorOf(f).empty());
+  GroundTestAccess::setPhase(g, "review", "SITL review");
+  return Json::obj({{"id", g.proposal()["id"]}, {"hash", g.proposal()["hash"]}});
+}
+Json rebootF(app::GroundTune& g) {
+  auto f = g.rebootNow().future();
+  settle(f, 90000);
+  const std::string err = errorOf(f);
+  if (!f.ready() || !err.empty()) step(false, "the reboot did not finish" + (err.empty() ? std::string() : ": " + err));
+  return f.ready() && !f.error() ? f.get() : Json();
+}
+}  // namespace
+
+TEST(wv_sitl_ground_write) {
+  const char* port = std::getenv("APT_SITL_TCP");
+  if (!port || !*port) {
+    std::printf("    skipped: no simulator (tools/sitl-ground-write.js --cpp runs this test against ArduCopter SITL)\n");
+    return;
+  }
+  const char* dirEnv = std::getenv("APT_SITL_DIR");
+  const std::string dir = dirEnv && *dirEnv ? std::string(dirEnv) : sessDir() + "/sitl";
+  auto* link = new io::Link();
+  // the simulator waits for one client on its TCP port: connect again every 2 s until it answers
+  const double t0 = rt::Loop::now();
+  double last = -1e12;
+  while (!link->alive() && rt::Loop::now() - t0 < 60000) {
+    if (!link->connected() && rt::Loop::now() - last > 2000) {
+      last = rt::Loop::now();
+      link->connect(Json::obj({{"kind", "tcp"}, {"host", "127.0.0.1"}, {"port", std::atoi(port)}}));
+    }
+    runFor(200);
+  }
+  step(link->alive(), "connected to the simulator (TCP " + std::string(port) + ")");
+  if (!link->alive()) return;
+  auto* g = new app::GroundTune(*link, dir, new app::Journal(dir + "/journal"));
+
+  // 1 identity
+  {
+    auto w = link->waitAutopilot(5000).future();
+    settle(w, 8000);
+  }
+  const Json id = link->identity();
+  std::printf("    vehicle: %s\n", engine::identityText(id).c_str());
+  step(!id["fw"].strOr("").empty() && !id["gitHash"].strOr("").empty() && !id["uid"].strOr("").empty(),
+       "AUTOPILOT_VERSION decoded: ArduPilot " + id["fw"].strOr("?") + " (" + id["gitHash"].strOr("?") + "), board UID " + id["uid"].strOr("?"));
+  const bool disarmed = link->vehicle().isObject() && !link->vehicle()["armed"].asBool();
+  step(disarmed, "the simulator is disarmed");
+  if (!disarmed) return;
+
+  // 2 the ground write of four gains, read back, the UNDO file, Undo
+  const std::vector<std::string> names{"ATC_RAT_RLL_P", "ATC_RAT_RLL_I", "ATC_RAT_RLL_D", "ATC_ANG_RLL_P"};
+  std::map<std::string, double> before;
+  for (const auto& n : names) before[n] = readP(*link, n);
+  Json rows = Json::array();
+  for (const auto& n : names) rows.push(Json::obj({{"name", n}, {"from", before[n]}, {"value", core::jsRoundPrecision(before[n] * 1.1, 6)}}));
+  Json ap = sitlReview(*g, *link, rows);
+  bool writable = true;
+  std::string list;
+  for (const auto& r : g->rows().arr()) {
+    if (!r["blocked"].strOr("").empty() || r["same"].asBool()) writable = false;
+    list += (list.empty() ? "" : ", ") + r["name"].strOr("") + " " + fmtv(r["vehicle"].numOr(NAN)) + " -> " + engine::jsText(r["value"]);
+  }
+  step(writable, "review: every row can be written (" + list + ")");
+  Json res = valueOf(g->write(names, ap).future());
+  step(statuses(res) == "verified,verified,verified,verified", "write: every value verified (" + statuses(res) + ")");
+  bool holds = true;
+  for (const auto& r : rows.arr())
+    if (!engine::sameF32(readP(*link, r["name"].str()), r["value"].num())) holds = false;
+  step(holds, "read back fresh: the vehicle holds every new value");
+  std::string undoText;
+  try {
+    undoText = app::readText(g->files["undo"].strOr(""));
+  } catch (const std::exception&) {
+  }
+  bool undoOk = has(undoText, "# For: system id 1 (quadrotor), ArduPilot ");
+  for (const auto& n : names)
+    if (!has(undoText, "\r\n" + n + ",")) undoOk = false;
+  step(undoOk, "UNDO file saved with the vehicle in its header and every value from before");
+  valueOf(g->undo().future());
+  step(fieldList(g->writes(), "undo") == "undone,undone,undone,undone", "Undo: every value written back and read back (" + fieldList(g->writes(), "undo") + ")");
+  holds = true;
+  for (const auto& n : names)
+    if (!engine::sameF32(readP(*link, n), before[n])) holds = false;
+  step(holds, "read back fresh: the vehicle holds the values from before again");
+
+  // 3 a value ArduPilot refuses: reported as refused, the rest of the set rolled back
+  const double pitBefore = readP(*link, "ATC_RAT_PIT_P"), flte = readP(*link, "ATC_RAT_YAW_FLTE");
+  ap = sitlReview(*g, *link,
+                  Json(Json::Array{Json::obj({{"name", "ATC_RAT_PIT_P"}, {"from", pitBefore}, {"value", core::jsRoundPrecision(pitBefore * 1.1, 6)}}),
+                                   Json::obj({{"name", "ATC_RAT_YAW_FLTE"}, {"from", flte}, {"value", 3}})}));
+  res = valueOf(g->write({"ATC_RAT_PIT_P", "ATC_RAT_YAW_FLTE"}, ap).future());
+  step(statuses(res) == "rolled back,refused",
+       "refused write: ATC_RAT_PIT_P " + res[0]["status"].strOr("") + ", ATC_RAT_YAW_FLTE " + res[1]["status"].strOr("") + " (" + res[1]["text"].strOr("") + ")");
+  step(engine::sameF32(readP(*link, "ATC_RAT_PIT_P"), pitBefore) && engine::sameF32(readP(*link, "ATC_RAT_YAW_FLTE"), flte),
+       "after the refusal the vehicle holds the values from before (read fresh)");
+  step(matches(g->info(), "refused .*went back to its value from before"), "the summary says so: " + g->info());
+
+  // 4 a whole-number parameter: the value is cast as ArduPilot stores it, then verified
+  const double gf = readP(*link, "INS_GYRO_FILTER");
+  const Json c1 = valueOf(app::verifiedSet(*link, "INS_GYRO_FILTER", gf + 0.6).future());
+  step(c1["status"].strOr("") == "verified" && c1["sent"].numOr(NAN) == gf + 1 && has(c1["note"].strOr(""), "rounded"),
+       "INS_GYRO_FILTER " + core::jsToString(gf + 0.6) + " sent as " + engine::jsText(c1["sent"]) + " (type " + engine::jsText(c1["type"]) + ") and verified");
+  const Json c2 = valueOf(app::verifiedSet(*link, "INS_GYRO_FILTER", gf).future());
+  step(c2["status"].strOr("") == "verified" && engine::sameF32(readP(*link, "INS_GYRO_FILTER"), gf), "INS_GYRO_FILTER back to " + core::jsToString(gf) + " (verified, read back)");
+
+  // 5 the notch, a value that acts only after a reboot, the reboot workflow; Undo and the second reboot
+  const std::vector<std::string> nn{"INS_HNTCH_ENABLE", "INS_HNTCH_FREQ", "INS_HNTCH_BW", "INS_HNTCH_REF"};
+  const std::map<std::string, double> target{{"INS_HNTCH_ENABLE", 1}, {"INS_HNTCH_FREQ", 60}, {"INS_HNTCH_BW", 30}, {"INS_HNTCH_REF", 0.3}};
+  std::map<std::string, double> nb;
+  for (const auto& n : nn) nb[n] = readP(*link, n);
+  Json nrows = Json::array();
+  for (const auto& n : nn) nrows.push(Json::obj({{"name", n}, {"from", nb[n]}, {"value", target.at(n)}, {"group", "notch"}}));
+  ap = sitlReview(*g, *link, nrows);
+  res = valueOf(g->write(nn, ap).future());
+  std::string st;
+  for (const auto& w : res.arr()) st += (st.empty() ? "" : ", ") + w["name"].strOr("") + " " + w["status"].strOr("");
+  step(statuses(res) == "verified,verified,verified,verified", "notch written and read back (" + st + ")");
+  step(fieldList(g->rebootPending(), "name") == "INS_HNTCH_REF", "INS_HNTCH_REF waits for a reboot: " + g->info());
+  const int gen0 = link->generation();
+  const double tr = rt::Loop::now();
+  const Json rb = rebootF(*g);
+  step(rb["ok"].asBool() && g->rebootPending().size() == 0, "rebooted in " + fmtv((rt::Loop::now() - tr) / 1000) + " s, every value read back after the reboot (connection #" +
+                                                                std::to_string(gen0) + " -> #" + std::to_string(link->generation()) + "): " + g->info());
+  std::map<std::string, double> fresh;
+  auto freshText = [&]() {
+    std::string s;
+    for (const auto& n : nn) {
+      fresh[n] = readP(*link, n);
+      s += (s.empty() ? "" : ", ") + n + " " + fmtv(fresh[n]);
+    }
+    return s;
+  };
+  std::string ft = freshText();
+  bool allTarget = true;
+  for (const auto& n : nn)
+    if (!engine::sameF32(fresh[n], target.at(n))) allTarget = false;
+  step(allTarget, "read fresh after the reboot: " + ft);
+  valueOf(g->undo().future());
+  step(fieldList(g->writes(), "undo") == "undone,undone,undone,undone" && fieldList(g->rebootPending(), "name") == "INS_HNTCH_REF",
+       "notch Undo: written back and read back; REF waits for a reboot: " + g->info());
+  const Json rb2 = rebootF(*g);
+  ft = freshText();
+  bool allBefore = rb2["ok"].asBool();
+  for (const auto& n : nn)
+    if (!engine::sameF32(fresh[n], nb[n])) allBefore = false;
+  step(allBefore, "second reboot: the notch values from before read back (" + ft + ")");
+  std::set<std::string> kinds;
+  for (const auto& e : events(g->audit())) kinds.insert(e["kind"].strOr(""));
+  bool allKinds = true;
+  std::string kl;
+  for (const char* k : {"identity", "proposal", "approval", "txn", "write", "rollback", "reboot"})
+    if (!kinds.count(k)) allKinds = false;
+  for (const auto& k : kinds) kl += (kl.empty() ? "" : ", ") + k;
+  step(allKinds, "journal " + app::pathStr(std::filesystem::path(g->audit().file()).filename()) + ": " + kl);
+  link->disconnect();
+  runFor(100);
 }

@@ -307,8 +307,8 @@ class GroundTune extends EventEmitter {
         fs.writeFileSync(this.files.param, paramFile(written.map(w => ({ group: w.group, name: w.name, value: w.to, from: w.from })), ['Written to the autopilot by AP Tuner (Telemetry + USB) and read back, ' + new Date().toLocaleString()], { identity: this.identity }));
       } catch (e) { delete this.files.param; this.note('warn', 'the file of the written values could not be saved: ' + e.message); }
     }
-    const needReboot = this.rebootPending.length || this.afterReboot.length;
-    const tail = needReboot ? ` ${[...this.rebootPending.map(x => x.name), ...this.afterReboot.map(x => x.name)].join(', ')} take effect only after a reboot: press Reboot (disarmed)` : ' Unplug the USB and fly to check';
+    const pend = [...this.rebootPending.map(x => x.name), ...this.afterReboot.map(x => x.name)];
+    const tail = pend.length ? ` ${pend.join(', ')} ${pend.length === 1 ? 'takes' : 'take'} effect only after a reboot: press Reboot (disarmed)` : ' Unplug the USB and fly to check';
     this.setPhase('done', txn.ok ? `all ${rows.length - later.length} written and read back.${tail}` : txnText(txn));
     return this.writes;
   }
@@ -336,7 +336,8 @@ class GroundTune extends EventEmitter {
   async rebootNow() {
     if (this.phase !== 'done') throw new Error('nothing written yet');
     if (!this.rebootPending.length && !this.afterReboot.length) throw new Error('nothing written here needs a reboot');
-    const expect = this.writes.filter(w => w.status === 'verified').map(w => ({ name: w.name, value: w.to }));
+    // what the vehicle holds now: the value written, or after an Undo the value from before
+    const expect = this.writes.filter(w => w.status === 'verified').map(w => ({ name: w.name, value: w.undo && typeof w.undoHolds === 'number' ? w.undoHolds : w.to }));
     this.setPhase('rebooting', 'rebooting the autopilot: it disconnects for a few seconds');
     const res = await rebootAndVerify(this.link, expect, { journal: (k, d) => this.audit.append(k, d), ctx: { via: 'ground write', identity: this.identity ? this.identity.key : null }, onInfo: t => { this.info = t; } });
     this.reboot = { at: Date.now(), ok: res.ok, reason: res.reason, rows: res.rows };
@@ -377,7 +378,7 @@ class GroundTune extends EventEmitter {
       if (r.ok && w.reboot && r.status === 'verified') this.rebootPending = this.rebootPending.filter(x => x.name !== w.name).concat([{ name: w.name, value: r.holds }]);
     }
     const bad = todo.filter(w => w.undo !== 'undone');
-    this.setPhase('done', bad.length ? `undo incomplete: ${bad.map(w => w.undoText).join('; ')}. Load the UNDO file in Mission Planner to go back` : 'previous values written back and read back' + (this.rebootPending.length ? `; ${this.rebootPending.map(x => x.name).join(', ')} take effect after a reboot (press Reboot)` : ''));
+    this.setPhase('done', bad.length ? `undo incomplete: ${bad.map(w => w.undoText).join('; ')}. Load the UNDO file in Mission Planner to go back` : 'previous values written back and read back' + (this.rebootPending.length ? `; ${this.rebootPending.map(x => x.name).join(', ')} ${this.rebootPending.length === 1 ? 'takes' : 'take'} effect after a reboot (press Reboot)` : ''));
   }
 
   snapshot() {

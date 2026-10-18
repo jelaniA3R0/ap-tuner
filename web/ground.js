@@ -32,7 +32,7 @@ const gUndo = guard(async () => { if (await modal('Write the previous values bac
 const gRecheck = guard(async () => { await api('ground/recheck', {}); toast('Values read again from the autopilot', 'ok'); });
 const gReboot = guard(async () => {
   const g = snap.ground; const names = [...(g.rebootPending || []).map(x => x.name), ...(g.afterReboot || []).map(x => x.name)];
-  if (!(await modal('Reboot the autopilot now?', `<p>Only disarmed, on the ground, USB plugged in. ${esc(names.join(', '))} take effect only after a reboot. The app waits for the autopilot to come back, checks that it is the same one and reads every value written here again${(g.afterReboot || []).length ? '; then it writes the notch values that only appear once the notch is on' : ''}.</p>`, { yes: 'Reboot', danger: true }))) return;
+  if (!(await modal('Reboot the autopilot now?', `<p>Only disarmed, on the ground, USB plugged in. ${esc(names.join(', '))} ${names.length === 1 ? 'takes' : 'take'} effect only after a reboot. The app waits for the autopilot to come back, checks that it is the same one and reads every value written here again${(g.afterReboot || []).length ? '; then it writes the notch values that only appear once the notch is on' : ''}.</p>`, { yes: 'Reboot', danger: true }))) return;
   const r = await api('ground/reboot', {});
   toast(r.ok ? 'Rebooted: the values were read back' : 'Reboot: ' + (r.reason || 'see the list'), r.ok ? 'ok' : 'bad');
 });

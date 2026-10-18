@@ -603,6 +603,16 @@ test('wv_ground_notch_reboot_workflow_with_values_after_reboot', async () => {
     assert.strictEqual(G.fv.reboots, 2); assert.strictEqual(G.g.rebootPending.length, 0);
     assert.match(G.g.info, /rebooted: every value written here was read back after the reboot/);
     assert.ok(G.g.writes.every(w => /read back after the reboot/.test(w.afterReboot || 'read back after the reboot')));
+    // Undo: REF waits for a reboot again; the reboot checks the values from before (not the values written)
+    const before = Object.fromEntries(G.g.writes.map(w => [w.name, w.from]));
+    await G.g.undo();
+    assert.deepStrictEqual(G.g.writes.map(w => w.undo), ['undone', 'undone', 'undone', 'undone', null], 'HMNCS did not change');
+    assert.deepStrictEqual(G.g.rebootPending.map(x => x.name), ['INS_HNTCH_REF']);
+    await G.g.rebootNow();
+    assert.strictEqual(G.fv.reboots, 3); assert.strictEqual(G.g.rebootPending.length, 0);
+    assert.match(G.g.info, /rebooted: every value written here was read back after the reboot/);
+    assert.ok(G.g.reboot.ok && G.g.reboot.rows.every(x => x.ok && x.holds === before[x.name]), JSON.stringify(G.g.reboot.rows));
+    assert.ok(G.g.writes.every(w => /read back after the reboot/.test(w.afterReboot || 'read back after the reboot')));
   } finally { G.done(); }
 });
 
