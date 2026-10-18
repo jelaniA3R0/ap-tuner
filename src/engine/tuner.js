@@ -13,6 +13,17 @@
 //  - on a trip the session pauses at once and the change is undone from evidence: back to the set before the
 //    change when the 2 s before it were calm, otherwise to the values the session started from (observed calm
 //    in the check-up); no corrective write is larger than stepMax, and the result is watched as well.
+//
+// Verified writes bound to the vehicle (2026-10-17 audit R3: F-25, F-28, F-29, F-32, F-33, F-35, F-39, F-51):
+//  - every write is verified exactly (float32 / whole number by type) and journaled (requested, sent, echo, read-back,
+//    status) in the append-only journal; a write that does not verify fails, pauses and the whole apply is written back
+//    to the values from before it (each verified); what cannot be proven is listed as uncertain;
+//  - the session identity (connection, system id, autopilot, board UID, firmware, parameter hash) is taken when the
+//    vehicle is read and carried by every analysis and proposal; a proposal has an id and a hash over the exact
+//    (parameter, from, to) list, the approval must send both back, and a reconnect or another vehicle drops proposals,
+//    buffers and automatic writes; every value is read fresh before an apply and a changed one stops it;
+//  - parameters that take effect only after a reboot are never written in flight; on the ground they are noted for the
+//    reboot workflow (NotchLive.reboot, verified after the reboot); the cache follows every PARAM_VALUE of the vehicle.
 'use strict';
 const EventEmitter = require('events');
 const fs = require('fs');
@@ -21,11 +32,22 @@ const { LiveAxis } = require('./axis');
 const { analyzeAxis, currentGains } = require('./analysis');
 const { detectFamily, axisParamNames, familyDef } = require('./vehicle');
 const { neededParams, oscSmaxFor, filterRules, iRule, gainLimits } = require('../model/rules');
+const { isRebootRequired } = require('../model/parammeta');
+const { verifiedSet, writeText } = require('./paramwrite');
+const { sameF32, sessionIdentity, makeProposal } = require('./identity');
+const { Journal } = require('./journal');
 
 const AXES = ['roll', 'pitch', 'yaw'];
 const PID_TUNING_ID = 194, ATTITUDE_ID = 30;
-// gain keys in the order they are written (filters first, D before P)
-const WRITE_ORDER = ['FLTT', 'FLTE', 'FLTD', 'SMAX', 'D', 'P', 'I', 'FF', 'angleP', 'tconst'];
+// gain keys in the order they are written (filters and limits first, D before P); IMAX is written when a proposal
+// changes it, like every value it shows (F-33)
+const WRITE_ORDER = ['FLTT', 'FLTE', 'FLTD', 'SMAX', 'IMAX', 'D', 'P', 'I', 'FF', 'angleP', 'tconst'];
+// why a proposal changes a value (shown with the full parameter name before the approval)
+const REASON = { P: 'rate P from the identified model (preset margins)', I: 'rate I follows P / FF (ArduPilot rule)', D: 'rate D from the identified model', FF: 'feed-forward',
+  FLTT: 'target filter (QuikTune rule)', FLTE: 'error filter (QuikTune rule)', FLTD: 'D-term filter (QuikTune rule)', SMAX: 'slew-rate limit (needed for the oscillation signal)',
+  IMAX: 'I limit: the I term holds a steady correction near its limit', angleP: 'angle gain from the rate-loop crossover (at most x1.5 per round)', tconst: 'time constant from the rate-loop crossover' };
+// a live proposal older than this is not applied: observe again
+const PROPOSAL_MAX_AGE_MS = 15 * 60 * 1000;
 // per-axis values a corrective write moves in steps of at most stepMax; LINEAR_KEYS also from / to zero (linearly)
 const STEPPED_KEYS = ['P', 'I', 'D', 'FF', 'angleP', 'tconst', 'FLTT', 'FLTE', 'FLTD'];
 const LINEAR_KEYS = ['P', 'I', 'D', 'FF', 'angleP', 'tconst'];
@@ -39,6 +61,7 @@ class Tuner extends EventEmitter {
   constructor(link, opts = {}) {
     super();
     this.link = link;
+    const journal = opts.journal; opts = Object.assign({}, opts); delete opts.journal;
     this.opts = Object.assign({ preset: 'normal', autoApply: false, axes: ['roll', 'pitch'], observeSeconds: 30, stepMax: 1.5, watchSeconds: 4, oscSmax: 5, massKg: 0, allowRamp: false, rampDoubleTime: 10, rampMargin: 60, maxReducePct: 20,
       inFlightWrites: false, watchGrace: 0.5, filterWatchSeconds: 10, monitorSeconds: 2, monitorFraction: 0.5, revertStepSeconds: 1, calmWaitSeconds: 4, angleAbort: 10, angleAbortSeconds: 0.8,
       sessionDir: path.join(__dirname, '..', '..', 'sessions') }, opts);
@@ -62,6 +85,10 @@ class Tuner extends EventEmitter {
     this._attHist = []; this._attErr = [];
     this.monitor = { active: false, axes: {}, attitude: { active: false, roll: null, pitch: null }, lastTrip: null };
     this._monitorTimer = null;
+    // R3: the journal file, the session identity, values that need a reboot, names being written now
+    this.audit = journal || new Journal(path.join(this.opts.sessionDir, 'journal'));
+    this.identity = null; this.paramsAtPrepare = {}; this.rebootPending = []; this._writingNames = new Set(); this._txnSeq = 0;
+    this.expectExternal = null;   // who changes values on the vehicle right now (the autopilot's FFT notch tune)
     this._bind();
   }
 
@@ -93,13 +120,42 @@ class Tuner extends EventEmitter {
     L.on('VFR_HUD', f => { this.hud = { airspeed: f.airspeed, throttle: f.throttle, alt: f.alt, groundspeed: f.groundspeed }; });
     L.on('STATUSTEXT', f => this.log('vehicle', f.text));
     L.on('VIBRATION', (f, m) => { this.vibe = { x: f.vibration_x, y: f.vibration_y, z: f.vibration_z, clip: (f.clipping_0 | 0) + (f.clipping_1 | 0) + (f.clipping_2 | 0), ts: m.ts / 1000 }; });
+    // every PARAM_VALUE of the vehicle keeps the cache current; a change the app did not make is reported (Q94)
+    L.on('param', (name, value) => this._onParamValue(name, value));
+    L.on('vehicle-change', c => this._onConnectionChange('another vehicle answered (' + c.reason + ')'));
+    // a reboot loses the requested message rates: ask again (the values are the same: the identity was checked)
+    L.on('reboot', () => { if (this.family) { this.requestStreams(); this.log('link', 'the autopilot rebooted: streams re-requested'); } });
     L.on('heartbeat', v => {
+      if (this._preparedGen !== undefined && this._preparedGen !== L.generation) this._onConnectionChange('the connection changed');
       if (!this.family && Object.keys(this.params).length) this.family = detectFamily(v, this.params);
       if (this._linkGen !== L.generation) { this._linkGen = L.generation; if (this.family) { this.requestStreams(); this.log('link', 'new connection: streams re-requested'); } }
       // a disarm pauses a running session (once: a paused session keeps its message)
       if (v.armed) this.armedSeen = true;
       else if (this.armedSeen && ['observing', 'analyzing', 'applying', 'proposed', 'ramping'].includes(this.state)) this.onDisarm();
     });
+  }
+
+  _onParamValue(name, value) {
+    if (!(name in this.params)) return;
+    const cur = this.params[name];
+    this.params[name] = value;
+    if (this._writingNames.has(name) || cur === undefined || sameF32(cur, value)) return;
+    const who = this.expectExternal || 'not by AP Tuner: another ground station?';
+    this.log('param', `${name} changed on the vehicle: ${fmt(cur)} -> ${fmt(value)} (${who})`);
+    this.audit.append('conflict', { name, from: cur, to: value, by: who, identity: this.identity ? this.identity.key : null, gen: this.link.generation });
+  }
+
+  /** a reconnect or another vehicle: proposals, live buffers and automatic writes of the old connection end (F-25) */
+  _onConnectionChange(why) {
+    if (this._preparedGen === undefined || this._preparedGen === this.link.generation || this._droppedGen === this.link.generation) return;
+    this._droppedGen = this.link.generation;
+    this.results = {}; this.previous = {}; this.prepared = false; this.family = null; this.params = {}; this.rebootPending = []; this.identity = null;
+    for (const ax of AXES) this.axes[ax].clear();
+    this._cancelJob(why);
+    this.endSession();
+    if (['observing', 'analyzing', 'applying', 'proposed', 'ramping'].includes(this.state)) this.pause(`${why}: read the vehicle again (step 2); nothing is written until then`);
+    this.audit.append('connection', { why, gen: this.link.generation, identity: this.link.identity() });
+    this.log('link', `${why}: proposals and live data of the previous connection were dropped`);
   }
 
   log(kind, text) { const e = { t: Date.now(), kind, text }; this.messages.push(e); if (this.messages.length > 500) this.messages.shift(); this.emit('log', e); }
@@ -118,7 +174,7 @@ class Tuner extends EventEmitter {
   async _prepare(confirm) {
     this.setState('preparing', 'reading parameters');
     // a new connection may be a different vehicle: drop everything cached from the previous one
-    if (this._preparedGen !== this.link.generation) { this._preparedGen = this.link.generation; this.params = {}; this.originals = {}; this.previous = {}; this.results = {}; this.lastGood = {}; this.prepared = false; this.lastTrip = null; this.endSession(); }
+    if (this._preparedGen !== this.link.generation) { this._preparedGen = this.link.generation; this.params = {}; this.originals = {}; this.previous = {}; this.results = {}; this.lastGood = {}; this.prepared = false; this.lastTrip = null; this.rebootPending = []; this.identity = null; this.endSession(); }
     // samples buffered so far may be from another vehicle or in other units: none are kept until the family is known (F-91)
     this.family = null;
     for (const ax of AXES) this.axes[ax].clear();
@@ -130,6 +186,8 @@ class Tuner extends EventEmitter {
     const names = neededParams(fam === 'heli' ? 'copter' : fam);
     const got = await this.link.requestParams(names, 3, (d, n) => this.emit('progress', { done: d, total: n }));
     Object.assign(this.params, got);
+    await this.link.waitAutopilot(3000);
+    this.identity = sessionIdentity(this.link.identity(), this.params);
     this.loopHz = this.params.SCHED_LOOP_RATE || (fam === 'plane' ? 50 : 400);
     // PID_TUNING streaming needs GCS_PID_MASK (bits: roll 1, pitch 2, yaw 4) and SMAX > 0 for the slew-rate signal
     const writes = [];
@@ -143,11 +201,17 @@ class Tuner extends EventEmitter {
     const checks = this.safetyChecks();
     if (writes.length && !confirm) { this.setState('ready', `${fam} detected; ${writes.length} housekeeping setting(s) need your OK`); return { family: fam, vehicle: v, needsConfirm: true, writes, checks, gains: Object.fromEntries(AXES.map(a => [a, currentGains(fam, a, this.params)])), loopHz: this.loopHz }; }
     if (writes.length) {
-      // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too
+      // housekeeping only (telemetry on, slew rate reported): not watched, but while armed it needs the opt-in too;
+      // the journal names the vehicle before anything is written to it
+      this.audit.append('identity', { identity: this.identity, via: 'read the vehicle, before the housekeeping values', family: fam });
       const job = this._beginJob('prepare');
       try { for (const w of writes) await this.setParam(w.name, w.to, w.why.split('.')[0], job); } finally { this._endJob(job); }
     }
     this.pendingWrites = [];
+    // the session identity: this connection, the vehicle (board UID, firmware) and a hash of every value read (F-25)
+    this.identity = sessionIdentity(this.link.identity(), this.params);
+    this.paramsAtPrepare = Object.assign({}, this.params);
+    this.audit.append('identity', { identity: this.identity, via: 'read the vehicle', family: fam });
     this.requestStreams();
     this.lastGood = JSON.parse(JSON.stringify(this.originals));
     if (!this.sessionFile) { this.sessionFile = path.join(this.opts.sessionDir, new Date().toISOString().replace(/[:.]/g, '-') + '.json'); fs.mkdirSync(this.opts.sessionDir, { recursive: true }); }
@@ -225,7 +289,7 @@ class Tuner extends EventEmitter {
   /** take the write lock; handlesTrips: the job reverts its own changes when a trip comes in while it runs */
   _beginJob(kind, { corrective = false, handlesTrips = false } = {}) {
     if (this._job) throw new Error(`a change is being written (${this._job.kind}): wait until it has finished`);
-    const job = { id: ++this._jobSeq, kind, corrective, handlesTrips, cancelled: null, abortWatch: false };
+    const job = { id: ++this._jobSeq, kind, corrective, handlesTrips, cancelled: null, abortWatch: false, gen: this.link.generation, touched: new Map(), txn: null };
     this._job = job;
     return job;
   }
@@ -268,30 +332,32 @@ class Tuner extends EventEmitter {
    */
   async setParam(name, value, reason, job) {
     if (!job) throw new Error('internal: write without the write lock');
+    // a change started on one connection never goes on on another one (it may be another vehicle)
+    if (job.gen !== this.link.generation) throw Object.assign(new Error(`${name} not written: the connection changed since this change started`), { code: 'link-changed' });
     if (job.corrective) { if (!this.link.connected) throw new Error(`${name} not written: no connection to the vehicle`); }
-    else { this._checkpoint(job); this._assertForward(job); }
+    else {
+      this._checkpoint(job); this._assertForward(job);
+      if (this._armed() && isRebootRequired(name)) throw Object.assign(new Error(`${name} takes effect only after a reboot: it is set on the ground (disarmed), never in flight`), { code: 'reboot-required' });
+      if (!this.audit.ok) throw Object.assign(new Error(`the write journal cannot be written (${this.audit.error}): nothing is written. Free some disk space and restart AP Tuner`), { code: 'journal' });
+      if (!job.touched.has(name)) job.touched.set(name, this.params[name]);
+    }
     const from = this.params[name];
     const armed = this._armed();
-    let v;
-    try {
-      v = await this.link.setParam(name, value, 1500, 3, () => job.corrective || (!job.cancelled && !this._pendingTrip));
-    } catch (e) {
-      if (e.code === 'cancelled' && e.attempts > 0) {
-        // an earlier PARAM_SET may have reached the vehicle: ask what it holds now
-        const rb = await this.link.requestParam(name, 1000, 1).catch(() => undefined);
-        if (rb !== undefined) this.params[name] = rb;
-        this.journal.push({ t: Date.now(), name, from, to: rb, requested: value, reason, armed, job: job.kind, status: rb === undefined ? 'uncertain: cancelled, no read-back' : 'cancelled, read back' });
-        this.saveSession();
-      }
-      if (e.code === 'cancelled') this._checkpoint(job);   // report the trip / cancel that stopped it
-      throw e;
-    }
-    this.params[name] = v;
-    this.journal.push({ t: Date.now(), name, from, to: v, requested: value, reason, armed, job: job.kind });
-    this.emit('param', { name, from, to: v, reason });
-    this.log('param', `${name}: ${fmt(from)} -> ${fmt(v)} (${reason})`);
+    this._writingNames.add(name);
+    let r;
+    try { r = await verifiedSet(this.link, name, value, { before: from, keepGoing: () => job.corrective || (!job.cancelled && !this._pendingTrip) }); }
+    finally { this._writingNames.delete(name); }
+    if (r.holds !== undefined) this.params[name] = r.holds;
+    const status = r.cancelled ? 'cancelled: ' + (r.status === 'cancelled' ? 'not sent' : r.status === 'verified' ? 'written before the stop (read back)' : writeText(r)) : r.status;
+    const entry = { t: Date.now(), name, from, to: r.holds, requested: value, sent: r.sent, echo: r.echo, readBack: r.readBack, status, reason, armed, job: job.kind, txn: job.txn };
+    this.journal.push(entry);
+    this.audit.append('write', Object.assign({ identity: this.identity ? this.identity.key : null, gen: this.link.generation, type: r.type, before: r.before, ok: r.ok, error: r.error, note: r.note, ms: r.ms, corrective: !!job.corrective }, entry));
     this.saveSession();
-    return v;
+    if (r.cancelled) { this._checkpoint(job); throw Object.assign(new Error(`${name} not written: cancelled`), { code: 'cancelled' }); }
+    if (!r.ok) { this.log('error', writeText(r)); throw Object.assign(new Error(writeText(r)), { code: 'verify', result: r }); }
+    this.emit('param', { name, from, to: r.holds, reason });
+    this.log('param', `${name}: ${fmt(from)} -> ${fmt(r.holds)} (${reason})`);
+    return r.holds;
   }
 
   saveSession() {
@@ -318,12 +384,31 @@ class Tuner extends EventEmitter {
     const res = analyzeAxis({ family: this.family, axis, data, params: this.params, preset: this.opts.preset, gyroOp: { throttle: this.hud.throttle / 100 }, scaler2, fsLoop: this.loopHz, designFrom: this.originals[axis] || null });
     res.dataInfo = { fs: data.fs, rawRateHz: data.rawRate, seconds: data.n / data.fs };
     res.at = Date.now();
+    res.identity = this.identity ? { key: this.identity.key, paramHash: this.identity.paramHash } : null;
+    if (res.proposal) this.bindProposal(axis, res.proposal);
     const step = Math.max(1, Math.floor(data.n / 1500));
     res.series = { t: [], target: [], actual: [], u: [] };
     for (let i = 0; i < data.n; i += step) { res.series.t.push(+(data.t0 + i / data.fs).toFixed(3)); res.series.target.push(+data.target[i].toFixed(2)); res.series.actual.push(+data.actual[i].toFixed(2)); res.series.u.push(+data.u[i].toFixed(4)); }
     this.results[axis] = res;
     this.emit('analysis', res);
     return res;
+  }
+
+  /**
+   * The proposal gets its full parameter rows (name, from, to, reason, reboot flag: what the approval shows), an id and
+   * a hash over the session identity and that exact list; Apply has to send id and hash back (F-33).
+   */
+  bindProposal(axis, p) {
+    const n = axisParamNames(this.family, axis); const rows = [];
+    for (const k of WRITE_ORDER) {
+      if (p.gains[k] === undefined || !n[k]) continue;
+      const from = this.params[n[k]];
+      if (from !== undefined && Math.abs(from - p.gains[k]) < 1e-9) continue;   // unchanged: not written
+      rows.push({ name: n[k], key: k, from, to: p.gains[k], reason: REASON[k] || '', reboot: isRebootRequired(n[k]) });
+    }
+    Object.assign(p, makeProposal({ source: 'live', axis, identity: this.identity, rows }));
+    this.audit.append('proposal', { proposal: p.id, hash: p.hash, axis, identity: this.identity ? this.identity.key : null, rows });
+    return p;
   }
 
   // ---------------- session control ----------------
@@ -385,27 +470,109 @@ class Tuner extends EventEmitter {
   /** a user-requested return to earlier values: while armed it needs the opt-in like any other in-flight write */
   async _userCorrective(kind, targets, reason) {
     if (!this.link.alive) throw new Error('no vehicle heartbeat: connect first');
+    // the values belong to the vehicle read on this connection: after a reconnect it may be another vehicle
+    if (!this.prepared || this._preparedGen !== this.link.generation) throw new Error('read the vehicle first (the connection changed)');
     if (this._armed() && !this.opts.inFlightWrites) throw new Error('the vehicle is armed and ' + IN_FLIGHT_OFF);
     const job = this._beginJob(kind, { corrective: true });
-    try { const r = await this._corrective(job, targets, reason); if (r.failed.length) throw new Error(`not written: ${r.failed.join(', ')}`); } finally { this._endJob(job); }
+    job.txn = ++this._txnSeq;
+    this.audit.append('txn', { txn: job.txn, phase: 'begin', kind, reason, items: targets });
+    try {
+      // read back before going back (F-51): every value is read fresh, and only what differs is written (each verified)
+      const r = await this._corrective(job, targets, reason, { fresh: true });
+      this.audit.append('txn', { txn: job.txn, phase: 'end', ok: !r.failed.length, failed: r.failedText });
+      if (r.failed.length) throw new Error(`not written back: ${r.failedText.join('; ')}`);
+    } finally { this._endJob(job); }
   }
   onDisarm() { if (this.state !== 'idle') this.pause('vehicle disarmed'); }
 
-  /** user accepted a proposal (manual mode); true if every change held */
-  async applyProposal(axis) {
+  /**
+   * The user approved a proposal (manual mode): approval = {id, hash} of the proposal shown. True if every change
+   * held; a write that does not verify rolls the whole apply back and throws (code 'apply-failed', the session pauses).
+   */
+  async applyProposal(axis, approval = null) {
     const r = this.results[axis];
     if (!r || !r.proposal) throw new Error('no proposal for ' + axis);
+    this._checkApproval(r.proposal, approval);
     if (this.state === 'applying' || this._job) throw new Error('another change is being written: wait until it has finished');
     if (this._armed() && !this.opts.inFlightWrites) throw new Error(IN_FLIGHT_OFF);
     const job = this._beginJob('apply ' + axis, { handlesTrips: true });
     try {
       this.setState('applying', axis);
-      return await this._applyStaged(axis, r.proposal.gains, job);
+      this.audit.append('approval', { proposal: r.proposal.id, hash: r.proposal.hash, axis, by: 'user', via: 'Apply', identity: this.identity ? this.identity.key : null });
+      return await this._applyBound(axis, r.proposal, job);
     } catch (e) {
       if (e.code === 'cancelled') return false;
       if (this.state === 'applying') this.pause(`${axis}: apply stopped: ${e.message}`);
       throw e;
     } finally { this._endJob(job); }
+  }
+
+  /** the approval must name the proposal held now (id and hash), made on this connection for this vehicle, not too old */
+  _checkApproval(p, approval) {
+    if (!p.id || !approval || approval.id !== p.id || approval.hash !== p.hash) {
+      this.audit.append('refused', { what: 'apply', proposal: p.id || null, hash: p.hash || null, approval: approval || null, why: 'proposal id / hash mismatch' });
+      throw Object.assign(new Error('the proposal changed since it was shown (a newer analysis): look at it again, then press Apply'), { code: 'approval' });
+    }
+    const id = this.link.identity();
+    if (!this.identity || p.gen !== this.link.generation || p.gen !== this.identity.gen || p.sysid !== id.sysid || p.compid !== id.compid) {
+      this.audit.append('refused', { what: 'apply', proposal: p.id, why: 'another connection or vehicle', proposalIdentity: p.identityKey, now: id });
+      throw Object.assign(new Error('the proposal was made on another connection or for another vehicle: read the vehicle again and analyse again'), { code: 'identity' });
+    }
+    if (Date.now() - p.at > PROPOSAL_MAX_AGE_MS) {
+      this.audit.append('refused', { what: 'apply', proposal: p.id, why: 'too old' });
+      throw Object.assign(new Error(`the proposal is ${Math.round((Date.now() - p.at) / 60000)} min old: observe again for a fresh one`), { code: 'stale' });
+    }
+  }
+
+  /**
+   * A bound proposal as one transaction: every value is read fresh first (one that is not what the proposal was made
+   * from stops it, nothing written); then the staged apply; a write that does not verify rolls the whole apply back to
+   * the values from before it (each verified, within stepMax) and throws code 'apply-failed' (the session is paused).
+   */
+  async _applyBound(axis, p, job) {
+    await this._freshCheck(p.rows);
+    job.txn = ++this._txnSeq;
+    this.audit.append('txn', { txn: job.txn, phase: 'begin', proposal: p.id, hash: p.hash, axis, armed: this._armed(), items: p.rows.map(r => ({ name: r.name, from: r.from, to: r.to })) });
+    try {
+      const ok = await this._applyStaged(axis, p.gains, job);
+      this.audit.append('txn', { txn: job.txn, phase: 'end', ok });
+      return ok;
+    } catch (e) {
+      if (e.code !== 'verify') { this.audit.append('txn', { txn: job.txn, phase: 'end', ok: false, error: e.message }); throw e; }
+      await this._rollback(axis, job, e);
+      throw Object.assign(new Error(this.stateInfo), { code: 'apply-failed' });
+    }
+  }
+
+  /** read every value a change will write; one that is no longer what the change was made from stops it (F-25, Q94) */
+  async _freshCheck(rows) {
+    const stale = [];
+    for (const r of rows) {
+      let v;
+      try { v = await this.link.requestParam(r.name, 1200, 2); } catch (e) { throw Object.assign(new Error(`${r.name} could not be read before writing (${e.message}): nothing was written`), { code: 'stale' }); }
+      if (r.from !== undefined && !sameF32(v, r.from)) stale.push(`${r.name} is ${fmt(v)} on the vehicle, the proposal was made from ${fmt(r.from)}`);
+    }
+    if (stale.length) {
+      this.audit.append('refused', { what: 'apply', why: 'changed on the vehicle', stale });
+      throw Object.assign(new Error(`changed on the vehicle since the analysis: ${stale.join('; ')}. Nothing was written: analyse again`), { code: 'stale' });
+    }
+  }
+
+  /**
+   * A write that did not verify: every value this job touched goes back to its value from before (each verified; in
+   * flight within stepMax and watched); what cannot be proven is listed as uncertain. The session pauses with the result.
+   */
+  async _rollback(axis, job, err) {
+    job.corrective = true;
+    const targets = [...job.touched].filter(([, to]) => typeof to === 'number').map(([name, to]) => ({ name, to }));
+    const armed = this._armed();
+    const what = axis ? axis : 'notch / filters';
+    this.log('tuner', `${what}: ${err.message}: writing back the values from before`);
+    const r = targets.length ? await this._corrective(job, targets, 'roll back: a write did not verify') : { written: [], failed: [], failedText: [] };
+    const w = armed && r.written.length ? await this._watchCorrective(axis ? [axis] : this._sharedAxes()) : { ok: true, reasons: [] };
+    this.audit.append('txn', { txn: job.txn, phase: 'end', ok: false, failed: err.result ? err.result.name : null, rolledBack: !r.failed.length, uncertain: r.failedText });
+    if (r.failed.length) this.pause(`${what}: ${err.message}. Writing back failed, uncertain parameters: ${r.failedText.join('; ')}${armed ? ': land now' : ': check them before flying'}`);
+    else this.pause(`${what}: ${err.message}. Rolled back: every value written by this apply is back to what it was before (read back)${w.ok ? '' : `, but ${w.reasons.join('; ')}: land now`}`);
   }
 
   /** staged application, each change watched in flight; returns true if the final gains were kept */
@@ -417,8 +584,8 @@ class Tuner extends EventEmitter {
     let steps = 1;
     for (const k of keys) { const a = cur[k] || 1e-6, b = target[k] || 1e-6; if (a > 0 && b > 0) steps = Math.max(steps, Math.ceil(Math.abs(Math.log(b / a)) / Math.log(this.opts.stepMax) - 1e-9)); }
     steps = Math.min(steps, 6);
-    // filters / smax first (small effect), then the gains stepwise, the angle gain last
-    const pre = {}; for (const k of ['FLTT', 'FLTE', 'FLTD', 'SMAX']) if (target[k] !== undefined) pre[k] = target[k];
+    // filters, smax and the I limit first (small effect), then the gains stepwise, the angle gain last
+    const pre = {}; for (const k of ['FLTT', 'FLTE', 'FLTD', 'SMAX', 'IMAX']) if (target[k] !== undefined) pre[k] = target[k];
     if (!(await this._change(job, axis, pre, 'apply filters'))) return false;
     for (let s = 1; s <= steps; s++) {
       const g = {};
@@ -459,6 +626,9 @@ class Tuner extends EventEmitter {
       this._checkpoint(job); this._assertForward(job);
       let calm = null;
       if (armed) {
+        // a value that takes effect only after a reboot cannot be watched in flight (it acts on the next flight): ground only (F-35)
+        const rb = todo.filter(e => isRebootRequired(e.name)).map(e => e.name);
+        if (rb.length) throw Object.assign(new Error(`${rb.join(', ')} take${rb.length > 1 ? '' : 's'} effect only after a reboot: ${rb.length > 1 ? 'they are' : 'it is'} set on the ground (disarmed, then reboot), never in flight`), { code: 'reboot-required' });
         for (const ax of axes) { const why = this._watchBlind(ax); if (why) throw new Error(`${ax}: ${why}: the change could not be watched, so it was not written`); }
         if (!this.sessionActive) this.beginSession();
         // nothing is changed while the vehicle shows oscillation: wait a moment for calm, otherwise stop here
@@ -473,6 +643,7 @@ class Tuner extends EventEmitter {
       for (const e of todo) { await this.setParam(e.name, e.to, reason, job); change.written.push(e.name); }
     } catch (err) {
       if (err.code === 'trip') { if (change) change.status = 'partial'; await this._handleTrip(job, err.trip, change); return false; }
+      if (err.code === 'verify') { if (change) change.status = 'failed'; throw err; }   // the whole set is rolled back by the caller
       // stopped or failed midway in flight: the part that was written is watched like any change
       if (!change || !armed || !change.written.length) { if (err.code === 'cancelled') return false; throw err; }
       change.status = 'partial';
@@ -492,7 +663,28 @@ class Tuner extends EventEmitter {
   async applyFilterChange(values, reason) {
     if (this._job) throw new Error(`a change is being written (${this._job.kind}): wait until it has finished`);
     const job = this._beginJob('filters', { handlesTrips: true });
-    try { return await this._change(job, null, values, reason, { kind: 'notch' }); } finally { this._endJob(job); }
+    try {
+      // fresh values first: the change is worked out against what the vehicle holds now
+      for (const name of Object.keys(values)) { try { await this.link.requestParam(name, 1200, 2); } catch (e) { throw new Error(`${name} could not be read (${e.message}): nothing was written`); } }
+      job.txn = ++this._txnSeq;
+      this.audit.append('txn', { txn: job.txn, phase: 'begin', kind: 'filters', reason, armed: this._armed(), items: Object.entries(values).map(([name, to]) => ({ name, from: this.params[name], to })) });
+      let held;
+      try { held = await this._change(job, null, values, reason, { kind: 'notch' }); }
+      catch (e) {
+        if (e.code !== 'verify') { this.audit.append('txn', { txn: job.txn, phase: 'end', ok: false, error: e.message }); throw e; }
+        await this._rollback(null, job, e);
+        throw Object.assign(new Error(this.stateInfo), { code: 'apply-failed' });
+      }
+      this.audit.append('txn', { txn: job.txn, phase: 'end', ok: held });
+      // written on the ground: values that act only after a reboot wait for the reboot workflow (verified after it)
+      if (held && !this._armed()) for (const name of job.touched.keys()) if (isRebootRequired(name)) this._notePendingReboot(name);
+      return held;
+    } finally { this._endJob(job); }
+  }
+  /** a value written on the ground that takes effect only after a reboot (checked again after the reboot) */
+  _notePendingReboot(name) {
+    this.rebootPending = this.rebootPending.filter(p => p.name !== name).concat([{ name, value: this.params[name] }]);
+    this.log('tuner', `${name} takes effect after a reboot of the autopilot (disarmed)`);
   }
 
   /** values the vehicle changed by itself (the autopilot FFT notch tune) are watched like the app's own changes */
@@ -666,7 +858,7 @@ class Tuner extends EventEmitter {
         this.pause(`${what}${after}: the change was reverted (${list}) and the vehicle is calm again. Press Resume to continue, or land`);
         return;
       }
-      reverted = { list, why: r.failed.length ? `not written: ${r.failed.join(', ')}` : w.reasons.join('; ') };
+      reverted = { list, why: r.failed.length ? `not written back: ${r.failedText.join('; ')}` : w.reasons.join('; ') };
       this.log('watchdog', `after the revert (${list}): ${reverted.why}: restoring the values from the start of the session`);
     }
     const targets = this._sessionDiff();
@@ -678,7 +870,7 @@ class Tuner extends EventEmitter {
     const r = await this._corrective(job, targets, 'restore the session start values: oscillation');
     const w = await this._watchCorrective(AXES.filter(ax => this.axes[ax].t.length));
     const list = r.written.map(e => e.name + ' ' + fmt(e.to)).join(', ');
-    if (r.failed.length) this.pause(`${what}${after}: restoring the values from the start of the session failed for ${r.failed.join(', ')}: land now`);
+    if (r.failed.length) this.pause(`${what}${after}: restoring the values from the start of the session failed (uncertain parameters: ${r.failedText.join('; ')}): land now`);
     else if (w.ok) this.pause(`${what}${after}: the values from the start of the session were restored (${list}) and the vehicle is calm again. Land and check, or press Resume`);
     else this.pause(`${what}${after}: still oscillating with the values from the start of the session (${w.reasons.join('; ')}): land now`);
   }
@@ -688,27 +880,30 @@ class Tuner extends EventEmitter {
    * steps of at most stepMax (linear from / to zero), revertStepSeconds apart; everything else in one write. Best
    * effort: a failed write is reported and the rest is still written. Returns {written: [{name, to}], failed: [name]}.
    */
-  async _corrective(job, targets, reason) {
+  async _corrective(job, targets, reason, { fresh = false } = {}) {
     const gainKey = new Map();
     if (this.family) for (const ax of AXES) { const n = axisParamNames(this.family, ax); for (const k of STEPPED_KEYS) if (n[k]) gainKey.set(n[k], k); }
+    // fresh: read every value first and leave out what the vehicle provably holds already; otherwise nothing is left
+    // out on the strength of the cache (F-51: a stale cache must not skip a revert)
+    if (fresh) for (const t of targets) { try { await this.link.requestParam(t.name, 1200, 2); } catch (e) { /* the write will tell */ } }
     const stepped = [], direct = [];
     for (const t of targets) {
       const cur = this.params[t.name];
-      if (cur !== undefined && Math.abs(cur - t.to) <= 1e-9 * Math.max(1, Math.abs(t.to))) continue;
+      if (fresh && sameF32(cur, t.to)) continue;
       const key = gainKey.get(t.name);
-      if (key && cur !== undefined && ((cur > 0 && t.to > 0) || LINEAR_KEYS.includes(key))) stepped.push({ name: t.name, from: cur, to: t.to });
+      if (key && cur !== undefined && !sameF32(cur, t.to) && ((cur > 0 && t.to > 0) || LINEAR_KEYS.includes(key))) stepped.push({ name: t.name, from: cur, to: t.to });
       else direct.push(t);
     }
     direct.sort((a, b) => (b.name === 'INS_HNTCH_ENABLE') - (a.name === 'INS_HNTCH_ENABLE'));
-    const last = new Map(), failed = [];
-    const write = async (name, value) => { try { await this.setParam(name, value, reason, job); last.set(name, value); } catch (e) { if (!failed.includes(name)) failed.push(name); this.log('error', `${name}: ${e.message}`); } };
+    const last = new Map(), failed = [], failedText = [];
+    const write = async (name, value) => { try { await this.setParam(name, value, reason, job); last.set(name, value); } catch (e) { if (!failed.includes(name)) { failed.push(name); failedText.push(e.result ? writeText(e.result) : `${name}: ${e.message}`); } this.log('error', `${name}: ${e.message}`); } };
     for (const t of direct) await write(t.name, t.to);
     const steps = stepsFor(Object.fromEntries(stepped.map(s => [s.name, s.from])), Object.fromEntries(stepped.map(s => [s.name, s.to])), stepped.map(s => s.name), this.opts.stepMax);
     for (let k = 1; k <= steps && stepped.length; k++) {
       if (k > 1) await sleep(this.opts.revertStepSeconds * 1000);
       for (const s of stepped) if (!failed.includes(s.name)) await write(s.name, interp(s.from, s.to, k, steps));
     }
-    return { written: [...last].map(([name, to]) => ({ name, to })), failed };
+    return { written: [...last].map(([name, to]) => ({ name, to })), failed, failedText };
   }
 
   // ---------------- the oscillation monitor (every axis, every 250 ms) ----------------
@@ -792,7 +987,11 @@ class Tuner extends EventEmitter {
       this.setState('applying', `${axis}: ${res.proposal.changes.map(c => c.key + ' ' + fmt(c.from) + '->' + fmt(c.to)).join(', ')}`);
       const job = this._beginJob('apply ' + axis, { handlesTrips: true });
       let ok = false;
-      try { ok = await this._applyStaged(axis, res.proposal.gains, job); } finally { this._endJob(job); }
+      try {
+        this.audit.append('approval', { proposal: res.proposal.id, hash: res.proposal.hash, axis, by: 'auto', via: 'auto-apply (authorised for this session when it started)', identity: this.identity ? this.identity.key : null });
+        ok = await this._applyBound(axis, res.proposal, job);
+      } catch (e) { if (e.code !== 'apply-failed') throw e; }   // rolled back, the session is paused with the reason
+      finally { this._endJob(job); }
       if (ok && this.state === 'applying') { this.round++; if (this.round >= 4) this._nextAxis(); else this.setState('observing', `${axis}: re-checking with the new gains (round ${this.round + 1})`); }
     } else {
       this.setState('proposed', `${axis}: review the proposal and press Apply`);
@@ -822,8 +1021,13 @@ class Tuner extends EventEmitter {
   async _rampStep() {
     if (this._job) return;
     const job = this._beginJob('ramp', { handlesTrips: true });
+    job.txn = ++this._txnSeq;
     try { await this._rampWrite(job); }
-    catch (e) { if (e.code === 'trip') { await this._handleTrip(job, e.trip, null); return; } throw e; }
+    catch (e) {
+      if (e.code === 'trip') { await this._handleTrip(job, e.trip, null); return; }
+      if (e.code === 'verify') { const axis = this.ramp ? this.ramp.axis : this.currentAxis(); this.ramp = null; await this._rollback(axis, job, e); return; }
+      throw e;
+    }
     finally { this._endJob(job); }
   }
   async _rampWrite(job) {
@@ -885,6 +1089,7 @@ class Tuner extends EventEmitter {
       gains: this.family ? Object.fromEntries(AXES.map(a => [a, currentGains(this.family, a, this.params)])) : null,
       originals: this.originals, previous: this.previous || {}, prepared: !!this.prepared, pendingWrites: this.pendingWrites || [], vibe: this.vibe || null,
       monitor: this.monitor, sessionActive: this.sessionActive, writing: this.writing,
+      identity: this.identity, linkIdentity: this.link.identity(), otherVehicles: this.link.othersSeen(), rebootPending: this.rebootPending, audit: this.audit.status(),
       changes: this.changes.slice(-10).map(c => ({ id: c.id, t: c.t, kind: c.kind, axis: c.axis, reason: c.reason, armed: c.armed, status: c.status, params: c.params })),
       journal: this.journal.slice(-50), messages: this.messages.slice(-40) };
   }

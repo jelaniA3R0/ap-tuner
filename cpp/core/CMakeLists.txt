@@ -10,6 +10,7 @@ add_library(aptuner_core STATIC
   src/plant.cpp
   src/synth.cpp
   src/rules.cpp
+  src/parammeta.cpp
   src/timeid.cpp
   src/jsnum.cpp
   src/json.cpp
@@ -22,6 +23,7 @@ add_library(aptuner_core STATIC
   src/engine/notch.cpp
   src/engine/issues.cpp
   src/engine/report.cpp
+  src/engine/identity.cpp
 )
 target_include_directories(aptuner_core
   PUBLIC

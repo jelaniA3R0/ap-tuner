@@ -14,9 +14,11 @@ const { NotchLive } = require('./engine/notchlive');
 const { FlightSession } = require('./engine/flight');
 const { GroundTune } = require('./engine/groundtune');
 const { analyzeLog } = require('./engine/loganalysis');
-const { proposalRows, paramFile } = require('./engine/report');
+const { proposalRows, paramFileChecked, logIdentityText } = require('./engine/report');
 const { PRESETS } = require('./model/rules');
 const { axisParamNames } = require('./engine/vehicle');
+const { Journal } = require('./engine/journal');
+const { sameF32 } = require('./engine/identity');
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
 const APP_MODE = process.argv.includes('--app');
@@ -24,12 +26,14 @@ const WEB = path.join(__dirname, '..', 'web');
 const SESSIONS = path.join(__dirname, '..', 'sessions');
 const TOKEN = crypto.randomBytes(24).toString('hex');   // per run; the app page gets it, other pages cannot read it
 const link = new Link();
-const tuner = new Tuner(link);
+// one append-only write journal for this run (sessions/journal/<start>.jsonl): live tuner, ground writes, notch, exports
+const journal = new Journal(path.join(SESSIONS, 'journal'));
+const tuner = new Tuner(link, { journal });
 tuner.startMonitor();
 const notch = new NotchLive(link, tuner);
 const flight = new FlightSession(link, tuner, notch);
 flight.on('phase', p => sse('flight', p));
-const ground = new GroundTune(link, { sessionsDir: SESSIONS });
+const ground = new GroundTune(link, { sessionsDir: SESSIONS, journal });
 ground.on('phase', p => sse('ground', p));
 const clients = new Set();
 let lastLogResult = null;
@@ -81,7 +85,7 @@ function json(res, code, obj, headers = {}) { const b = JSON.stringify(obj); res
 const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
 const ALLOWED_ORIGINS = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
 // API routes that only read: GET, no token. Everything else under /api/ changes state: POST + token.
-const READ_ROUTES = new Set(['/api/events', '/api/ports', '/api/presets', '/api/notch/status', '/api/live/rows', '/api/live/param', '/api/log/list', '/api/log/param', '/api/ground/result', '/api/ground/state', '/api/ground/file']);
+const READ_ROUTES = new Set(['/api/events', '/api/ports', '/api/presets', '/api/notch/status', '/api/live/rows', '/api/live/param', '/api/log/list', '/api/log/param', '/api/ground/result', '/api/ground/state', '/api/ground/file', '/api/journal']);
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 function sameToken(t) { const a = Buffer.from(String(t || '')), b = Buffer.from(TOKEN); return a.length === b.length && crypto.timingSafeEqual(a, b); }
 /** null when the request may go on, else [status, error, extra headers] */
@@ -184,15 +188,33 @@ async function autoconnect(onProgress) {
   return null;
 }
 
+/** the live session's values: every tuned gain and the notch block, with the value read at the start (changed: differs) */
 function liveRows() {
   const snap = tuner.snapshot(); const rows = [];
   if (!tuner.family || !snap.gains) return rows;
   for (const ax of AXES) {
     const n = axisParamNames(tuner.family, ax); const g = snap.gains[ax]; const o = tuner.originals[ax] || {};
-    for (const k of ['P', 'I', 'D', 'FF', 'FLTT', 'FLTE', 'FLTD', 'SMAX', 'angleP', 'tconst']) if (n[k] && g[k] !== undefined) rows.push({ group: ax, name: n[k], value: +g[k].toPrecision(6), from: o[k], label: k, changed: o[k] !== undefined && Math.abs(o[k] - g[k]) > 1e-6 * Math.max(1, Math.abs(o[k])) });
+    for (const k of ['P', 'I', 'D', 'FF', 'FLTT', 'FLTE', 'FLTD', 'SMAX', 'IMAX', 'angleP', 'tconst']) if (n[k] && typeof g[k] === 'number') rows.push({ group: ax, name: n[k], value: g[k], from: o[k], label: k, changed: typeof o[k] === 'number' && !sameF32(o[k], g[k]) });
   }
-  for (const k of ['INS_HNTCH_ENABLE', 'INS_HNTCH_MODE', 'INS_HNTCH_FREQ', 'INS_HNTCH_BW', 'INS_HNTCH_ATT', 'INS_HNTCH_REF', 'INS_HNTCH_HMNCS', 'INS_HNTCH_OPTS', 'INS_HNTCH_FM_RAT', 'INS_GYRO_FILTER']) if (tuner.params[k] !== undefined) rows.push({ group: 'notch', name: k, value: tuner.params[k], label: k });
+  const at = tuner.paramsAtPrepare || {};
+  for (const k of ['INS_HNTCH_ENABLE', 'INS_HNTCH_MODE', 'INS_HNTCH_FREQ', 'INS_HNTCH_BW', 'INS_HNTCH_ATT', 'INS_HNTCH_REF', 'INS_HNTCH_HMNCS', 'INS_HNTCH_OPTS', 'INS_HNTCH_FM_RAT', 'INS_GYRO_FILTER'])
+    if (typeof tuner.params[k] === 'number') rows.push({ group: 'notch', name: k, value: tuner.params[k], from: at[k], label: k, changed: typeof at[k] === 'number' && !sameF32(at[k], tuner.params[k]) });
   return rows;
+}
+/** the .param text of the values a session changed (checked, fixed point, the vehicle named in the header) */
+function liveParamFile() {
+  const rows = liveRows().filter(r => r.changed);
+  const head = [`Live session values read from the vehicle on ${new Date().toLocaleString()}: the ${rows.length} value(s) this session changed`];
+  if (!rows.length) head.push('Nothing was changed in this session.');
+  const out = paramFileChecked(rows, head, { identity: tuner.identity || link.identity() });
+  journal.append('export', { what: 'live .param', rows: rows.map(r => ({ name: r.name, value: r.value })), errors: out.errors, warnings: out.warnings, identity: tuner.identity ? tuner.identity.key : null });
+  return out;
+}
+/** the .param text of a log analysis (checked; the vehicle is the one in the log) */
+function logParamFile(r) {
+  const out = paramFileChecked(r.rows, [`From log ${path.basename(r.file)} (${r.firmware || ''}), ${r.family}, preset ${Object.values(r.axes).find(a => a && a.preset)?.preset || 'normal'}`, 'Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters.'], { identity: logIdentityText(r) });
+  journal.append('export', { what: 'log .param', file: r.file, rows: r.rows.map(x => ({ name: x.name, value: x.value })), errors: out.errors, warnings: out.warnings });
+  return out;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -224,16 +246,17 @@ const server = http.createServer(async (req, res) => {
         case '/api/pause': tuner.pause('paused by user'); return json(res, 200, { ok: true });
         case '/api/resume': tuner.resume(); return json(res, 200, { ok: true });
         case '/api/stop': await tuner.stop(); return json(res, 200, { ok: true });
-        case '/api/apply': { const ok = await tuner.applyProposal(body.axis); if (ok && tuner.state !== 'paused') tuner.resume(); return json(res, 200, { ok }); }
+        // the approval names the proposal it showed (id + hash): another proposal is not written (F-33)
+        case '/api/apply': { const ok = await tuner.applyProposal(body.axis, { id: body.id, hash: body.hash }); if (ok && tuner.state !== 'paused') tuner.resume(); return json(res, 200, { ok }); }
         case '/api/undo': await tuner.undoAxis(body.axis); return json(res, 200, { ok: true });
         case '/api/restore': await tuner.restoreOriginals(); return json(res, 200, { ok: true });
         case '/api/analyze': { const r = tuner.analyze(body.axis || tuner.currentAxis(), body.seconds || null); return json(res, 200, r); }
         // (no /api/setparam: arbitrary parameter writes are not offered, F-05)
         case '/api/presets': return json(res, 200, PRESETS);
         case '/api/notch/status': return json(res, 200, await notch.status());
-        case '/api/notch/esc': return json(res, 200, { ok: true, applied: await notch.applyEsc() });
+        case '/api/notch/esc': { const applied = await notch.applyEsc(); return json(res, 200, { ok: true, applied, rebootNeeded: notch.rebootNeeded() }); }
         case '/api/notch/fft/enable': return json(res, 200, Object.assign({ ok: true }, await notch.enableFft()));
-        case '/api/notch/reboot': return json(res, 200, Object.assign({ ok: true }, await notch.reboot()));
+        case '/api/notch/reboot': return json(res, 200, await notch.reboot());
         case '/api/notch/fft/start': return json(res, 200, Object.assign({ ok: true }, await notch.startFftTune()));
         case '/api/notch/fft/stop': return json(res, 200, Object.assign({ ok: true }, await notch.stopFftTune()));
         case '/api/flight/start': { setOpts(body); flight.start({ axes: tuner.opts.axes, preset: tuner.opts.preset, auto: !!body.auto, observeSeconds: tuner.opts.observeSeconds }); return json(res, 200, { ok: true, flight: flight.snapshot() }); }
@@ -256,8 +279,11 @@ const server = http.createServer(async (req, res) => {
           if (body.testUsb && body.testUsb.kind === 'tcp') ground.opts.usb = { kind: 'tcp', host: '127.0.0.1', port: parseInt(body.testUsb.port, 10), label: 'test TCP ' + body.testUsb.port };
           await ground.goUsb({ useSaved: !!body.useSaved }); return json(res, 200, { ok: true });
         }
-        case '/api/ground/write': return json(res, 200, { ok: true, results: await ground.write(Array.isArray(body.names) ? body.names : []) });
+        case '/api/ground/write': return json(res, 200, { ok: true, results: await ground.write(Array.isArray(body.names) ? body.names : [], { id: body.id, hash: body.hash }) });
         case '/api/ground/undo': await ground.undo(); return json(res, 200, { ok: true });
+        case '/api/ground/recheck': await ground.recheck(); return json(res, 200, { ok: true });
+        case '/api/ground/reboot': return json(res, 200, Object.assign({ ok: true }, await ground.rebootNow()));
+        case '/api/journal': return json(res, 200, Object.assign({ entries: journal.recent.slice(-200) }, journal.status()));
         case '/api/ground/stop': ground.stop(); return json(res, 200, { ok: true });
         case '/api/ground/result': return json(res, 200, ground.result || {});
         case '/api/ground/state': return json(res, 200, ground.snapshot());
@@ -267,23 +293,23 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="${path.basename(fp)}"` }); return fs.createReadStream(fp).pipe(res);
         }
         case '/api/live/rows': return json(res, 200, { family: tuner.family, rows: liveRows(), journal: tuner.journal });
-        case '/api/live/param': { const rows = liveRows(); const txt = paramFile(rows, [`Live session gains read from the vehicle on ${new Date().toLocaleString()}`]); res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Disposition': 'attachment; filename="AP Tuner live gains.param"' }); return res.end(txt); }
+        case '/api/live/param': { const out = liveParamFile(); res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Disposition': 'attachment; filename="AP Tuner live gains.param"' }); return res.end(out.text); }
         case '/api/log/list': return json(res, 200, listLogs());
-        case '/api/log/analyze': { if (!body.path || !fs.existsSync(body.path)) return json(res, 400, { error: 'file not found: ' + body.path }); lastLogResult = analyzeLog(body.path, { preset: body.preset || 'normal', family: body.family || null }); lastLogResult.rows = proposalRows(lastLogResult.family, lastLogResult.axes, lastLogResult.noise); return json(res, 200, lastLogResult); }
+        case '/api/log/analyze': { if (!body.path || !fs.existsSync(body.path)) return json(res, 400, { error: 'file not found: ' + body.path }); lastLogResult = analyzeLog(body.path, { preset: body.preset || 'normal', family: body.family || null }); addLogRows(lastLogResult); return json(res, 200, lastLogResult); }
         case '/api/log/upload': {
           const name = (url.searchParams.get('name') || 'upload.bin').replace(/[^\w .()-]/g, '_');
           const dir = path.join(SESSIONS, 'uploads'); fs.mkdirSync(dir, { recursive: true });
           const file = path.join(dir, name); fs.writeFileSync(file, await readRaw(req));
           lastLogResult = analyzeLog(file, { preset: url.searchParams.get('preset') || 'normal', family: url.searchParams.get('family') || null });
-          lastLogResult.rows = proposalRows(lastLogResult.family, lastLogResult.axes, lastLogResult.noise);
+          addLogRows(lastLogResult);
           return json(res, 200, lastLogResult);
         }
         case '/api/log/param': {
           if (!lastLogResult) return json(res, 400, { error: 'analyse a log first' });
-          const txt = paramFile(lastLogResult.rows, [`From log ${path.basename(lastLogResult.file)} (${lastLogResult.firmware || ''}), ${lastLogResult.family}, preset ${Object.values(lastLogResult.axes).find(a => a && a.preset)?.preset || 'normal'}`, 'Fly carefully after loading: one axis at a time, ready to switch back to your previous parameters.']);
+          const pf = logParamFile(lastLogResult);
           const fname = path.basename(lastLogResult.file).replace(/\.bin$/i, '') + ' - AP Tuner.param';
-          if (url.searchParams.get('save') === '1') { const out = lastLogResult.file.replace(/\.bin$/i, '') + ' - AP Tuner.param'; fs.writeFileSync(out, txt); return json(res, 200, { ok: true, file: out }); }
-          res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Disposition': `attachment; filename="${fname}"` }); return res.end(txt);
+          if (url.searchParams.get('save') === '1') { const out = lastLogResult.file.replace(/\.bin$/i, '') + ' - AP Tuner.param'; fs.writeFileSync(out, pf.text); return json(res, 200, { ok: true, file: out, errors: pf.errors, warnings: pf.warnings }); }
+          res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Disposition': `attachment; filename="${fname}"` }); return res.end(pf.text);
         }
         default: return json(res, 404, { error: 'unknown api' });
       }
@@ -304,6 +330,13 @@ const server = http.createServer(async (req, res) => {
     json(res, 500, { error: e.message });
   }
 });
+
+/** the proposed rows of a log analysis, with the value in the log and what the file checks found */
+function addLogRows(r) {
+  r.rows = proposalRows(r.family, r.axes, r.noise, r.params);
+  const pf = paramFileChecked(r.rows, [], {});
+  r.paramChecks = { errors: pf.errors, warnings: pf.warnings };
+}
 
 const SIZE_OSC = { small: 5, medium: 5, large: 3, heavy: 1.5 };
 function sanitizeOpts(b) {

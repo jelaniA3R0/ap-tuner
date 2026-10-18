@@ -4,7 +4,12 @@
 //     an FFT-capable board such as the Cube Orange / H7 class);
 //  2) ESC RPM telemetry: when the ESCs report RPM, the notch can simply track them (mode 3);
 //  3) otherwise: the log route (raw gyro logging + Log tab).
+// Values that act only after a reboot (INS_HNTCH_REF / HMNCS / OPTS, FFT_ENABLE) are written on the ground only;
+// the reboot is then done through the app and every value is read again after it (2026-10-17 audit F-35).
 'use strict';
+const { rebootAndVerify } = require('./paramwrite');
+const { isRebootRequired } = require('../model/parammeta');
+const { sameF32 } = require('./identity');
 const NOTCH_PARAMS = ['INS_HNTCH_ENABLE', 'INS_HNTCH_MODE', 'INS_HNTCH_FREQ', 'INS_HNTCH_BW', 'INS_HNTCH_ATT', 'INS_HNTCH_REF', 'INS_HNTCH_HMNCS', 'INS_HNTCH_OPTS', 'INS_HNTCH_FM_RAT', 'INS_GYRO_FILTER', 'FFT_ENABLE', 'FFT_MINHZ', 'FFT_MAXHZ'];
 const AUX_FFT_NOTCH_TUNE = 162;
 
@@ -38,7 +43,8 @@ class NotchLive {
       current: Object.fromEntries(NOTCH_PARAMS.map(k => [k, p[k]])),
       fftCapable, fftEnabled: fftCapable && p.FFT_ENABLE > 0,
       escTelemetry: this.esc.seen && now - this.esc.lastTs < 20000, escRpm,
-      notchActive: p.INS_HNTCH_ENABLE > 0, mode: p.INS_HNTCH_MODE | 0,
+      notchActive: p.INS_HNTCH_ENABLE > 0 && !this.rebootNeeded().some(n => /^INS_HNTCH_/.test(n)), mode: p.INS_HNTCH_MODE | 0,
+      rebootPending: this.rebootNeeded(),
       armed: !!this.link.vehicle?.armed,
       messages: this.fftMessages.slice(-8),
       options: [],
@@ -54,7 +60,15 @@ class NotchLive {
     return out;
   }
 
-  /** apply the ESC-telemetry notch (in flight: watched on every axis and reverted if the vehicle starts to oscillate) */
+  /** names written on the ground that take effect only after a reboot */
+  rebootNeeded() { return (this.tuner.rebootPending || []).map(p => p.name); }
+  /** the values of a change that act only after a reboot and differ from what the vehicle holds */
+  rebootOnly(values) { return Object.keys(values).filter(k => isRebootRequired(k) && !sameF32(this.tuner.params[k], values[k])); }
+
+  /**
+   * apply the ESC-telemetry notch (in flight: watched on every axis and reverted if the vehicle starts to oscillate;
+   * values that act only after a reboot are refused in flight: set the notch on the ground, then reboot)
+   */
   async applyEsc() {
     const st = await this.status();
     if (!st.escProposal) throw new Error('no ESC RPM telemetry seen in the last 20 s');
@@ -63,19 +77,26 @@ class NotchLive {
     return st.escProposal;
   }
 
-  /** set FFT_ENABLE = 1 (takes effect after a reboot) */
+  /** set FFT_ENABLE = 1 on the ground (takes effect after a reboot: the reboot workflow checks it) */
   async enableFft() {
     const held = await this.tuner.applyFilterChange({ FFT_ENABLE: 1 }, 'notch: enable in-flight FFT');
     if (!held) throw Object.assign(new Error('FFT_ENABLE was not kept: ' + (this.tuner.stateInfo || 'see the messages')), { code: 'reverted' });
     return { FFT_ENABLE: this.tuner.params.FFT_ENABLE, rebootNeeded: true };
   }
 
-  /** reboot the autopilot (refused while armed) */
+  /**
+   * reboot the autopilot (refused while armed) and check it: it must come back as the same vehicle and every value
+   * written on the ground that waits for the reboot is read again ({ok, reason, rows})
+   */
   async reboot() {
     if (!this.link.alive) throw new Error('no vehicle heartbeat: connect first');
     if (this.link.vehicle?.armed) throw new Error('refusing to reboot an armed vehicle');
-    const r = await this.link.commandAck(246, [1]).catch(() => ({ result: -1 }));
-    return { sent: true, result: r.result };
+    if (this.tuner.writing) throw new Error(`a change is being written (${this.tuner.writing}): wait until it has finished`);
+    const expect = (this.tuner.rebootPending || []).map(p => ({ name: p.name, value: p.value }));
+    const res = await rebootAndVerify(this.link, expect, { journal: (k, d) => this.tuner.audit.append(k, d), ctx: { via: 'notch panel' } });
+    if (res.ok) this.tuner.rebootPending = [];
+    this.tuner.log('tuner', res.ok ? (expect.length ? 'rebooted: ' + expect.map(e => e.name).join(', ') + ' read back after the reboot' : 'rebooted') : 'reboot: ' + res.reason);
+    return { ok: res.ok, reason: res.reason, rows: res.rows, rebooted: res.rebooted };
   }
 
   /** start the in-flight FFT notch tune (vehicle must hover steadily for ~30 s) */
@@ -88,9 +109,11 @@ class NotchLive {
     if (st.mode !== 1) want.INS_HNTCH_MODE = 1;
     if (Object.keys(want).length && !(await this.tuner.applyFilterChange(want, 'notch: throttle tracking for the FFT tune'))) throw Object.assign(new Error('the notch was not kept: ' + (this.tuner.stateInfo || 'see the messages')), { code: 'reverted' });
     this.fftMessages = [];
+    const before = Object.fromEntries(NOTCH_PARAMS.map(k => [k, this.tuner.params[k]]));
     const r = await this.link.commandAck(218, [AUX_FFT_NOTCH_TUNE, 2]).catch(() => ({ result: -1 }));
     if (r.result !== 0) throw new Error('the autopilot did not accept the FFT tune command (result ' + r.result + '); firmware may lack the GyroFFT feature');
-    this.tune = { startedAt: Date.now(), done: false };
+    this.tune = { startedAt: Date.now(), done: false, before };
+    this.tuner.expectExternal = 'written by the autopilot FFT notch tune';
     return { started: true };
   }
 
@@ -98,12 +121,17 @@ class NotchLive {
   async stopFftTune() {
     const r = await this.link.commandAck(218, [AUX_FFT_NOTCH_TUNE, 0]).catch(() => ({ result: -1 }));
     await new Promise(res => setTimeout(res, 2500));
-    const before = Object.assign({}, this.tuner.params);
+    // compared with the values from before the tune (the cache follows the vehicle's own announcements)
+    const before = Object.assign({}, this.tuner.params, (this.tune && this.tune.before) || {});
     const got = await this.link.requestParams(NOTCH_PARAMS, 3);
+    this.tuner.expectExternal = null;
     Object.assign(this.tuner.params, got);
     const changed = {};
     for (const k of NOTCH_PARAMS) if (got[k] !== undefined && got[k] !== before[k]) changed[k] = { from: before[k], to: got[k] };
-    for (const [k, c] of Object.entries(changed)) this.tuner.journal.push({ t: Date.now(), name: k, from: c.from, to: c.to, reason: 'written by the autopilot FFT notch tune', armed: !!this.link.vehicle?.armed });
+    for (const [k, c] of Object.entries(changed)) {
+      const e = { t: Date.now(), name: k, from: c.from, to: c.to, reason: 'written by the autopilot FFT notch tune', armed: !!this.link.vehicle?.armed, status: 'by the autopilot' };
+      this.tuner.journal.push(e); this.tuner.audit.append('write', Object.assign({ by: 'autopilot', identity: this.tuner.identity ? this.tuner.identity.key : null }, e));
+    }
     this.tuner.saveSession();
     this.tune = { done: true, result: r.result, changed, messages: this.fftMessages.slice(-8) };
     // what the autopilot wrote in flight is watched like the app's own changes (reverted on a trip)

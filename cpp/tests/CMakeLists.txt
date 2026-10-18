@@ -8,14 +8,17 @@ add_executable(aptuner-tests
   test_io.cpp
   test_liveaxis.cpp
   test_live_safety.cpp
+  test_write_verify.cpp
   test_server_gate.cpp
 )
 target_link_libraries(aptuner-tests PRIVATE aptuner_app)
 target_compile_definitions(aptuner-tests PRIVATE APTUNER_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
 
-add_test(NAME unit COMMAND aptuner-tests -live_)
+add_test(NAME unit COMMAND aptuner-tests -live_ -wv_)
 # the in-flight safety scenarios on a fake vehicle (about a minute: real-time watches)
 add_test(NAME live_safety COMMAND aptuner-tests live_)
+# verified writes bound to the right aircraft (audit R3) on fake vehicles (real-time: about two minutes)
+add_test(NAME write_verify COMMAND aptuner-tests wv_)
 # the programs start and report their version
 add_test(NAME analyze_version COMMAND aptuner-analyze --version)
 add_test(NAME app_version COMMAND aptuner --version)

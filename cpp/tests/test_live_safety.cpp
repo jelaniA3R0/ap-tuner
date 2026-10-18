@@ -85,7 +85,8 @@ Rig setup(bool armed, bool inFlight, const Json& opts = Json::object(), std::map
   fv->attach(*link);
   auto* tuner = new Tuner(*link, sessDir());
   tuner->opts.set("inFlightWrites", inFlight);
-  for (const auto& [k, v] : Json::obj({{"watchSeconds", 0.6}, {"watchGrace", 0.2}, {"filterWatchSeconds", 1.0}, {"revertStepSeconds", 0.1}, {"calmWaitSeconds", 0.5}}).items())
+  const Json fast = Json::obj({{"watchSeconds", 0.6}, {"watchGrace", 0.2}, {"filterWatchSeconds", 1.0}, {"revertStepSeconds", 0.1}, {"calmWaitSeconds", 0.5}});
+  for (const auto& [k, v] : fast.items())
     tuner->opts.set(k, v);
   for (const auto& [k, v] : opts.items()) tuner->opts.set(k, v);
   tuner->startMonitor();
@@ -113,6 +114,12 @@ void propose(Tuner& t, const std::string& axis, const Json& changes) {
     list.push(Json::obj({{"key", k}, {"from", cur[k]}, {"to", v}, {"pct", 100 * (v.num() / cur[k].num() - 1)}}));
   }
   t.results.set(axis, Json::obj({{"axis", axis}, {"at", rt::Loop::now()}, {"proposal", Json::obj({{"gains", gains}, {"changes", list}})}}));
+  t.bindProposal(axis, t.results.at(axis).at("proposal"));   // id + hash, as an analysis does
+}
+/** the approval the page sends back: the id and hash of the proposal it shows */
+Json approve(Tuner& t, const std::string& axis) {
+  const Json& p = t.results[axis]["proposal"];
+  return Json::obj({{"id", p["id"]}, {"hash", p["hash"]}});
 }
 /** largest ratio between consecutive values written to the same parameter (and from its value before) */
 double maxWriteRatio(const FakeVehicle& fv, std::map<std::string, double> last) {
@@ -125,7 +132,7 @@ double maxWriteRatio(const FakeVehicle& fv, std::map<std::string, double> last) 
   return worst;
 }
 bool apply(Rig& r, const std::string& axis) {
-  auto f = r.tuner->applyProposal(axis).future();
+  auto f = r.tuner->applyProposal(axis, approve(*r.tuner, axis)).future();
   CHECK(settle(f));
   CHECK(errorOf(f).empty());
   return f.ready() && !f.error() && f.get();
@@ -149,7 +156,7 @@ TEST(live_r0_armed_without_optin_writes_nothing) {
   Rig r = setup(true, false);
   const std::size_t n0 = r.fv->sets.size();
   propose(*r.tuner, "roll", Json::obj({{"P", 0.16}, {"I", 0.16}}));
-  auto a = r.tuner->applyProposal("roll").future();
+  auto a = r.tuner->applyProposal("roll", approve(*r.tuner, "roll")).future();
   settle(a);
   CHECK(errorOf(a) == app::kInFlightOff);   // Advanced Apply while armed
   auto b = r.tuner->applyFilterChange(Json::obj({{"INS_HNTCH_ENABLE", 1}}), "test").future();
@@ -284,7 +291,10 @@ TEST(live_f02_no_trip_on_calm_or_short_bursts) {
 // ---------------- F-01: the in-flight notch change
 
 TEST(live_f01_notch_change_reverted_and_paused_within_5s) {
-  Rig r = setup(true, true);
+  // INS_HNTCH_REF already 1 (set earlier on the ground): in flight only values that act at once are written (F-35)
+  auto p = test::copterParams();
+  p["INS_HNTCH_REF"] = 1;
+  Rig r = setup(true, true, Json::object(), p);
   auto* notch = new app::NotchLive(*r.link, *r.tuner);
   r.fv->escRpm = 6000;
   runFor(500);
@@ -457,9 +467,9 @@ TEST(live_f92_second_apply_refused_and_resume_refused) {
   Rig r = setup(true, true);
   propose(*r.tuner, "roll", Json::obj({{"P", 0.16}, {"I", 0.16}}));
   propose(*r.tuner, "pitch", Json::obj({{"P", 0.16}, {"I", 0.16}}));
-  auto a = r.tuner->applyProposal("roll").future();
+  auto a = r.tuner->applyProposal("roll", approve(*r.tuner, "roll")).future();
   runFor(50);
-  auto b = r.tuner->applyProposal("pitch").future();
+  auto b = r.tuner->applyProposal("pitch", approve(*r.tuner, "pitch")).future();
   settle(b);
   CHECK(has(errorOf(b), "another change is being written"));
   CHECK(threwWith([&] { r.tuner->resume(); }, "still being written"));
@@ -494,7 +504,7 @@ TEST(live_f31_pause_cancels_param_set_retries) {
   Rig r = setup(true, true);
   propose(*r.tuner, "roll", Json::obj({{"P", 0.16}, {"I", 0.16}}));
   r.fv->ignoreSets = true;   // the vehicle does not answer: the link would retry every 1.5 s
-  auto a = r.tuner->applyProposal("roll").future();
+  auto a = r.tuner->applyProposal("roll", approve(*r.tuner, "roll")).future();
   runFor(300);
   r.tuner->pause("paused by user");
   CHECK(settle(a) && errorOf(a).empty() && !a.get());

@@ -57,7 +57,7 @@ function req(port, method, p, { host, headers = {}, body } = {}) {
     });
     await check('localhost:port is accepted as Host', async () => { assert.strictEqual((await req(port, 'GET', '/api/presets', { host: `localhost:${port}` })).status, 200); });
     await check('read-only routes answer GET without a token', async () => { assert.strictEqual((await req(port, 'GET', '/api/presets')).status, 200); assert.strictEqual((await req(port, 'GET', '/api/live/rows')).status, 200); });
-    for (const route of ['/api/pause', '/api/restore', '/api/flight/continue', '/api/notch/esc', '/api/notch/reboot', '/api/start', '/api/resume', '/api/apply', '/api/options', '/api/ground/write']) {
+    for (const route of ['/api/pause', '/api/restore', '/api/flight/continue', '/api/notch/esc', '/api/notch/reboot', '/api/start', '/api/resume', '/api/apply', '/api/options', '/api/ground/write', '/api/ground/recheck', '/api/ground/reboot', '/api/ground/undo']) {
       await check(`GET ${route} -> 405`, async () => { const r = await req(port, 'GET', route); assert.strictEqual(r.status, 405, `status ${r.status}`); });
     }
     await check('GET /api/log/param?save=1 (writes a file) -> 405', async () => { assert.strictEqual((await req(port, 'GET', '/api/log/param?save=1')).status, 405); });

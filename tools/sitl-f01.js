@@ -30,7 +30,9 @@ async function waitSnap(pred, ms, what) {
 (async () => {
   if (fs.existsSync(RUN)) fs.rmSync(RUN, { recursive: true, force: true }); fs.mkdirSync(RUN, { recursive: true });
   const defaults = path.join(RUN, 'f01.parm');
-  fs.writeFileSync(defaults, fs.readFileSync(path.join(SITL, 'demo-quad.parm'), 'utf8') + '\n# F-01 regression: the pitch gains of the audit run, no notch\nATC_RAT_PIT_P 0.18\nATC_RAT_PIT_I 0.18\nATC_RAT_PIT_D 0.0057\nATC_ANG_PIT_P 12\nINS_HNTCH_ENABLE 0\n');
+  // INS_HNTCH_REF acts only after a reboot, so the app never writes it in flight (R3, F-35): the quad starts with
+  // REF 1 as after a notch set up on the ground, and the in-flight change switches the notch on (ENABLE, MODE, FREQ)
+  fs.writeFileSync(defaults, fs.readFileSync(path.join(SITL, 'demo-quad.parm'), 'utf8') + '\n# F-01 regression: the pitch gains of the audit run, no notch\nATC_RAT_PIT_P 0.18\nATC_RAT_PIT_I 0.18\nATC_RAT_PIT_D 0.0057\nATC_ANG_PIT_P 12\nINS_HNTCH_ENABLE 0\nINS_HNTCH_REF 1\n');
   await getToken();
   const sitl = spawn(path.join(SITL, 'ArduCopter.exe'), ['--model', 'quad', '--speedup', '1', '--home', '-35.363261,149.165230,584,353', '--defaults', defaults], { cwd: RUN, stdio: ['ignore', fs.openSync(path.join(RUN, 'sitl.log'), 'a'), fs.openSync(path.join(RUN, 'sitl.log'), 'a')], windowsHide: true });
   await sleep(2000);

@@ -1,5 +1,5 @@
 // Generates defs.json (message layouts + crc_extra + enums) from the MAVLink XML dialects.
-// Run once:  node src/mavlink/gen.js <dir with minimal.xml common.xml ardupilotmega.xml>
+// Run once:  node src/mavlink/gen.js <dir with minimal.xml standard.xml common.xml ardupilotmega.xml>
 // No dependencies: a small regex-based XML walk is enough for the MAVLink schema.
 'use strict';
 const fs = require('fs');
@@ -24,6 +24,9 @@ function parseType(t) {
 }
 
 function parseXml(text) {
+  // comments first: newer common.xml keeps commented-out message headers ('<!-- <message id="148" ...> in standard.xml -->')
+  // that a regex walk would otherwise read as real messages (AUTOPILOT_VERSION came out with LANDING_TARGET's fields)
+  text = text.replace(/<!--[\s\S]*?-->/g, '');
   const messages = [];
   const enums = {};
   const msgRe = /<message\s+id="(\d+)"\s+name="([A-Z0-9_]+)"[^>]*>([\s\S]*?)<\/message>/g;
@@ -82,7 +85,7 @@ function main() {
   const dir = process.argv[2];
   if (!dir) { console.error('usage: node gen.js <xml dir>'); process.exit(1); }
   const all = { messages: {}, byName: {}, enums: {} };
-  for (const file of ['minimal.xml', 'common.xml', 'ardupilotmega.xml']) {
+  for (const file of ['minimal.xml', 'standard.xml', 'common.xml', 'ardupilotmega.xml']) {
     const p = path.join(dir, file);
     if (!fs.existsSync(p)) continue;
     const { messages, enums } = parseXml(fs.readFileSync(p, 'utf8'));
@@ -96,7 +99,7 @@ function main() {
   const out = path.join(__dirname, 'defs.json');
   fs.writeFileSync(out, JSON.stringify(all));
   const n = Object.keys(all.messages).length;
-  const check = ['HEARTBEAT', 'ATTITUDE', 'PARAM_VALUE', 'PID_TUNING', 'STATUSTEXT', 'RAW_IMU', 'COMMAND_LONG', 'VFR_HUD'];
+  const check = ['HEARTBEAT', 'ATTITUDE', 'PARAM_VALUE', 'PID_TUNING', 'STATUSTEXT', 'RAW_IMU', 'COMMAND_LONG', 'VFR_HUD', 'AUTOPILOT_VERSION', 'LANDING_TARGET'];
   console.log(`wrote ${out}: ${n} messages, ${Object.keys(all.enums).length} enums`);
   for (const c of check) { const m = all.messages[all.byName[c]]; console.log(`  ${c} id=${m.id} crc_extra=${m.crcExtra} len=${m.length}`); }
 }

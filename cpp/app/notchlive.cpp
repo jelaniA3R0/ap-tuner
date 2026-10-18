@@ -3,7 +3,10 @@
 #include <cmath>
 
 #include "aptuner/core/jsnum.hpp"
+#include "aptuner/core/parammeta.hpp"
+#include "aptuner/engine/identity.hpp"
 #include "aptuner/engine/vehicle.hpp"
+#include "paramwrite.hpp"
 
 namespace aptuner::app {
 
@@ -52,6 +55,19 @@ void NotchLive::onEsc(const Json& f) {
   if (rpm_.size() > 600) rpm_.erase(rpm_.begin());
 }
 
+Json NotchLive::rebootNeeded() const {
+  Json out = Json::array();
+  for (const auto& p : tuner_.rebootPending.arr()) out.push(p["name"]);
+  return out;
+}
+
+std::vector<std::string> NotchLive::rebootOnly(const Json& values) const {
+  std::vector<std::string> out;
+  for (const auto& [k, v] : values.items())
+    if (core::isRebootRequired(k) && !engine::sameF32(tuner_.params[k], v)) out.push_back(k);
+  return out;
+}
+
 rt::Task<Json> NotchLive::status() {
   const Json got = co_await link_.requestParams(kNotchParams, 3);
   for (const auto& [k, v] : got.items()) tuner_.params.set(k, v);
@@ -69,13 +85,18 @@ rt::Task<Json> NotchLive::status() {
   Json current = Json::object();
   for (const auto& k : kNotchParams) current.set(k, p[k]);
   const bool escTel = escSeen_ && now - escLastTs_ < 20000;
+  bool notchPending = false;
+  const Json pendingNames = rebootNeeded();
+  for (const auto& n : pendingNames.arr())
+    if (n.strOr("").rfind("INS_HNTCH_", 0) == 0) notchPending = true;
   Json out = Json::obj({{"current", current},
                         {"fftCapable", fftCapable},
                         {"fftEnabled", fftCapable && jv(p, "FFT_ENABLE") > 0},
                         {"escTelemetry", escTel},
                         {"escRpm", escRpm},
-                        {"notchActive", jv(p, "INS_HNTCH_ENABLE") > 0},
+                        {"notchActive", jv(p, "INS_HNTCH_ENABLE") > 0 && !notchPending},
                         {"mode", static_cast<int>(p["INS_HNTCH_MODE"].numOr(0))},
+                        {"rebootPending", rebootNeeded()},
                         {"armed", link_.vehicle()["armed"].asBool()},
                         {"messages", lastN(fftMessages_, 8)},
                         {"options", Json::array()}});
@@ -115,15 +136,22 @@ rt::Task<Json> NotchLive::enableFft() {
 }
 
 rt::Task<Json> NotchLive::reboot() {
+  // reboot the autopilot (refused while armed) and check it: it must come back as the same vehicle and every value
+  // written on the ground that waits for the reboot is read again
   if (!link_.alive()) throw rt::Error("no vehicle heartbeat: connect first");
   if (link_.vehicle()["armed"].asBool()) throw rt::Error("refusing to reboot an armed vehicle");
-  Json r;
-  try {
-    r = co_await link_.commandAck(246, {1});
-  } catch (const std::exception&) {
-    r = Json::obj({{"result", -1}});
-  }
-  co_return Json::obj({{"sent", true}, {"result", r["result"]}});
+  if (!tuner_.writing().empty()) throw rt::Error("a change is being written (" + tuner_.writing() + "): wait until it has finished");
+  Json expect = Json::array();
+  for (const auto& p : tuner_.rebootPending.arr()) expect.push(Json::obj({{"name", p["name"]}, {"value", p["value"]}}));
+  RebootOpts ro;
+  ro.journal = [this](const std::string& k, const Json& d) { tuner_.audit().append(k, d); };
+  ro.ctx = Json::obj({{"via", "notch panel"}});
+  const Json res = co_await rebootAndVerify(link_, expect, ro);
+  if (res["ok"].asBool()) tuner_.rebootPending = Json::array();
+  std::string names;
+  for (const auto& e : expect.arr()) names += (names.empty() ? "" : ", ") + e["name"].str();
+  tuner_.log("tuner", res["ok"].asBool() ? (expect.size() ? "rebooted: " + names + " read back after the reboot" : std::string("rebooted")) : "reboot: " + res["reason"].strOr(""));
+  co_return Json::obj({{"ok", res["ok"]}, {"reason", res["reason"]}, {"rows", res["rows"]}, {"rebooted", res["rebooted"]}});
 }
 
 rt::Task<Json> NotchLive::startFftTune() {
@@ -136,6 +164,8 @@ rt::Task<Json> NotchLive::startFftTune() {
   if (want.size() && !(co_await tuner_.applyFilterChange(want, "notch: throttle tracking for the FFT tune")))
     throw rt::Error("the notch was not kept: " + (tuner_.stateInfo.empty() ? std::string("see the messages") : tuner_.stateInfo), "reverted");
   fftMessages_ = Json::array();
+  Json before = Json::object();
+  for (const auto& k : kNotchParams) before.set(k, tuner_.params[k]);
   Json r;
   try {
     r = co_await link_.commandAck(218, {static_cast<double>(kAuxFftNotchTune), 2});
@@ -145,7 +175,8 @@ rt::Task<Json> NotchLive::startFftTune() {
   if (r["result"].numOr(-1) != 0)
     throw rt::Error("the autopilot did not accept the FFT tune command (result " + core::jsToString(r["result"].numOr(-1)) +
                     "); firmware may lack the GyroFFT feature");
-  tune_ = Json::obj({{"startedAt", Loop::now()}, {"done", false}});
+  tune_ = Json::obj({{"startedAt", Loop::now()}, {"done", false}, {"before", before}});
+  tuner_.expectExternal = "written by the autopilot FFT notch tune";
   co_return Json::obj({{"started", true}});
 }
 
@@ -157,15 +188,24 @@ rt::Task<Json> NotchLive::stopFftTune() {
     r = Json::obj({{"result", -1}});
   }
   co_await rt::sleep(2500);
-  const Json before = tuner_.params;
+  // compared with the values from before the tune (the cache follows the vehicle's own announcements)
+  Json before = tuner_.params;
+  if (tune_["before"].isObject())
+    for (const auto& [k, v] : tune_["before"].items()) before.set(k, v);
   const Json got = co_await link_.requestParams(kNotchParams, 3);
+  tuner_.expectExternal.clear();
   for (const auto& [k, v] : got.items()) tuner_.params.set(k, v);
   Json changed = Json::object();
   for (const auto& k : kNotchParams)
     if (got[k].isNumber() && !(got[k] == before[k])) changed.set(k, Json::obj({{"from", before[k]}, {"to", got[k]}}));
-  for (const auto& [k, c] : changed.items())
-    tuner_.journal.push(Json::obj({{"t", Loop::now()}, {"name", k}, {"from", c["from"]}, {"to", c["to"]}, {"reason", "written by the autopilot FFT notch tune"},
-                                   {"armed", link_.vehicle()["armed"].asBool()}}));
+  for (const auto& [k, c] : changed.items()) {
+    const Json e = Json::obj({{"t", Loop::now()}, {"name", k}, {"from", c["from"]}, {"to", c["to"]}, {"reason", "written by the autopilot FFT notch tune"},
+                              {"armed", link_.vehicle()["armed"].asBool()}, {"status", "by the autopilot"}});
+    tuner_.journal.push(e);
+    Json ev = Json::obj({{"by", "autopilot"}, {"identity", tuner_.identity.isObject() ? tuner_.identity["key"] : Json()}});
+    for (const auto& [kk, v] : e.items()) ev.set(kk, v);
+    tuner_.audit().append("write", ev);
+  }
   tuner_.saveSession();
   const Json msgs = lastN(fftMessages_, 8);
   tune_ = Json::obj({{"done", true}, {"result", r["result"]}, {"changed", changed}, {"messages", msgs}});

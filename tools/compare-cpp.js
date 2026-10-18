@@ -7,6 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const { execFileSync } = require('child_process');
 const { analyzeLog } = require('../src/engine/loganalysis');
+const { proposalRows, paramFileChecked, logIdentityText } = require('../src/engine/report');
 
 const exe = path.join(__dirname, '..', 'cpp', 'build', 'release', 'cli', process.platform === 'win32' ? 'aptuner-analyze.exe' : 'aptuner-analyze');
 const REL = parseFloat(process.env.REL || '1e-6');
@@ -45,16 +46,25 @@ function cmp(a, b, p, out) {
 
 for (const file of process.argv.slice(2)) {
   const tmp = path.join(os.tmpdir(), 'aptuner-cpp-' + process.pid + '.json');
+  const tmpParam = path.join(os.tmpdir(), 'aptuner-cpp-' + process.pid + '.param');
+  try { fs.unlinkSync(tmpParam); } catch (e) { /* none */ }
   const t0 = Date.now();
   const js = JSON.parse(JSON.stringify(analyzeLog(file, {})));
   const tJs = Date.now() - t0;
   const t1 = Date.now();
   // exit code 3: the file was refused (not a DataFlash log); the result is still written and compared
-  try { execFileSync(exe, [file, '--json', tmp], { stdio: ['ignore', 'ignore', 'inherit'] }); } catch (e) { if (e.status !== 3) throw e; }
+  try { execFileSync(exe, [file, '--json', tmp, '--param', tmpParam], { stdio: ['ignore', 'ignore', 'inherit'] }); } catch (e) { if (e.status !== 3) throw e; }
   const tCpp = Date.now() - t1;
   const cpp = JSON.parse(fs.readFileSync(tmp, 'utf8')); fs.unlinkSync(tmp);
   delete js.counts; delete cpp.counts;   // key order only (same values)
   const out = []; cmp(js, cpp, '', out);
+  // the checked .param export (F-43): the same text, byte for byte
+  if (!js.error) {
+    const jsParam = paramFileChecked(proposalRows(js.family, js.axes, js.noise, js.params), ['from ' + file], { identity: logIdentityText(js) }).text;
+    const cppParam = fs.existsSync(tmpParam) ? fs.readFileSync(tmpParam, 'utf8') : null;
+    if (cppParam !== jsParam) out.push(`.param export: ${cppParam === null ? 'C++ wrote none' : 'texts differ'}`);
+    try { fs.unlinkSync(tmpParam); } catch (e) { /* none */ }
+  }
   total += out.length;
   console.log(`\n## ${path.basename(file)}: ${out.length ? out.length + ' difference(s)' : 'identical'}  (JS ${tJs} ms, C++ ${tCpp} ms incl. start-up)`);
   for (const o of out.slice(0, 60)) console.log('   ' + o);

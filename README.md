@@ -148,6 +148,31 @@ What protects the vehicle (2026-10-17 audit, R0 and R4):
   check), anything that changes something must be a POST with a random per-run token from the page, and text
   from logs or the vehicle is shown as text, never as HTML.
 
+How a value is written (2026-10-17 audit, R3):
+
+* **Only to the autopilot you are connected to.** The app talks to one ArduPilot autopilot and knows it by its
+  system id, its board ID and its firmware (shown on the Vehicle card). Answers from anything else on the link are
+  ignored and another vehicle is reported. A reconnect or another vehicle stops what was in progress, and the
+  changes worked out for the old connection have to be worked out again.
+* **Every value is checked.** The value is sent the way ArduPilot stores it (whole-number parameters rounded) and
+  the autopilot's answer must match exactly; without an answer, or with another value, it is read again. Each
+  row then says what the autopilot holds: written and read back, refused (it kept the old value), a different
+  value, or uncertain (no answer: check it before flying).
+* **A set is all or nothing.** The values are read again first (if one changed since you looked, nothing is
+  written), the UNDO file is saved before the first write, and if one value does not hold, the values already
+  written go back to their values from before (each one read back).
+* **Your OK is for the exact list you saw.** The dialog shows every value, why it changes, which ones act only
+  after a reboot, and the list's id and fingerprint; the app writes that list, to that vehicle, or nothing.
+* **Values that act only after a reboot** (notch reference, harmonics, options, the FFT switch) are never written
+  in flight. On the ground the app offers **Reboot** (disarmed only), waits for the autopilot to come back, checks
+  that it is the same one and reads every value again.
+* **The write journal** `sessions\journal\<start time>.jsonl` gets one line for every vehicle, proposal, OK,
+  write, roll-back, reboot and export, and is never rewritten. If it cannot be written (disk full), the app makes
+  no new change until it is restarted (it still undoes a change that made the vehicle oscillate).
+* **Parameter files** say which vehicle they are for on their first lines, keep every value exact for Mission
+  Planner and mark the values that act after a reboot; a value ArduPilot does not accept is left out with a note,
+  and a value outside the documented range gets a note.
+
 ## Testing without a vehicle (SITL)
 
 `sitl\run-sitl.cmd` starts an ArduCopter software-in-the-loop (Windows build from
@@ -159,9 +184,12 @@ axis with auto-apply, each step held under the watchdog, and the session journal
 Safety regression tests: `node tools/sitl-f01.js --port <app port>` repeats the audit's F-01 case (the notch
 switched on in flight with high pitch gains; the app must switch it back and pause within 5 s of the onset),
 `node tools/flight-demo.js --port <app port>` flies a whole guided session and lists every pause and trip, and
-`node tools/osc-episodes.js <log.BIN>` lists the sustained oscillations in the simulator's own log. Unit tests:
-`npm test` (JavaScript, including a fake vehicle with 26 safety scenarios, the API security checks and the
-page-escaping check) and `cpp\build.cmd` (C++, the same scenarios).
+`node tools/osc-episodes.js <log.BIN>` lists the sustained oscillations in the simulator's own log.
+`node tools/sitl-ground-write.js --cpp` writes on the ground to a fresh simulator, disarmed, in both editions:
+four gains written, read back and undone, a value the autopilot refuses, a whole-number value, and the notch
+with its reboot, Undo and second reboot (results in `sitl\run-ground-write\`). Unit tests: `npm test`
+(JavaScript, including fake vehicles with 26 safety and 41 write-verification scenarios, the API security
+checks and the page-escaping check) and `cpp\build.cmd` (C++, the same scenarios).
 
 ## Demonstrations
 
@@ -186,6 +214,8 @@ gain the app's model predicts (logs in `docs/validation/`, numbers in `docs/how-
   loop-shaping synthesis, tuning rules.
 * `src/engine` live axis buffers and watchdog, the tuning session state machine (with a
   QuikTune-style ramp fallback), live notch setup (ESC RPM / in-flight FFT), log analysis, notch
-  recommendation, parameter-file export.
+  recommendation, parameter-file export; `paramwrite.js` verified writes, transactions and the reboot
+  workflow, `identity.js` the vehicle identity and proposal fingerprints, `journal.js` the write journal.
+* `src/model/parammeta.js` parameter types, ranges and the values that act only after a reboot.
 * `web` the browser UI (uPlot for charts). `test` synthetic end-to-end test
   (`node test/synthetic.test.js`) and checks against real logs.

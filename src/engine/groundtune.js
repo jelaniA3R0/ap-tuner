@@ -4,6 +4,15 @@
 //   -> download (log head + the marked 30 s, at the autopilot's full logging rate) -> review (issues and
 //   proposed changes) -> write (on the ground, disarmed, each value read back) -> done (undo file kept).
 // Without telemetry the pilot can skip straight to USB; the longest hover in the log is used then.
+//
+// The write (2026-10-17 audit R3: F-25, F-30, F-32, F-33, F-35, F-39, F-43): the review shows every row with its
+// full name, the value in the log, the value on the autopilot now, the reason, the checks (type, range, enumeration)
+// and whether it needs a reboot; a row whose value on the autopilot is not the one in the log (the change was worked
+// out for other values), or from a log of another vehicle or firmware, cannot be written. The list is one proposal
+// (id + hash over the connection and the exact values); Write sends both back. The write is one transaction: every
+// value read fresh (a value changed since the review stops it), the UNDO file saved, each value written and verified
+// exactly; on a failure everything written goes back (verified) and the rest is reported honestly per row. Values that
+// act only after a reboot get the reboot workflow (verified after the reboot); Undo is verified value by value.
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -11,7 +20,11 @@ const EventEmitter = require('events');
 const { execFile } = require('child_process');
 const { LogDownloader } = require('../mavlink/logdl');
 const { analyzeLog } = require('./loganalysis');
-const { proposalRows, paramFile } = require('./report');
+const { proposalRows, paramFile, logVehicleCheck } = require('./report');
+const { validateParam } = require('../model/parammeta');
+const { runTransaction, rebootAndVerify, verifiedSet, writeText, txnText, CHANGED } = require('./paramwrite');
+const { sameF32, sessionIdentity, sameVehicle, identityText, makeProposal } = require('./identity');
+const { Journal } = require('./journal');
 const { axisIssues } = require('./issues');
 const { GOOD_MODES } = require('./flight');
 
@@ -30,8 +43,9 @@ function serialMap() {
 }
 
 class GroundTune extends EventEmitter {
-  constructor(link, { sessionsDir }) {
+  constructor(link, { sessionsDir, journal = null }) {
     super(); this.link = link; this.dir = path.join(sessionsDir, 'ground'); this.dl = new LogDownloader(link);
+    this.audit = journal || new Journal(path.join(sessionsDir, 'journal'));
     this.boot = { ms: null, at: 0 };
     link.on('message', m => { const f = m.fields; if (f && f.time_boot_ms !== undefined && m.compid === 1 && f.time_boot_ms > 0) { this.boot = { ms: f.time_boot_ms, at: Date.now() }; } });
     this.reset();
@@ -43,6 +57,7 @@ class GroundTune extends EventEmitter {
     this.opts = { axes: ['roll', 'pitch'], preset: 'normal', seconds: 30, usb: null };
     this.mark = null; this.captureStart = null; this._tFlying = 0; this.usb = null; this.progress = null; this.result = null; this.rows = [];
     this.writes = []; this.files = {}; this.notes = []; this.error = null; this.sysid = null; this._knownPorts = null; this._busy = new Set(); this._tried = new Set();
+    this.identity = null; this.proposal = null; this.logCheck = null; this.rebootPending = []; this.afterReboot = []; this.reboot = null; this.lastTxn = null;
     this.restoreMark();
   }
 
@@ -64,6 +79,7 @@ class GroundTune extends EventEmitter {
 
   start(opts = {}) {
     if (RUNNING.has(this.phase)) throw new Error('a session is already running');
+    if (this.phase === 'writing' || this.phase === 'rebooting') throw new Error('the app is writing to the autopilot: wait until it has finished');
     this.reset(); Object.assign(this.opts, opts);
     if (this.link.alive) {
       this.sysid = this.link.target.sysid;
@@ -192,55 +208,178 @@ class GroundTune extends EventEmitter {
     for (const ax of ['roll', 'pitch', 'yaw']) if (r.axes[ax] && !r.axes[ax].error) { try { r.axes[ax].issues = axisIssues(r.axes[ax], r.family); } catch (e) { r.axes[ax].issues = []; } }
     const chosen = new Set(m ? m.axes : this.opts.axes);
     const axes = Object.fromEntries(Object.entries(r.axes).filter(([ax]) => chosen.has(ax)));
-    this.rows = proposalRows(r.family, axes, r.noise);
+    this.rows = proposalRows(r.family, axes, r.noise, r.params);
     this.result = r; this.result.chosenAxes = [...chosen];
-    // current values on the vehicle (the log holds the values at the time of the flight)
-    for (const row of this.rows) { try { row.vehicle = await this.link.requestParam(row.name, 1200, 2); } catch (e) { row.vehicle = undefined; } }
+    await this._review();
     this.setPhase('review', this.rows.length ? `${this.rows.length} change(s) proposed: check them, then press Write to the autopilot` : 'no change proposed: see the issues per axis');
   }
 
-  /** write the chosen rows on the ground; saves the previous values first */
-  async write(names) {
-    if (this.phase !== 'review' && this.phase !== 'done') throw new Error('nothing to write yet');
-    if (!this.link.alive) throw new Error('the autopilot is not connected');
-    if (this.link.vehicle && this.link.vehicle.armed) throw new Error('the vehicle is armed: disarm first');
-    const rows = this.rows.filter(r => names.includes(r.name));
-    if (!rows.length) throw new Error('choose at least one change');
-    this.setPhase('writing', 'writing');
-    const before = [];
-    for (const r of rows) { let cur; try { cur = await this.link.requestParam(r.name, 1200, 2); } catch (e) { cur = undefined; } r.vehicle = cur; if (cur !== undefined) before.push({ group: r.group, name: r.name, value: +(+cur).toPrecision(6) }); }
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    fs.mkdirSync(this.dir, { recursive: true });
-    this.files.undo = path.join(this.dir, `${stamp} UNDO (values before AP Tuner).param`);
-    fs.writeFileSync(this.files.undo, paramFile(before, ['Values on the autopilot before AP Tuner wrote, ' + new Date().toLocaleString(), 'Load this file to go back.']));
-    const results = [];
-    // notch: enable first; the other notch parameters only exist after a reboot when it was off
-    const order = rows.slice().sort((a, b) => (a.name === 'INS_HNTCH_ENABLE' ? -1 : 0) - (b.name === 'INS_HNTCH_ENABLE' ? -1 : 0));
-    for (const r of order) {
-      if (r.vehicle !== undefined && Math.abs(r.vehicle - r.value) <= 1e-6 * Math.max(1, Math.abs(r.value))) { results.push({ name: r.name, from: r.vehicle, to: r.value, ok: true, same: true }); continue; }
-      try {
-        const echo = await this.link.setParam(r.name, r.value, 1500, 3);
-        const ok = Math.abs(echo - r.value) <= 1e-4 * Math.max(1, Math.abs(r.value));
-        results.push({ name: r.name, from: r.vehicle, to: echo, ok });
-      } catch (e) {
-        const reboot = /^INS_HNTCH_/.test(r.name) && r.name !== 'INS_HNTCH_ENABLE';
-        results.push({ name: r.name, from: r.vehicle, to: undefined, ok: false, error: reboot ? 'needs a reboot first (the notch was just switched on)' : 'no answer from the autopilot' });
-      }
+  /**
+   * The review: the value on the autopilot now for every row, the checks, whether the log is from this vehicle; one
+   * proposal (id + hash over this connection and the exact values) that Write has to name.
+   */
+  async _review() {
+    await this.link.waitAutopilot(3000);
+    this.identity = sessionIdentity(this.link.identity(), null);
+    this.logCheck = logVehicleCheck(this.result, this.identity);
+    for (const n of this.logCheck.notes) this.note('warn', n);
+    const enablesNotch = this.rows.some(r => r.name === 'INS_HNTCH_ENABLE' && r.value > 0);
+    // the values on the autopilot now, read a few at a time (a missing one costs its timeouts only once)
+    let next = 0;
+    const reader = async () => { while (next < this.rows.length) { const row = this.rows[next++]; try { row.vehicle = await this.link.requestParam(row.name, 1200, 2); } catch (e) { row.vehicle = undefined; } } };
+    await Promise.all([reader(), reader(), reader(), reader()]);
+    for (const row of this.rows) {
+      const v = validateParam(row.name, row.value);
+      row.reboot = v.reboot; row.warnings = v.warnings; row.errors = v.errors; row.same = false; row.deferred = false; row.blocked = null;
+      if (!v.ok) row.blocked = `${row.name} ${v.errors.join(', ')}`;
+      else if (row.vehicle === undefined) {
+        // the notch values may only appear once the notch is switched on (after the reboot): they are written then
+        if (enablesNotch && /^INS_HNTCH_/.test(row.name) && row.name !== 'INS_HNTCH_ENABLE') row.deferred = true;
+        else row.blocked = 'not found on the autopilot';
+      } else if (sameF32(row.vehicle, row.value)) row.same = true;
+      else if (typeof row.from === 'number' && !sameF32(row.vehicle, row.from)) row.blocked = `the autopilot holds ${fmt(row.vehicle)}, the log had ${fmt(row.from)}: the change was worked out for other values (fly again with the values now on the autopilot)`;
+      if (!row.blocked && this.logCheck.problems.length) row.blocked = this.logCheck.problems.join('; ');
     }
-    this.writes = results;
-    const after = rows.map(r => ({ group: r.group, name: r.name, value: r.value, from: r.vehicle }));
-    this.files.param = path.join(this.dir, `${stamp} written by AP Tuner.param`);
-    fs.writeFileSync(this.files.param, paramFile(after, ['Written to the autopilot by AP Tuner (Telemetry + USB), ' + new Date().toLocaleString()]));
-    const bad = results.filter(x => !x.ok);
-    this.setPhase('done', bad.length ? `${results.length - bad.length} of ${results.length} written; ${bad.length} need attention (see the list)` : `all ${results.length} written and read back. Unplug the USB and fly to check`);
-    return results;
+    this.proposal = makeProposal({ source: 'log', identity: this.identity, rows: this.rows.map(x => ({ name: x.name, from: x.vehicle, to: x.value })) });
+    this.audit.append('identity', { identity: this.identity, via: 'ground review', log: this.logCheck.log, logProblems: this.logCheck.problems });
+    this.audit.append('proposal', { proposal: this.proposal.id, hash: this.proposal.hash, source: 'log', file: this.files.bin || null, identity: this.identity.key,
+      rows: this.rows.map(x => ({ name: x.name, log: x.from, vehicle: x.vehicle, to: x.value, reboot: x.reboot, blocked: x.blocked, deferred: x.deferred, same: x.same, warnings: x.warnings })) });
   }
 
-  async undo() {
-    if (!this.writes.length) throw new Error('nothing written yet');
+  /** read the values on the autopilot again (after a reconnect or a reboot, or to refresh): a new proposal to review */
+  async recheck() {
+    if (!this.result || !['review', 'done'].includes(this.phase)) throw new Error('nothing to check yet');
+    if (!this.link.alive) throw new Error('the autopilot is not connected');
+    await this._review();
+    this.writes = [];
+    this.setPhase('review', 'values read again: check them, then press Write to the autopilot');
+  }
+
+  /**
+   * Write the chosen rows on the ground: approval = {id, hash} of the reviewed list. One transaction (fresh read, UNDO
+   * file, verified writes, rollback on a failure); resolves the rows with their status: verified, already set, refused,
+   * different, uncertain, rolled back, not written, after the reboot.
+   */
+  async write(names, approval = null) {
+    if (this.phase !== 'review' && this.phase !== 'done') throw new Error('nothing to write yet');
+    const p = this.proposal;
+    if (!p || !approval || approval.id !== p.id || approval.hash !== p.hash) {
+      this.audit.append('refused', { what: 'ground write', proposal: p ? p.id : null, approval, why: 'proposal id / hash mismatch' });
+      throw new Error('the list changed since it was shown: look at it again, then press Write');
+    }
+    if (!this.link.alive) throw new Error('the autopilot is not connected');
+    const id = this.link.identity();
+    if (p.gen !== this.link.generation || p.sysid !== id.sysid || p.compid !== id.compid) {
+      this.audit.append('refused', { what: 'ground write', proposal: p.id, why: 'another connection', now: id });
+      throw new Error('the connection changed since the review: press "Read the values again", check them, then Write');
+    }
     if (this.link.vehicle && this.link.vehicle.armed) throw new Error('the vehicle is armed: disarm first');
-    for (const w of this.writes) if (w.ok && !w.same && w.from !== undefined) { try { await this.link.setParam(w.name, w.from, 1500, 3); w.undone = true; } catch (e) { w.undoError = true; } }
-    this.setPhase('done', 'previous values written back');
+    if (!this.audit.ok) throw new Error(`the write journal cannot be written (${this.audit.error}): nothing is written. Free some disk space and restart AP Tuner`);
+    const rows = this.rows.filter(r => names.includes(r.name));
+    if (!rows.length) throw new Error('choose at least one change');
+    const blocked = rows.filter(r => r.blocked);
+    if (blocked.length) throw new Error('cannot be written: ' + blocked.map(r => `${r.name} (${r.blocked})`).join('; '));
+    this.audit.append('approval', { proposal: p.id, hash: p.hash, by: 'user', via: 'ground write', names, identity: this.identity ? this.identity.key : null });
+    this.setPhase('writing', 'writing');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    // the notch switch first; values that only exist once the notch is on wait for the reboot
+    const now = rows.filter(r => !r.deferred).sort((a, b) => (a.name === 'INS_HNTCH_ENABLE' ? -1 : 0) - (b.name === 'INS_HNTCH_ENABLE' ? -1 : 0));
+    const later = rows.filter(r => r.deferred);
+    const txn = await runTransaction(this.link, now.map(r => ({ name: r.name, to: r.value, expect: r.vehicle, reason: r.label })), {
+      journal: (k, d) => this.audit.append(k, d), ctx: { proposal: p.id, hash: p.hash, identity: this.identity ? this.identity.key : null, via: 'ground write' },
+      // the UNDO file is on disk before the first value is written (otherwise nothing is written)
+      afterPreRead: before => {
+        fs.mkdirSync(this.dir, { recursive: true });
+        this.files.undo = path.join(this.dir, `${stamp} UNDO (values before AP Tuner).param`);
+        const undoRows = before.map(b => ({ group: (rows.find(r => r.name === b.name) || {}).group, name: b.name, value: b.before }));
+        fs.writeFileSync(this.files.undo, paramFile(undoRows, ['Values on the autopilot before AP Tuner wrote, ' + new Date().toLocaleString(), 'Load this file to go back.'], { identity: this.identity, strict: false }));
+      },
+    });
+    this.lastTxn = txn;
+    this.writes = rows.map(r => this._rowResult(r, txn));
+    // what acts only after a reboot (written and read back) and what can only be written after it
+    this.rebootPending = this.writes.filter(w => w.reboot && w.status === 'verified').map(w => ({ name: w.name, value: w.to }));
+    this.afterReboot = txn.ok ? later.map(r => ({ name: r.name, value: r.value, group: r.group, label: r.label, reboot: !!r.reboot })) : [];
+    const written = this.writes.filter(w => w.status === 'verified');
+    if (written.length) {
+      try {
+        this.files.param = path.join(this.dir, `${stamp} written by AP Tuner.param`);
+        fs.writeFileSync(this.files.param, paramFile(written.map(w => ({ group: w.group, name: w.name, value: w.to, from: w.from })), ['Written to the autopilot by AP Tuner (Telemetry + USB) and read back, ' + new Date().toLocaleString()], { identity: this.identity }));
+      } catch (e) { delete this.files.param; this.note('warn', 'the file of the written values could not be saved: ' + e.message); }
+    }
+    const pend = [...this.rebootPending.map(x => x.name), ...this.afterReboot.map(x => x.name)];
+    const tail = pend.length ? ` ${pend.join(', ')} ${pend.length === 1 ? 'takes' : 'take'} effect only after a reboot: press Reboot (disarmed)` : ' Unplug the USB and fly to check';
+    this.setPhase('done', txn.ok ? `all ${rows.length - later.length} written and read back.${tail}` : txnText(txn));
+    return this.writes;
+  }
+
+  /** one row's outcome of a transaction, in plain words */
+  _rowResult(r, txn) {
+    const base = { group: r.group, name: r.name, label: r.label, requested: r.value, reboot: !!r.reboot, from: undefined, to: undefined, status: 'not written', ok: false, text: '', changed: false, undo: null };
+    if (r.deferred) return Object.assign(base, { status: 'after reboot', text: `${r.name}: written after the reboot (it appears once the notch is on)` });
+    const res = txn.rows.find(x => x.name === r.name);
+    if (!res) return Object.assign(base, { text: txn.aborted ? 'not written: ' + txn.aborted : `${r.name}: not written (an earlier value failed)` });
+    const rb = txn.rollback.find(x => x.name === r.name);
+    const out = Object.assign(base, { from: res.before, to: res.holds, status: res.status, ok: res.ok, text: writeText(res) });
+    if (!txn.ok && rb) {
+      if (rb.ok) Object.assign(out, { status: 'rolled back', ok: false, to: rb.holds, text: `${writeText(res)}; written back to ${fmt(rb.holds)} (read back)` });
+      else Object.assign(out, { status: 'uncertain', ok: false, to: rb.holds, text: `${writeText(res)}; writing it back failed: ${writeText(rb)}` });
+    } else if (!txn.ok && !rb && res.ok && txn.uncertain.some(u => u.name === r.name)) Object.assign(out, { status: 'uncertain', ok: false, text: txn.uncertain.find(u => u.name === r.name).why });
+    out.changed = CHANGED.has(out.status) && !(out.status === 'verified' && sameF32(out.to, out.from));
+    return out;
+  }
+
+  /**
+   * Reboot the autopilot (disarmed) after values that act only after a reboot: it must come back as the same vehicle,
+   * every value written in this session is read again; values that only exist after it are written then (verified).
+   */
+  async rebootNow() {
+    if (this.phase !== 'done') throw new Error('nothing written yet');
+    if (!this.rebootPending.length && !this.afterReboot.length) throw new Error('nothing written here needs a reboot');
+    // what the vehicle holds now: the value written, or after an Undo the value from before
+    const expect = this.writes.filter(w => w.status === 'verified').map(w => ({ name: w.name, value: w.undo && typeof w.undoHolds === 'number' ? w.undoHolds : w.to }));
+    this.setPhase('rebooting', 'rebooting the autopilot: it disconnects for a few seconds');
+    const res = await rebootAndVerify(this.link, expect, { journal: (k, d) => this.audit.append(k, d), ctx: { via: 'ground write', identity: this.identity ? this.identity.key : null }, onInfo: t => { this.info = t; } });
+    this.reboot = { at: Date.now(), ok: res.ok, reason: res.reason, rows: res.rows };
+    for (const w of this.writes) { const x = res.rows.find(y => y.name === w.name); if (x) w.afterReboot = x.ok ? 'read back after the reboot' : (x.holds === undefined ? 'no answer after the reboot' : `holds ${fmt(x.holds)} after the reboot`); }
+    if (!res.ok) { this.setPhase('done', 'reboot: ' + res.reason); return this.reboot; }
+    this.rebootPending = [];
+    // the identity of the new connection (the link may have reopened): the same vehicle was checked by rebootAndVerify
+    this.identity = sessionIdentity(this.link.identity(), null);
+    if (this.afterReboot.length) {
+      const later = this.afterReboot; this.afterReboot = [];
+      const txn = await runTransaction(this.link, later.map(r => ({ name: r.name, to: r.value, reason: r.label })), { journal: (k, d) => this.audit.append(k, d), ctx: { via: 'ground write after the reboot', identity: this.identity.key } });
+      for (const r of later) { const w = this.writes.find(x => x.name === r.name); const nw = this._rowResult(Object.assign({}, r, { deferred: false }), txn); if (w) Object.assign(w, nw); }
+      const pend = this.writes.filter(w => w.reboot && w.status === 'verified' && later.some(l => l.name === w.name)).map(w => ({ name: w.name, value: w.to }));
+      this.rebootPending = pend;
+      this.setPhase('done', txn.ok ? `rebooted and read back; then ${later.length} notch value(s) written and read back${pend.length ? ': ' + pend.map(x => x.name).join(', ') + ' need one more reboot (press Reboot)' : ''}` : 'after the reboot: ' + txnText(txn));
+      return this.reboot;
+    }
+    this.setPhase('done', 'rebooted: every value written here was read back after the reboot. Unplug the USB and fly to check');
+    return this.reboot;
+  }
+
+  /** write the values from before back, each verified on its own (an undo goes as far back as it can) */
+  async undo() {
+    const todo = this.writes.filter(w => w.changed && typeof w.from === 'number' && w.undo !== 'undone');
+    if (!todo.length) throw new Error('nothing to undo: no value written here is different from before');
+    if (!this.link.alive) throw new Error('the autopilot is not connected');
+    if (this.link.vehicle && this.link.vehicle.armed) throw new Error('the vehicle is armed: disarm first');
+    if (this.identity && !sameVehicle(this.identity, this.link.identity())) throw new Error('another vehicle is connected now (' + identityText(this.link.identity()) + '): the undo values are for ' + identityText(this.identity));
+    this.setPhase('writing', 'writing the previous values back');
+    this.audit.append('approval', { by: 'user', via: 'ground undo', names: todo.map(w => w.name), identity: this.identity ? this.identity.key : null });
+    for (const w of todo) {
+      let cur; try { cur = await this.link.requestParam(w.name, 1200, 2); } catch (e) { cur = undefined; }
+      let r;
+      if (sameF32(cur, w.from)) r = { name: w.name, status: 'unchanged', ok: true, holds: cur };
+      else r = await verifiedSet(this.link, w.name, w.from, { before: cur });
+      this.audit.append('write', Object.assign({ via: 'ground undo', identity: this.identity ? this.identity.key : null }, r));
+      w.undo = r.ok ? 'undone' : r.status; w.undoText = r.ok ? `back to ${fmt(r.holds)} (read back)` : writeText(r); w.undoHolds = r.holds;
+      w.afterReboot = null;   // the last reboot's check was about the value written, not this one
+      if (r.ok && w.reboot && r.status === 'verified') this.rebootPending = this.rebootPending.filter(x => x.name !== w.name).concat([{ name: w.name, value: r.holds }]);
+    }
+    const bad = todo.filter(w => w.undo !== 'undone');
+    this.setPhase('done', bad.length ? `undo incomplete: ${bad.map(w => w.undoText).join('; ')}. Load the UNDO file in Mission Planner to go back` : 'previous values written back and read back' + (this.rebootPending.length ? `; ${this.rebootPending.map(x => x.name).join(', ')} ${this.rebootPending.length === 1 ? 'takes' : 'take'} effect after a reboot (press Reboot)` : ''));
   }
 
   snapshot() {
@@ -250,8 +389,12 @@ class GroundTune extends EventEmitter {
     return { phase: this.phase, info: this.info, since: this.since, opts: { axes: this.opts.axes, preset: this.opts.preset, seconds: this.opts.seconds }, mark: this.mark, savedMark: this.savedMark,
       mode: v ? v.modeName : null, armed: !!(v && v.armed), modeOk: this.modeOk(v), alive: this.link.alive, linkDesc: this.link.description, usb: this.usb, progress: this.progress,
       result: this.result ? { family: this.result.family, firmware: this.result.firmware, window: this.result.flightWindow, chosenAxes: this.result.chosenAxes, axes: Object.fromEntries(Object.entries(this.result.axes).map(([k, a]) => [k, slimAxis(a)])), noise: this.result.noise ? { available: this.result.noise.available, reason: this.result.noise.reason, recommended: this.result.noise.recommended ? { params: this.result.noise.recommended.params, gyroFilterHz: this.result.noise.recommended.gyroFilterHz, why: this.result.noise.recommended.why } : null } : null } : null,
-      rows: this.rows, writes: this.writes, files: this.files, notes: this.notes.slice(-20), error: this.error };
+      rows: this.rows, writes: this.writes, files: this.files, notes: this.notes.slice(-20), error: this.error,
+      proposal: this.proposal ? { id: this.proposal.id, hash: this.proposal.hash } : null, identity: this.identity, identityText: this.identity ? identityText(this.identity) : null,
+      logCheck: this.logCheck, rebootPending: this.rebootPending, afterReboot: this.afterReboot, reboot: this.reboot, audit: this.audit.status() };
   }
 }
+
+function fmt(v) { return typeof v === 'number' ? +v.toPrecision(6) : v; }
 
 module.exports = { GroundTune, serialMap };

@@ -14,6 +14,12 @@ const api = async (p, body, opts = {}) => {
 const f3 = v => (v === undefined || v === null || isNaN(v)) ? '-' : (+(+v).toPrecision(4)).toString();
 const fmtPct = p => p === null || p === undefined ? '' : (p > 0 ? '+' : '') + Math.round(p) + '%';
 const num = (v, d) => (typeof v === 'number' && isFinite(v)) ? v.toFixed(d) : '-';
+/** the vehicle the app talks to, in one line (the same words as the server's identityText) */
+function identityLine(id) {
+  if (!id || id.sysid === null || id.sysid === undefined) return 'no vehicle';
+  const type = id.typeName ? String(id.typeName).replace(/^MAV_TYPE_/, '').toLowerCase() : 'type ' + id.type;
+  return `system id ${id.sysid} (${type}), ArduPilot ${id.fw || 'firmware not reported'}${id.gitHash ? ' (' + id.gitHash + ')' : ''}, board ${id.uid ? 'UID ' + String(id.uid).replace(/(00)+$/, '').slice(0, 24) : 'UID not reported'}, connection #${id.gen}`;
+}
 function toast(msg, kind = '') { const d = document.createElement('div'); d.className = 'toast ' + kind; d.textContent = msg; $('#toasts').appendChild(d); setTimeout(() => d.remove(), 6000); }
 const guard = fn => async (...a) => { try { await fn(...a); } catch (e) { toast(e.message, 'bad'); } };
 function modal(title, html, { yes = 'OK', no = 'Cancel', danger = false } = {}) {
@@ -107,8 +113,13 @@ function render() {
   if (!s.alive) setActive('connect'); else if (!prepared) setActive('vehicle'); else if (['observing', 'analyzing', 'applying', 'ramping', 'proposed', 'paused'].includes(s.state)) setActive('tune'); else if (s.state === 'done') setActive('notch'); else if (activeStep === 'connect' || activeStep === 'vehicle') setActive('tune');
   // vehicle card
   if (s.vehicle) {
-    const r = s.rates; $('#vehicleKv').innerHTML = kv([['type', s.vehicle.typeName.replace('MAV_TYPE_', '').toLowerCase() + (s.family ? ` (${s.family})` : '')], ['mode', `${s.vehicle.modeName} · ${s.vehicle.armed ? 'armed' : 'disarmed'}`], ['link', s.linkDesc], ['attitude', `roll ${num(s.attitude.roll, 1)}°, pitch ${num(s.attitude.pitch, 1)}°`], ['PID telemetry', `${r.roll.hz} Hz per axis` + (r.roll.hz < 20 && prepared ? ' (slow link: the measurement is less reliable)' : '')]]);
+    const r = s.rates; $('#vehicleKv').innerHTML = kv([['type', s.vehicle.typeName.replace('MAV_TYPE_', '').toLowerCase() + (s.family ? ` (${s.family})` : '')], ['mode', `${s.vehicle.modeName} · ${s.vehicle.armed ? 'armed' : 'disarmed'}`], ['link', s.linkDesc], ['vehicle', identityLine(s.identity || s.linkIdentity)], ['attitude', `roll ${num(s.attitude.roll, 1)}°, pitch ${num(s.attitude.pitch, 1)}°`], ['PID telemetry', `${r.roll.hz} Hz per axis` + (r.roll.hz < 20 && prepared ? ' (slow link: the measurement is less reliable)' : '')]]);
   }
+  const warnings = [];
+  if (s.otherVehicles && s.otherVehicles.length) warnings.push(`Another vehicle is on this link (system id ${s.otherVehicles.map(o => o.sysid).join(', ')}): the app talks only to system id ${s.identity ? s.identity.sysid : (s.linkIdentity || {}).sysid}.`);
+  if (s.audit && s.audit.lost) warnings.push(`The write journal could not be written (${s.audit.error}): nothing more is written to the vehicle. Free some disk space and restart AP Tuner.`);
+  if (s.rebootPending && s.rebootPending.length) warnings.push(`${s.rebootPending.map(p => p.name).join(', ')} ${s.rebootPending.length === 1 ? 'takes' : 'take'} effect only after a reboot of the autopilot: step 4, Reboot (disarmed).`);
+  const vw = $('#vehicleWarn'); if (vw) { vw.textContent = warnings.join(' '); vw.style.display = warnings.length ? '' : 'none'; }
   if (s.gains && prepared) $('#gainsNow').innerHTML = gainsTable(s.gains, s.originals);
   // tune banner
   const info = { idle: 'Press Start, then fly in Stabilize / AltHold (plane: FBWA) and give short, sharp stick taps every few seconds.', ready: 'Press Start, then fly and tap the sticks.', observing: 'Fly: short sharp stick taps on ' + (s.axis || '') + '. Collecting data…', analyzing: 'Computing…', proposed: 'Look at the proposal below and press Apply when you agree (or Resume to keep observing).', applying: 'Writing the new gains step by step and watching for oscillation. Keep flying calmly.', paused: 'Paused. Fix what the message says, then press Resume.', done: 'All chosen axes are tuned. Go to step 4 for the notch filter, or step 5 to save.', ramping: 'QuikTune-style ramp: raising a gain slowly until the oscillation detector trips, then backing off.' }[s.state] || '';
@@ -171,11 +182,11 @@ function renderAxisCard(panel, r, live) {
     <div class="minichart" id="${id}-step"></div>${idn.bode ? `<div class="minichart" id="${id}-bode"></div>` : ''}
     ${live ? `<div class="row" style="margin-top:10px">${p ? `<button class="btn primary" data-apply="${axis}">Apply ${axis} proposal</button>` : ''}<button class="btn ghost" data-undo="${axis}" ${snap && snap.previous && snap.previous[axis] ? '' : 'disabled'}>Undo last apply</button></div>` : ''}`;
   if (live && p) $('[data-apply]', card).onclick = guard(async () => {
-    const list = p.changes.map(c => `<tr class="changed"><td>${esc(c.key)}</td><td>${f3(c.from)}</td><td>${f3(c.to)}</td><td>${fmtPct(c.pct)}</td></tr>`).join('');
+    const list = (p.rows || []).map(x => `<tr class="changed"><td>${esc(x.name)}${x.reboot ? ' <span class="warn small">(acts after a reboot)</span>' : ''}<div class="muted small">${esc(x.reason)}</div></td><td>${f3(x.from)}</td><td>${f3(x.to)}</td><td>${typeof x.from === 'number' && x.from ? fmtPct((x.to / x.from - 1) * 100) : 'new'}</td></tr>`).join('');
     const armed = !!(snap && snap.vehicle && snap.vehicle.armed);
     if (armed && !(snap.opts && snap.opts.inFlightWrites)) { await modal('Changes in flight are off', '<p>The vehicle is armed. While it flies the app only measures: land and press Apply on the ground, or turn on <b>Allow changes in flight</b> (experimental, tested only in the simulator).</p>', { yes: 'OK', no: '' }); return; }
-    const ok = await modal(`Apply the ${axis} proposal?`, `<p class="muted">${armed ? 'These parameters are written to the flying vehicle in small steps, each watched for oscillation. If the vehicle starts to oscillate the app pauses and tries to undo the change; that is a safety net, not a guarantee (experimental, tested only in the simulator).' : 'These parameters are written to the vehicle (disarmed).'} You can Undo afterwards.</p><table class="gains"><tr><th>gain</th><th>now</th><th>new</th><th>change</th></tr>${list}</table>${m}`, { yes: 'Apply now', danger: armed });
-    if (!ok) return; await api('apply', { axis }); toast('applying ' + axis + ' gains in steps', 'ok');
+    const ok = await modal(`Apply the ${axis} proposal?`, `<p class="muted">${armed ? 'These parameters are written to the flying vehicle in small steps, each watched for oscillation. If the vehicle starts to oscillate the app pauses and tries to undo the change; that is a safety net, not a guarantee (experimental, tested only in the simulator).' : 'These parameters are written to the vehicle (disarmed).'} Every value is read back; if one does not hold, everything written goes back to the value from before. You can Undo afterwards.</p><table class="gains"><tr><th>parameter</th><th>now</th><th>new</th><th>change</th></tr>${list}</table>${m}<p class="muted small">For ${esc(identityLine(snap && (snap.identity || snap.linkIdentity)))} · proposal ${esc(p.id)} · ${esc(String(p.hash || '').slice(0, 8))}</p>`, { yes: 'Apply now', danger: armed });
+    if (!ok) return; await api('apply', { axis, id: p.id, hash: p.hash }); toast('applying ' + axis + ' gains in steps', 'ok');
   });
   if (live) $('[data-undo]', card).onclick = guard(async () => { if (await modal(`Undo the last ${axis} apply?`, '<p class="muted">The gains from before the last apply are written back.</p>', { yes: 'Undo' })) { await api('undo', { axis }); toast(axis + ' gains restored to the previous set', 'ok'); } });
   const stepEl = $(`#${id}-step`); const series = [], data = [];
@@ -248,13 +259,23 @@ $('#btnNotchStatus').onclick = guard(async () => {
   const curTxt = st.notchActive ? `Notch is on: mode ${esc(cur.INS_HNTCH_MODE)} (${['fixed', 'throttle', 'RPM sensor', 'ESC telemetry', 'in-flight FFT', 'RPM sensor 2'][cur.INS_HNTCH_MODE] || '?'}), ${esc(cur.INS_HNTCH_FREQ)} Hz, bandwidth ${esc(cur.INS_HNTCH_BW)} Hz, harmonics ${esc(cur.INS_HNTCH_HMNCS)}` : 'No harmonic notch is configured yet.';
   $('#notchCards').innerHTML = `<div class="card"><h3>Now on the vehicle</h3><p>${curTxt}</p><p class="muted small">Gyro low-pass INS_GYRO_FILTER = ${esc(cur.INS_GYRO_FILTER)} Hz · FFT ${st.fftCapable ? (st.fftEnabled ? 'enabled' : 'available, off') : 'not available in this firmware'} · ESC RPM telemetry ${st.escTelemetry ? 'yes (' + Math.round(st.escRpm) + ' rpm)' : 'no'}</p>${st.note ? `<p class="warn small">${esc(st.note)}</p>` : ''}</div>` +
     `<div class="card"><h3>Options</h3><ul class="list">${st.options.map(o => `<li><span class="tick ${o.id === 'log' ? 'todo' : ''}">${o.id === 'log' ? '…' : '✓'}</span><div style="flex:1"><b>${esc(o.title)}</b><div class="muted small">${esc(o.detail)}</div>${o.id === 'esc' ? `<button class="btn primary" style="margin-top:6px" data-esc>Set notch to ESC RPM tracking</button>` : ''}${o.id === 'fft' ? `<button class="btn" style="margin-top:6px" data-fft>Open the FFT steps</button>` : ''}${o.id === 'log' ? `<button class="btn ghost" style="margin-top:6px" data-log>Go to Log file</button>` : ''}</div></li>`).join('')}</ul></div>`;
-  const esc_ = $('[data-esc]'); if (esc_) esc_.onclick = guard(async () => { const armed = !!(snap && snap.vehicle && snap.vehicle.armed); if (await modal('Set the notch to ESC RPM tracking?', `<p class="muted">Parameters to write:</p><ul class="notes">${Object.entries(st.escProposal).map(([k, v]) => `<li>${esc(k)} = ${esc(v)}</li>`).join('')}</ul>${armed ? '<p class="warn small">The vehicle is armed: this needs Allow changes in flight. Every axis is then watched for 10 s and the notch is switched back if the vehicle starts to oscillate (experimental).</p>' : ''}`, { yes: 'Write them', danger: armed })) { await api('notch/esc', {}); toast('notch set to ESC RPM tracking', 'ok'); $('#btnNotchStatus').click(); } });
+  const esc_ = $('[data-esc]'); if (esc_) esc_.onclick = guard(async () => { const armed = !!(snap && snap.vehicle && snap.vehicle.armed); if (await modal('Set the notch to ESC RPM tracking?', `<p class="muted">Parameters to write:</p><ul class="notes">${Object.entries(st.escProposal).map(([k, v]) => `<li>${esc(k)} = ${esc(v)}</li>`).join('')}</ul>${armed ? '<p class="warn small">The vehicle is armed: this needs Allow changes in flight. Every axis is then watched for 10 s and the notch is switched back if the vehicle starts to oscillate (experimental).</p>' : ''}`, { yes: 'Write them', danger: armed })) { const r = await api('notch/esc', {}); toast(r.rebootNeeded && r.rebootNeeded.length ? `notch written and read back; ${r.rebootNeeded.join(', ')} ${r.rebootNeeded.length === 1 ? 'takes' : 'take'} effect after a reboot: press Reboot (disarmed)` : 'notch set to ESC RPM tracking (read back)', 'ok'); $('#btnNotchStatus').click(); } });
   const fft = $('[data-fft]'); if (fft) fft.onclick = () => { $('#fftFlow').style.display = ''; $('#fftFlow').scrollIntoView({ behavior: 'smooth' }); };
   const lg = $('[data-log]'); if (lg) lg.onclick = () => $('nav.views button[data-view=log]').click();
-  setStatus('notch', st.notchActive ? 'notch on' : 'not configured', st.notchActive ? 'ok' : 'warn');
+  if (st.rebootPending && st.rebootPending.length) $('#notchCards').insertAdjacentHTML('afterbegin', `<div class="banner warn"><div class="ico">↻</div><div><b>Reboot needed</b><span>${st.rebootPending.map(esc).join(', ')} ${st.rebootPending.length === 1 ? 'takes' : 'take'} effect only after a reboot of the autopilot (disarmed); the values are read again afterwards.</span></div><button class="btn primary" data-reboot>Reboot and check</button></div>`);
+  const rb = $('[data-reboot]'); if (rb) rb.onclick = async () => { await rebootFlow(); $('#btnNotchStatus').click(); };
+  setStatus('notch', st.notchActive ? 'notch on' : st.rebootPending && st.rebootPending.length ? 'reboot needed' : 'not configured', st.notchActive ? 'ok' : 'warn');
 });
-$('#btnFftEnable').onclick = guard(async () => { await api('notch/fft/enable', {}); toast('FFT_ENABLE set to 1: reboot the autopilot (disarmed) before flying', 'ok'); });
-$('#btnReboot').onclick = guard(async () => { if (await modal('Reboot the autopilot?', '<p>Only while disarmed, on the ground.</p>', { yes: 'Reboot', danger: true })) { await api('notch/reboot', {}); toast('reboot sent; reconnect in ~20 s'); } });
+$('#btnFftEnable').onclick = guard(async () => { await api('notch/fft/enable', {}); toast('FFT_ENABLE set to 1 and read back: reboot the autopilot (disarmed) before flying', 'ok'); });
+const rebootFlow = guard(async () => {
+  const pend = (snap && snap.rebootPending) || [];
+  if (!(await modal('Reboot the autopilot?', `<p>Only while disarmed, on the ground. The app waits for the autopilot to come back, checks that it is the same vehicle and reads every value again.</p>${pend.length ? '<p class="muted">Values that take effect with this reboot: ' + pend.map(p => esc(p.name) + ' = ' + f3(p.value)).join(', ') + '</p>' : ''}`, { yes: 'Reboot', danger: true }))) return;
+  toast('rebooting: the autopilot disconnects for a few seconds');
+  const r = await api('notch/reboot', {});
+  if (r.ok) toast(r.rows && r.rows.length ? 'rebooted: ' + r.rows.map(x => x.name).join(', ') + ' read back after the reboot' : 'rebooted and back', 'ok');
+  else toast('reboot: ' + r.reason, 'bad');
+});
+$('#btnReboot').onclick = rebootFlow;
 $('#btnFftStart').onclick = guard(async () => { await api('notch/fft/start', {}); let s = 30; $('#fftTimer').textContent = s + ' s'; clearInterval(fftTimer); fftTimer = setInterval(() => { s--; $('#fftTimer').textContent = (s > 0 ? s + ' s' : 'press Stop'); if (s <= 0) clearInterval(fftTimer); }, 1000); toast('measuring: hold a steady hover', 'ok'); });
 $('#btnFftStop').onclick = guard(async () => { clearInterval(fftTimer); $('#fftTimer').textContent = ''; const r = await api('notch/fft/stop', {}); const ch = Object.entries(r.changed || {}); $('#fftResult').innerHTML = (r.ok ? '<b class="ok">The autopilot wrote the notch:</b> ' : r.held === false ? '<b class="bad">The notch the autopilot wrote made the vehicle oscillate and was switched back.</b> ' : '<b class="warn">No notch written</b> (needs a steady hover and clear motor noise). ') + (ch.length ? '<ul class="notes">' + ch.map(([k, c]) => `<li>${esc(k)}: ${f3(c.from)} → ${f3(c.to)}</li>`).join('') + '</ul>' : '') + (r.messages.length ? '<div class="muted small">' + r.messages.map(m => esc(m.text)).join('<br>') + '</div>' : ''); if (r.ok) { toast('notch configured by the autopilot', 'ok'); setStatus('notch', 'notch on', 'ok'); } });
 
@@ -292,9 +313,15 @@ function renderLogResult(r) {
     ${nProp ? '' : '<div class="banner warn"><div class="ico">⚠</div><div><b>No gain proposal from this log</b><span>Usually because there was no stick excitation, the data rate is too low, or the vehicle only hovered. The report still shows what the flight looked like.</span></div></div>'}
     <div class="cards cols-auto" id="logAxes"></div>
     <div id="logNoise" class="card" style="margin-top:12px"></div>
-    <div class="card" style="margin-top:12px"><h3>Parameter file contents</h3><p class="muted small">Load in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params. Fly carefully afterwards, ready to switch back to your previous parameters.</p>${r.rows && r.rows.length ? rowsTable(r.rows) : '<p class="muted">nothing to write</p>'}</div>`;
+    <div class="card" style="margin-top:12px"><h3>Parameter file contents</h3><p class="muted small">Load in Mission Planner: CONFIG → Full Parameter List → Load from file → Write Params. Fly carefully afterwards, ready to switch back to your previous parameters. The file names the vehicle of this log; load it only on that vehicle.</p>${paramChecksHtml(r.paramChecks)}${r.rows && r.rows.length ? rowsTable(r.rows) : '<p class="muted">nothing to write</p>'}</div>`;
   for (const a of ['roll', 'pitch', 'yaw']) if (r.axes[a]) renderAxisCard($('#logAxes'), Object.assign({}, r.axes[a], { axis: a }), false);
   renderNoise(r.noise);
+}
+/** what the file checks found: values left out (they fail a check) and notes (outside the documented range) */
+function paramChecksHtml(c) {
+  if (!c) return '';
+  return (c.errors || []).map(e => `<div class="bad small">✖ ${esc(e.name)} = ${esc(e.value)} is left out of the file: it ${esc(e.why)}</div>`).join('') +
+    (c.warnings || []).map(w => `<div class="warn small">⚠ ${esc(w.name)} ${esc(w.why)}</div>`).join('');
 }
 function renderNoise(nz) {
   const el = $('#logNoise');

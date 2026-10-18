@@ -260,9 +260,10 @@ int main(int argc, char** argv) {
     printResult(r, ms);
     if (!paramOut.empty()) {
       const auto fam = aptuner::core::parseFamily(r["family"].str());
-      const Json rows = aptuner::engine::proposalRows(*fam, r["axes"], r["noise"]);
+      // checked, fixed point, the log's vehicle in the header (tools/compare-cpp.js compares it with the JavaScript text)
+      const Json rows = aptuner::engine::proposalRows(*fam, r["axes"], r["noise"], r["params"]);
       std::ofstream o(paramOut, std::ios::binary);
-      o << aptuner::engine::paramFile(rows, {"from " + pos[0]});
+      o << aptuner::engine::paramFile(rows, {"from " + pos[0]}, Json(aptuner::engine::logIdentityText(r)));
     }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "aptuner-analyze: %s\n", e.what());
