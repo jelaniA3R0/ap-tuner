@@ -21,6 +21,7 @@ static const FieldDef kFields_29[] = {{"time_boot_ms", kU32, 0, 0}, {"press_abs"
 static const FieldDef kFields_30[] = {{"time_boot_ms", kU32, 0, 0}, {"roll", kF32, 0, 4}, {"pitch", kF32, 0, 8}, {"yaw", kF32, 0, 12}, {"rollspeed", kF32, 0, 16}, {"pitchspeed", kF32, 0, 20}, {"yawspeed", kF32, 0, 24}};
 static const FieldDef kFields_31[] = {{"time_boot_ms", kU32, 0, 0}, {"q1", kF32, 0, 4}, {"q2", kF32, 0, 8}, {"q3", kF32, 0, 12}, {"q4", kF32, 0, 16}, {"rollspeed", kF32, 0, 20}, {"pitchspeed", kF32, 0, 24}, {"yawspeed", kF32, 0, 28}, {"repr_offset_q", kF32, 4, 32}};
 static const FieldDef kFields_32[] = {{"time_boot_ms", kU32, 0, 0}, {"x", kF32, 0, 4}, {"y", kF32, 0, 8}, {"z", kF32, 0, 12}, {"vx", kF32, 0, 16}, {"vy", kF32, 0, 20}, {"vz", kF32, 0, 24}};
+static const FieldDef kFields_33[] = {{"time_boot_ms", kU32, 0, 0}, {"lat", kI32, 0, 4}, {"lon", kI32, 0, 8}, {"alt", kI32, 0, 12}, {"relative_alt", kI32, 0, 16}, {"vx", kI16, 0, 20}, {"vy", kI16, 0, 22}, {"vz", kI16, 0, 24}, {"hdg", kU16, 0, 26}};
 static const FieldDef kFields_34[] = {{"time_boot_ms", kU32, 0, 0}, {"chan1_scaled", kI16, 0, 4}, {"chan2_scaled", kI16, 0, 6}, {"chan3_scaled", kI16, 0, 8}, {"chan4_scaled", kI16, 0, 10}, {"chan5_scaled", kI16, 0, 12}, {"chan6_scaled", kI16, 0, 14}, {"chan7_scaled", kI16, 0, 16}, {"chan8_scaled", kI16, 0, 18}, {"port", kU8, 0, 20}, {"rssi", kU8, 0, 21}};
 static const FieldDef kFields_35[] = {{"time_boot_ms", kU32, 0, 0}, {"chan1_raw", kU16, 0, 4}, {"chan2_raw", kU16, 0, 6}, {"chan3_raw", kU16, 0, 8}, {"chan4_raw", kU16, 0, 10}, {"chan5_raw", kU16, 0, 12}, {"chan6_raw", kU16, 0, 14}, {"chan7_raw", kU16, 0, 16}, {"chan8_raw", kU16, 0, 18}, {"port", kU8, 0, 20}, {"rssi", kU8, 0, 21}};
 static const FieldDef kFields_36[] = {{"time_usec", kU32, 0, 0}, {"servo1_raw", kU16, 0, 4}, {"servo2_raw", kU16, 0, 6}, {"servo3_raw", kU16, 0, 8}, {"servo4_raw", kU16, 0, 10}, {"servo5_raw", kU16, 0, 12}, {"servo6_raw", kU16, 0, 14}, {"servo7_raw", kU16, 0, 16}, {"servo8_raw", kU16, 0, 18}, {"port", kU8, 0, 20}, {"servo9_raw", kU16, 0, 21}, {"servo10_raw", kU16, 0, 23}, {"servo11_raw", kU16, 0, 25}, {"servo12_raw", kU16, 0, 27}, {"servo13_raw", kU16, 0, 29}, {"servo14_raw", kU16, 0, 31}, {"servo15_raw", kU16, 0, 33}, {"servo16_raw", kU16, 0, 35}};
@@ -114,7 +115,8 @@ static const FieldDef kFields_143[] = {{"time_boot_ms", kU32, 0, 0}, {"press_abs
 static const FieldDef kFields_144[] = {{"timestamp", kU64, 0, 0}, {"custom_state", kU64, 0, 8}, {"lat", kI32, 0, 16}, {"lon", kI32, 0, 20}, {"alt", kF32, 0, 24}, {"vel", kF32, 3, 28}, {"acc", kF32, 3, 40}, {"attitude_q", kF32, 4, 52}, {"rates", kF32, 3, 68}, {"position_cov", kF32, 3, 80}, {"est_capabilities", kU8, 0, 92}};
 static const FieldDef kFields_146[] = {{"time_usec", kU64, 0, 0}, {"x_acc", kF32, 0, 8}, {"y_acc", kF32, 0, 12}, {"z_acc", kF32, 0, 16}, {"x_vel", kF32, 0, 20}, {"y_vel", kF32, 0, 24}, {"z_vel", kF32, 0, 28}, {"x_pos", kF32, 0, 32}, {"y_pos", kF32, 0, 36}, {"z_pos", kF32, 0, 40}, {"airspeed", kF32, 0, 44}, {"vel_variance", kF32, 3, 48}, {"pos_variance", kF32, 3, 60}, {"q", kF32, 4, 72}, {"roll_rate", kF32, 0, 88}, {"pitch_rate", kF32, 0, 92}, {"yaw_rate", kF32, 0, 96}};
 static const FieldDef kFields_147[] = {{"current_consumed", kI32, 0, 0}, {"energy_consumed", kI32, 0, 4}, {"temperature", kI16, 0, 8}, {"voltages", kU16, 10, 10}, {"current_battery", kI16, 0, 30}, {"id", kU8, 0, 32}, {"battery_function", kU8, 0, 33}, {"type", kU8, 0, 34}, {"battery_remaining", kI8, 0, 35}, {"time_remaining", kI32, 0, 36}, {"charge_state", kU8, 0, 40}, {"voltages_ext", kU16, 4, 41}, {"mode", kU8, 0, 49}, {"fault_bitmask", kU32, 0, 50}};
-static const FieldDef kFields_148[] = {{"time_usec", kU64, 0, 0}, {"angle_x", kF32, 0, 8}, {"angle_y", kF32, 0, 12}, {"distance", kF32, 0, 16}, {"size_x", kF32, 0, 20}, {"size_y", kF32, 0, 24}, {"target_num", kU8, 0, 28}, {"frame", kU8, 0, 29}, {"x", kF32, 0, 30}, {"y", kF32, 0, 34}, {"z", kF32, 0, 38}, {"q", kF32, 4, 42}, {"type", kU8, 0, 58}, {"position_valid", kU8, 0, 59}};
+static const FieldDef kFields_148[] = {{"capabilities", kU64, 0, 0}, {"uid", kU64, 0, 8}, {"flight_sw_version", kU32, 0, 16}, {"middleware_sw_version", kU32, 0, 20}, {"os_sw_version", kU32, 0, 24}, {"board_version", kU32, 0, 28}, {"vendor_id", kU16, 0, 32}, {"product_id", kU16, 0, 34}, {"flight_custom_version", kU8, 8, 36}, {"middleware_custom_version", kU8, 8, 44}, {"os_custom_version", kU8, 8, 52}, {"uid2", kU8, 18, 60}};
+static const FieldDef kFields_149[] = {{"time_usec", kU64, 0, 0}, {"angle_x", kF32, 0, 8}, {"angle_y", kF32, 0, 12}, {"distance", kF32, 0, 16}, {"size_x", kF32, 0, 20}, {"size_y", kF32, 0, 24}, {"target_num", kU8, 0, 28}, {"frame", kU8, 0, 29}, {"x", kF32, 0, 30}, {"y", kF32, 0, 34}, {"z", kF32, 0, 38}, {"q", kF32, 4, 42}, {"type", kU8, 0, 58}, {"position_valid", kU8, 0, 59}};
 static const FieldDef kFields_150[] = {{"mag_declination", kF32, 0, 0}, {"raw_press", kI32, 0, 4}, {"raw_temp", kI32, 0, 8}, {"gyro_cal_x", kF32, 0, 12}, {"gyro_cal_y", kF32, 0, 16}, {"gyro_cal_z", kF32, 0, 20}, {"accel_cal_x", kF32, 0, 24}, {"accel_cal_y", kF32, 0, 28}, {"accel_cal_z", kF32, 0, 32}, {"mag_ofs_x", kI16, 0, 36}, {"mag_ofs_y", kI16, 0, 38}, {"mag_ofs_z", kI16, 0, 40}};
 static const FieldDef kFields_151[] = {{"mag_ofs_x", kI16, 0, 0}, {"mag_ofs_y", kI16, 0, 2}, {"mag_ofs_z", kI16, 0, 4}, {"target_system", kU8, 0, 6}, {"target_component", kU8, 0, 7}};
 static const FieldDef kFields_152[] = {{"brkval", kU16, 0, 0}, {"freemem", kU16, 0, 2}, {"freemem32", kU32, 0, 4}};
@@ -304,6 +306,7 @@ static const MsgDef kMessages[] = {
   {30, "ATTITUDE", 39, 28, kFields_30, 7},
   {31, "ATTITUDE_QUATERNION", 246, 48, kFields_31, 9},
   {32, "LOCAL_POSITION_NED", 185, 28, kFields_32, 7},
+  {33, "GLOBAL_POSITION_INT", 104, 28, kFields_33, 9},
   {34, "RC_CHANNELS_SCALED", 237, 22, kFields_34, 11},
   {35, "RC_CHANNELS_RAW", 244, 22, kFields_35, 11},
   {36, "SERVO_OUTPUT_RAW", 222, 37, kFields_36, 18},
@@ -397,7 +400,8 @@ static const MsgDef kMessages[] = {
   {144, "FOLLOW_TARGET", 127, 93, kFields_144, 11},
   {146, "CONTROL_SYSTEM_STATE", 103, 100, kFields_146, 17},
   {147, "BATTERY_STATUS", 154, 54, kFields_147, 14},
-  {148, "AUTOPILOT_VERSION", 115, 60, kFields_148, 14},
+  {148, "AUTOPILOT_VERSION", 178, 78, kFields_148, 12},
+  {149, "LANDING_TARGET", 200, 60, kFields_149, 14},
   {150, "SENSOR_OFFSETS", 134, 42, kFields_150, 12},
   {151, "SET_MAG_OFFSETS", 219, 8, kFields_151, 5},
   {152, "MEMINFO", 208, 8, kFields_152, 3},
