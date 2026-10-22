@@ -1,7 +1,8 @@
 # AP Tuner
 
 Live and log-based tuning of ArduPilot rate PIDs, angle gains and gyro notch filters, for
-multirotors, QuadPlane VTOLs, helicopters and fixed-wing planes of any size.
+multirotors, QuadPlane VTOLs, helicopters and fixed-wing planes of any size, including **heavy and slow
+drones** (100 kg class), which get their own model-based tuner (the **Model tune** tab, below).
 
 It connects to the vehicle through Mission Planner's MAVLink mirror (or directly to a telemetry
 link or a SITL), watches the vehicle fly, identifies the airframe's response, computes gains
@@ -13,17 +14,58 @@ gains go to the vehicle in bounded steps, every change is watched and the app tr
 vehicle starts to oscillate (see Safety). The same analysis runs on `.bin` logs, including harmonic-notch
 design from raw gyro data.
 
+**One edition (C++).** Since 22 Oct 2026 the app is the C++ program in `cpp/` only (the earlier JavaScript
+edition was removed; it is in the git history up to commit `35bc01c`). Paths like `src/engine/tuner.js` further
+down name the JavaScript module a C++ file was ported from; the C++ file has the same name under `cpp/`.
+
+## Model tune: heavy and slow drones (in plain words)
+
+Big drones are slow: the motors and props take a long time to change thrust, and the angle loop
+(stick → angle) can end up faster than the rate loop under it. Then the drone wobbles slowly (about once
+every two seconds) or drifts in yaw after every lift-off, and the usual "raise the gains a little" rules can't
+find a working tune. The **Model tune** tab does what an engineer would do by hand:
+
+1. **Finds the hovers** in your flights (from logs, or live while Mission Planner is connected).
+2. **Finds what's wrong** and says whether tuning can fix it: torque imbalance (yaw trim) with the motor split,
+   how much yaw authority is left, centre of gravity from the front/rear thrust split ("move the battery X cm
+   forward" when you give the motor spacing), slow wobbles and whether the model confirms a *cascade* (angle
+   loop too fast for the rate loop), motors at their limit, vibration that got worse since the last flights
+   (props / mounts), hover throttle learning, altitude hold, compass messages.
+3. **Builds a model of your drone** from ordinary hovers, as a *range* of possible drones, not one guess.
+4. **Proves the model**: it flies your real hovers again with the settings you flew (same stick, same lift-off)
+   and compares the heading swing / wobble with the log. Only a proven axis may jump straight to its design.
+5. **Designs safe settings for every axis together**: thousands of candidates are tested on every drone of the
+   range (phase margin ≥ 40°, gain margin ≥ 10 dB for roll / pitch; damping for yaw), noise no higher than now,
+   time simulations of lift-off, gusts, stick steps, extra delay and rotor kick; limits (acceleration, rate,
+   pilot yaw rate, IMAX) from what the motors can actually do; one gyro filter for all axes.
+6. **Gives you steps**: a `.param` file per step with the reason for every value, an **UNDO** file with the values
+   you flew, the predicted result and a short test card. Load the file in Mission Planner (Full Parameter List →
+   Load from file → Write Params). The app never writes these to the drone itself.
+7. **Checks your next flight**: analyse the next log (or fly with the app listening) and it recognises which step
+   you flew, compares the prediction with what happened ("prediction confirmed"), re-fits the model and gives
+   the next step, or says to stop.
+
+**Live through Mission Planner:** connect Mission Planner to the drone as usual, press **Connect** in AP Tuner
+(it finds Mission Planner's MAVLink mirror by itself), then **Start listening**. Every flight from arming to
+disarming is recorded and analysed after landing. It needs `GCS_PID_MASK = 7` for the PID telemetry; the app
+tells you if it is off but does not change it. It only asks the autopilot for the telemetry streams, as
+Mission Planner does. A telemetry radio is fast enough for this: the motions of a heavy drone are slow
+(0.05-3 Hz); only the vibration checks need a log.
+
+Command line: `aptuner-heavy <log.bin> [more.bin ...] [--plan plan.json] [--out folder] [--spacing metres]`.
+The method, step by step: `docs/how-it-works.md` ("Model-based tuning"); the tandem QuadPlane it was proven on:
+`docs/validation/tandem-hover-logs.md`.
+
 ## Install or just run
 
-* **Install (recommended):** double-click **`Install AP Tuner.cmd`**. It copies the app to your user
-  folder, puts **AP Tuner** on the Desktop and in the Start Menu, and starts it. The app opens in its
-  own window. Close the window to stop it. `Uninstall AP Tuner.cmd` removes it again.
-* **Run without installing:** double-click **`AP Tuner.vbs`** (own window) or
-  **`start AP Tuner.cmd`** (browser tab plus a console window).
+* **Build the release** (needs the portable toolchain in `D:\toolchain`, see `cpp/README.md`):
+  `powershell -ExecutionPolicy Bypass -File tools\make-release.ps1` writes `D:\AP Tuner C++.zip`.
+* **Install:** unzip it and double-click **`Install AP Tuner.cmd`**: it copies the app to your user folder,
+  puts **AP Tuner** on the Desktop and in the Start Menu, and starts it in its own window (Microsoft Edge app
+  mode). Close the window to stop it. `Uninstall AP Tuner.cmd` removes it again.
+* **Run without installing:** double-click `aptuner.exe` in the unzipped folder.
 
-Nothing else to install: the `node` folder holds the runtime, no internet is used, and the whole
-folder is portable (copy it or the zip to any Windows PC).
-
+Nothing else to install: one program plus the `web` folder, no runtime, no internet.
 ## One guided flight (Flight tab, recommended)
 
 Press **Start flight check**. The app connects, reads the vehicle, and then leads you through one flight:
@@ -175,6 +217,9 @@ How a value is written (2026-10-17 audit, R3):
 
 ## Testing without a vehicle (SITL)
 
+> The `tools/*.js` helpers named in this section and the next belonged to the JavaScript edition: they are in the git
+> history (up to commit `35bc01c`). `sitl/pilot.js` (the scripted pilot) is still here and needs Node.js.
+
 `sitl\run-sitl.cmd` starts an ArduCopter software-in-the-loop (Windows build from
 firmware.ardupilot.org). `node sitl\pilot.js 5760 10` arms, takes off to 12 m and flies stick
 taps for 10 minutes. Connect AP Tuner to `127.0.0.1:5762` (TCP). Mission Planner can watch on
@@ -206,16 +251,18 @@ gain the app's model predicts (logs in `docs/validation/`, numbers in `docs/how-
 
 ## Files
 
-* `src/mavlink` MAVLink v2 parser/encoder generated from the dialect XML; `link.js` transport
-  (TCP, UDP, serial through a PowerShell bridge), parameters, message intervals.
-* `src/log/dfreader.js` DataFlash `.bin` reader.
-* `src/dsp` FFT, Welch spectra / coherence, Wiener step-response estimate.
-* `src/model` ArduPilot controller and filter transfer functions, plant model and fit,
-  loop-shaping synthesis, tuning rules.
-* `src/engine` live axis buffers and watchdog, the tuning session state machine (with a
-  QuikTune-style ramp fallback), live notch setup (ESC RPM / in-flight FFT), log analysis, notch
-  recommendation, parameter-file export; `paramwrite.js` verified writes, transactions and the reboot
-  workflow, `identity.js` the vehicle identity and proposal fingerprints, `journal.js` the write journal.
-* `src/model/parammeta.js` parameter types, ranges and the values that act only after a reboot.
-* `web` the browser UI (uPlot for charts). `test` synthetic end-to-end test
-  (`node test/synthetic.test.js`) and checks against real logs.
+* `cpp/core` the maths and analysis library (no I/O): `log/` DataFlash reader and time-stamp integrity;
+  `fft`, `spectra`, `stepresp`; `controller` (ArduPilot controller and filter transfer functions), `plant`,
+  `synth`, `timeid`, `rules`, `parammeta` (parameter types, ranges, reboot); `engine/` log analysis, notch
+  design, issues, parameter files, vehicle identity.
+* Model tuning of heavy / slow vehicles: `cpp/core/src/cascade.cpp` (the ArduPilot axis chain: margins,
+  slow-axis poles, marginal-mode identification, nonlinear simulation), `engine/flightrec.cpp` (one flight from a
+  log or live telemetry), `engine/heavy_data.cpp` (hovers, spectra, oscillations), `engine/heavy_ident.cpp`
+  (identification, plant sets, replay), `engine/heavy_design.cpp` (robust design, predictions),
+  `engine/heavytune.cpp` (the pipeline, diagnostics, steps, next-flight check); `cpp/app/heavylive.cpp` (live
+  recording, saved plans); `cpp/cli/heavy_main.cpp` (`aptuner-heavy`); `web/heavy.js` (the Model tune tab).
+* `cpp/io` event loop, MAVLink, TCP / UDP / serial links, auto-connect (Mission Planner mirror), log download.
+* `cpp/app` the application: HTTP + SSE server for `web/`, live tuner, guided flight, Telemetry + USB, live notch.
+* `cpp/tests` unit, golden, real-log and model-tuning tests (`cpp\build.cmd` builds and runs them).
+* `web` the user interface (uPlot for charts). `research/` (not packaged) the hand analysis of the tandem
+  QuadPlane that the model tuner implements.

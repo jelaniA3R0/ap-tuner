@@ -268,8 +268,9 @@ edition does the same, `tools/compare-cpp.js` checks it):
   Telemetry radios at 57600 baud give ~15 Hz; use a fast link or the log.
 * The model is linear; saturation, non-linear thrust and flexible frames are not modelled (the
   diagnostics flag saturation and high-frequency noise).
-* The app never changes `MOT_*`, `ATC_ACC_*_MAX`, `ATC_INPUT_TC` or other feel/limit parameters;
-  it reports what it would recommend.
+* The live tuner never changes `MOT_*`, `ATC_ACC_*_MAX`, `ATC_INPUT_TC` or other feel/limit parameters.
+  The model tuner for heavy / slow vehicles (below) *proposes* `ACC_*_MAX`, `RATE_*_MAX`, the pilot yaw rate,
+  `INPUT_TC`, `IMAX` and the gyro filter, each with its reason, in parameter files only; it never writes them.
 
 ## 4. Connection, installation and the live notch (second iteration)
 
@@ -380,3 +381,127 @@ analysis then:
 - **Notch from post-filter IMU data** only when the peak shows up in at least 80% of at least five 10 s
   airborne parts; otherwise it asks for the batch sampler (INS_LOG_BAT_MASK) or ESC telemetry.
 Worked example and the comparison with a hand tune: docs/validation/tandem-hover-logs.md.
+
+## Model-based tuning of heavy and slow vehicles (2026-10-22, C++: `cascade.cpp`, `engine/heavy*.cpp`)
+
+The tandem 4+1 QuadPlane (~100 kg, `docs/validation/tandem-hover-logs.md`) showed where the rules above stop
+working: yaw drifted 70-110 deg after every lift-off and pitch wobbled at 0.45 Hz. The rule-based proposals
+(QuikTune yaw ceiling 0.5, x2 per round, angle-P floor 3), evaluated on the validated models, gave pitch a phase
+margin of 6 deg and a 41 deg yaw swing, against 42 deg and 11 deg for the hand tune that flew. The model tuner
+implements that hand tune (`research/tandem-2026-10/` holds the reference scripts).
+
+**The axis chain** (`core/cascade`, checked against the ArduPilot source):
+- Pilot shaping: first order with `INPUT_TC` (yaw: `PLT_Y_RATE_TC`), then the acceleration limit `ACC_*_MAX` in
+  deg/s/s (older firmware: `ACCEL_*` in cdeg/s/s).
+- Angle controller: `sqrt_controller` with angle P and `clamp(ACC/2, 40..720)` deg/s/s (yaw: `10..120`). The
+  correction is limited to `RATE_*_MAX`, then the feed-forward is added.
+- Yaw heading error: limited to `min(inv_sqrt_controller(1/rate P, angle P, accel), 45 deg)`, with the target dragged
+  along (`thrust_heading_rotation_angles`). That is 45 deg at stock gains and 31 deg at rate P 2.5, not a fixed 45.
+- Rate PID: `AC_PID::update_all` (FLTT, FLTE, D on the FLTD-filtered error derivative, the integrator frozen in the
+  saturated direction while LIMIT is set, IMAX).
+- Then the mixer limit u_max, transport delay T, motor lag tau, and the vehicle `rate' = a (u - trim) - c rate` (+ gusts).
+- Gyro: 2-pole Butterworth at `INS_GYRO_FILTER`.
+
+**Margins.** `L(s) = G FE Cr (FT K / s + Fg)`, broken at the plant input.
+- Phase margin: at the last gain crossover of the unwrapped phase.
+- Gain margin: only at the first -180 deg crossing above it. The rate-I + angle-P cascade passes -180 deg far below
+  the crossover with |L| >> 1; that is harmless conditional stability (the first hand draft counted it by mistake).
+- Ms = max |1/(1+L)|.
+- Slow axes also get the poles of `s^3 + (aP + c) s^2 + a (PK + I) s + aIK`. Stock tandem yaw: zeta 0.12, period 16 s,
+  which is the swing seen in every hover.
+
+**Hovers.**
+- The controller flies (PID `RESET` flag clear; telemetry: armed) in a VTOL mode, with the throttle above 60% of the
+  median, for at least 8 s, never across a tuning-parameter change.
+- Lift-off is where the throttle reaches 90% of the hover's median: before that the ground holds the vehicle. (The
+  controller output rises earlier, on the ground, at high gains.)
+
+**Diagnostics**, each in plain words and marked "tuning can't fix this" where it is mechanical:
+- Torque imbalance: steady yaw output, I term against IMAX, CCW motors 1+2 against CW 3+4.
+- Mixer limit: the median output while LIMIT is set, but at least the 99th percentile actually delivered (telemetry
+  has no flags: the latter only). Then the headroom left after the trim, the achievable acceleration both ways
+  `a (u_max -+ trim)`, and the stopping distance of a drift.
+- CG from the front / rear thrust split, using the thrust curve (`*_SPIN_MIN/MAX`, `*_THST_EXPO`, PWM range),
+  cross-checked with the pitch I term; in cm when the motor spacing is given.
+- 0.2-3 Hz oscillations: 10 s windows, the largest cluster of peaks within +-15% (a second cluster is kept), the
+  target-vs-actual phase, the I-term swing, and growth within a hover.
+- Motors at their top output; the slew limiter.
+- Gyro and output above 15 Hz, compared with the saved plan's flights and between flights (more than x2 means
+  mechanical).
+- Hover throttle against `*_THST_HOVER`; altitude hold in the altitude modes; compass messages and field strength.
+
+**Identification as a set of plants.**
+- **Yaw** (a slow axis with a constant disturbance): windowed integral regression on the rate data,
+  `r(t1) - r(t0) = a int(u) - c int(r) + d_k (t1 - t0)`.
+  - 1 s windows, 1.5 s left out after lift-off, 0.1 s averages at the window ends, one trim `-d_k/a` per hover.
+  - Motor lag tried at 0 / 0.1 / 0.2 / 0.3 s. It is not identifiable, so the set spans 0.1-0.4 s.
+  - The spread of a comes from leaving one hover out at a time, and is at least x0.8 / x1.25.
+  - The set: nominal; weak and slow (c = 0); strong with slow motors; strong with fast motors; large trim.
+- **Roll / pitch** (an oscillating cascade): at the oscillation the loop sits at L ~ -1, so
+  `G(jw0) = -1 / (FE Cr (FT K / jw0 + Fg))` with the flown gains. |G| gives a; the phase gives tau for T = 10 and 25 ms.
+  - Every window frequency in the cluster, and a second wobble frequency, widens the range of a.
+  - The set: a over that range (at least x0.82 / x1.2) x tau x T.
+  - The naive regression of the rate on the output is not used: in closed loop it tends to -1/controller
+    (R^2 0.02-0.07 on the tandem).
+- **No oscillation** (a well-tuned flight): the saved model of the vehicle is used. A new fit that disagrees with it by
+  more than x1.5 is added to the set ("the model is uncertain, the design must hold for both").
+
+**Validation gate.**
+- Yaw: every hover is replayed from lift-off with the logged stick, the gains in effect and the hover's own trim. A
+  hover passes when the heading swing is within 5 deg (or 12%), the heading RMS is 30 deg or less, and the output at
+  1 Hz and below is within 0.07 + 0.03 x rate P. The model is validated when 60% of the hovers pass.
+- Roll / pitch: with the flown gains, the model must oscillate at the logged frequency +-15% (gust-driven simulation),
+  have its worst phase margin in -20..+10 deg, and be able to get as lively as the flight. When the flight shows no
+  oscillation, the model must predict none.
+- A validated axis may jump to its design in one step (the tandem yaw went x8 and flew as predicted). Otherwise, per
+  step: P and I move at most x2, D x1.5, angle P x1.5, and the step says why.
+
+**Design**, only for the heavy / weak class: yaw a < 1 or roll / pitch a < 20 rad/s/s per unit, or a confirmed cascade.
+- **Roll and pitch together**, for each gyro-filter route (as flown, and half of it with FLTT = FLTD = filter/2):
+  - Search: rate P around `1 / (3 (tau + T) a)` (the bandwidth the lags allow), I/P 0.1-0.5, D x1 / x1.5 / x2.5,
+    angle P 0.75-3.
+  - Accepted: worst-case PM >= 40 deg, upper GM >= 10 dB and Ms <= 1.8 on every plant, and output noise at the
+    measured vibration peaks (or 1.25 / 1.85 x the gyro filter) no more than +15%.
+  - Ranked by time simulations on the nominal and the slow plant: lift-off with the trim and I = 0, gust wander, a
+    5 deg step (overshoot and rise), late oscillation, output limited. Within 10% of the best score, the one with the
+    most phase margin wins.
+  - The filter route is chosen for both axes together: on the tandem, a filter change alone made roll worse.
+- **Yaw:**
+  - Search: rate P up to the bandwidth the slowest motors allow, I/P 0.05-0.1, angle P 1-3.
+  - Accepted when the slow pair has zeta >= 0.35 on the nominal plant and >= 0.2 on every corner. The angle loop sits
+    close to the rate loop by design, so the loop phase margin is reported but not used as a gate: the flown and
+    confirmed Step 2 has a low one.
+  - Ranked by lift-off swing, late oscillation, a yaw gust and two pilot turns, on every plant.
+  - Stress tests: +50 ms delay, rotor-inertia kick x2 and x4, gyro noise.
+- **Limits from physics:**
+  - `ACC_R/P_MAX` <= 70% of `a (u_max - |trim|)`, the same for both axes, never above the current value.
+  - `ACC_Y_MAX` = 1.25 x the stronger direction (the weak direction is the torque imbalance, reported separately).
+  - `RATE_Y_MAX` = `PLT_Y_RATE` = `RATE_WPY_MAX`: the largest step whose stopping distance is 15 deg or less.
+  - IMAX >= |trim| + 0.2; `INPUT_TC` >= 0.2.
+
+**Steps and files.** Yaw first, then roll + pitch + filter. Each step has:
+- the rows with their reasons;
+- a `.param` file (checked values, `# was` comments, the vehicle named) and an UNDO file with the values as flown;
+- the predicted results: for yaw the heading-swing range over the set and the damping; for roll / pitch the worst PM,
+  whether a wobble is expected, gust wander, step overshoot and lift-off tilt;
+- a reboot note when `INS_GYRO_FILTER` changes, and the test card.
+
+On a QuadPlane the Q_ values are only in Mission Planner's Full Parameter List (Extended Tuning shows the fixed-wing ones).
+
+**Next-flight check.** Every analysis saves a plan (`sessions/plans/sysid-N/`). The next analysis of that vehicle (not
+of the same flights):
+1. finds which step was flown: its values are in effect, or its parameters moved away from the plan's starting values
+   ("flown with other values");
+2. predicts with the saved model, for the gains actually flown and this flight's torque trim;
+3. compares: the yaw swing must fall within the predicted range +-20% (or 3 deg); a wobble expected or not;
+4. re-fits the model and proposes the next step, or says to stop.
+
+On the tandem: Step 1 predicted 15-21 deg, flew 13; Step 2 predicted 8-11 deg, flew 11 (the hand predictions were
+14-20 and 9-11).
+
+**Live.** With the vehicle connected (Mission Planner's mirror is found automatically), the app:
+- reads the settings it needs;
+- asks for the telemetry streams (PID_TUNING needs `GCS_PID_MASK = 7`, which the app reports but does not set);
+- records each flight from arming to disarming and analyses it after landing.
+
+25 Hz telemetry is enough for these slow motions; only the vibration checks need a log. Nothing is written to the vehicle.

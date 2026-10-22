@@ -373,7 +373,7 @@ AxisModel AxisModel::fromJson(const Json& j) {
 double logYawSwing(const FlightRecord& f, const Hover& h) {
   const Series& hd = f.axis[2].ang;
   if (hd.empty()) return std::nan("");
-  const double ts = h.tLift - 0.5, h0 = hd.at(ts);
+  const double ts = h.tLift, h0 = hd.at(ts);
   double mx = 0;
   for (std::size_t i = hd.indexAt(ts); i < hd.size() && hd.t[i] <= std::min(h.t1, ts + 40); ++i)
     if (hd.t[i] >= ts) mx = std::max(mx, std::fabs(cc::wrap180(hd.v[i] - h0)));
@@ -383,7 +383,7 @@ double logYawSwing(const FlightRecord& f, const Hover& h) {
 YawReplay replayYaw(const FlightRecord& f, const Hover& h, std::size_t hoverIdx, const cc::Gains& g, const cc::Plant& p) {
   YawReplay r;
   r.hover = hoverIdx;
-  const double ts = h.tLift - 0.5;
+  const double ts = h.tLift;   // lift-off: the throttle reaches 90% of hover
   cc::SimInput in;
   in.seconds = std::max(1.0, h.t1 - ts);
   in.recordHz = 10;

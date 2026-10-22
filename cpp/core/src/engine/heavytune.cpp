@@ -95,7 +95,12 @@ MixLimit mixerLimit(const std::vector<FlightRecord>& fl, const std::vector<Hover
   std::size_t n = 0, nl = 0;
   for (const Hover& h : hv) {
     const AxisRec& a = fl[h.flight].axis[static_cast<std::size_t>(axis)];
-    if (a.flags.empty()) continue;
+    if (a.flags.empty()) {
+      // telemetry has no LIMIT flags: the largest outputs delivered bound the limit from below
+      for (std::size_t i = a.out.indexAt(h.tLift); i < a.out.size() && a.out.t[i] <= h.t1; ++i)
+        if (a.out.t[i] >= h.tLift) all.push_back(std::fabs(a.out.v[i]));
+      continue;
+    }
     for (std::size_t i = a.flags.indexAt(h.tLift); i < a.flags.size() && a.flags.t[i] <= h.t1; ++i) {
       const double t = a.flags.t[i];
       if (t < h.tLift) continue;
