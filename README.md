@@ -204,9 +204,10 @@ Wrong settings can crash an aircraft; you are responsible for what you fly.
 QuadPlane models) and on real logs, not by in-air tuning of a real aircraft. **Allow changes in flight** is
 experimental and off by default.
 
-**Not checked on every platform.** The C++ code is built and tested on Windows (clang); GitHub Actions also builds it
-with MSVC, GCC (Linux) and Clang (macOS). The installer and the app window are Windows only; on Linux / macOS the app
-runs as a local web server (`aptuner --open`).
+**Not checked on every platform yet.** Built and fully tested on Windows with Clang 23 and with GCC 16 (warnings as
+errors, every test passing on both). The GitHub Actions workflow builds with MSVC (Windows), GCC (Linux) and Clang
+(macOS); it has not run yet, and the Linux / macOS serial-port and socket code has only been compiled there. The
+installer and the app window are Windows only; on Linux / macOS the app runs as a local web server (`aptuner --open`).
 
 ## Safety
 

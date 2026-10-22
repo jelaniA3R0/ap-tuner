@@ -101,10 +101,10 @@ struct ScopeExit {
 
 TripError::TripError(Trip t) : rt::Error("oscillation: " + join(t.reasons, "; "), "trip"), trip(std::move(t)) {}
 
-Tuner::Tuner(io::Link& lk, const std::string& sessionDir, Journal* journal) : link(lk), sessionDir_(sessionDir) {
+Tuner::Tuner(io::Link& lk, const std::string& sessionDir, Journal* sharedJournal) : link(lk), sessionDir_(sessionDir) {
   // R3: the journal file of the app run (or one of its own)
-  if (journal) {
-    audit_ = journal;
+  if (sharedJournal) {
+    audit_ = sharedJournal;
   } else {
     ownJournal_ = std::make_unique<Journal>(pathStr(fsPath(sessionDir) / "journal"));
     audit_ = ownJournal_.get();

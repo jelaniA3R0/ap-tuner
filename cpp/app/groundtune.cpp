@@ -107,14 +107,14 @@ std::string GroundTune::familyOf(const Json& v) const {
   if (!v.isObject()) return "";
   const std::string m = v["modeName"].strOr("");
   if (!m.empty() && m[0] == 'Q') return "vtol";
-  const auto& pm = goodModes("plane");
+  const std::vector<std::string> pm = goodModes("plane");   // a copy (GCC -Wdangling-reference)
   return std::find(pm.begin(), pm.end(), m) != pm.end() || v["type"].numOr(0) == 1 ? "plane" : "copter";
 }
 
 bool GroundTune::modeOk(const Json& v) const {
   const std::string fam = familyOf(v);
   if (fam.empty()) return false;
-  const auto& gm = goodModes(fam);
+  const std::vector<std::string> gm = goodModes(fam);
   return std::find(gm.begin(), gm.end(), v["modeName"].strOr("")) != gm.end();
 }
 

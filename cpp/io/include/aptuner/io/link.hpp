@@ -42,7 +42,7 @@ struct ParamInfo {
 /** a failed request: code "timeout", "cancelled", "link-changed" or "rebooted"; attempts = PARAM_SETs / reads sent */
 class LinkError : public rt::Error {
  public:
-  LinkError(const std::string& msg, const std::string& code, int attempts) : rt::Error(msg, code), attempts(attempts) {}
+  LinkError(const std::string& msg, const std::string& code, int nAttempts) : rt::Error(msg, code), attempts(nAttempts) {}
   int attempts;
 };
 
