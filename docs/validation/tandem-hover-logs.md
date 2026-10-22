@@ -98,3 +98,54 @@ To treat with care:
 new code: all roll/pitch gains, grades and changes identical. Only yaw changed: those flights had no yaw
 stick input, so yaw is now "not gradable" instead of A/B; the hover-data fit is not used there (the
 aircraft barely moved in yaw, < 2 deg/s RMS). `test/synthetic.test.js` passes.
+
+## Model-based tuning (2026-10-22, C++ `aptuner-heavy` / the Model tune tab)
+
+Same airframe, the 15 Oct logs analysed together, then the 21 Oct flights checked against the saved plan
+(`aptuner-heavy <logs> --plan plan.json`; `cpp/tests/test_heavy.cpp` runs all of it as a regression test).
+
+### What the app finds (15 Oct, 5 hovers)
+
+| | app (model tuning) | hand analysis |
+|---|---|---|
+| yaw control power a, damping c | 0.19, 0.15 (range 0.15-0.24) | 0.20, 0.165 |
+| yaw trims per hover | 0.37, 0.42, 0.44, 0.37, 0.43 | 0.37-0.45 |
+| yaw mixer limit u_max | 0.66 (LIMIT flags) | 0.57-0.67 |
+| yaw replay, heading swing log / model | 67/66, 108/100, 83/82, 91/84, 76/76 deg (5 of 5 pass) | 67/66, 109/107, 84/89, 92/91, 75/77 |
+| torque imbalance | flagged, "tuning can't fix", CCW 1801 us vs CW 1451 us | the same |
+| pitch | cascade at 0.46 Hz, a 6.1 (4.6-7.3), tau 0.06-0.08 s, worst PM -10 deg with the flown gains | 0.43-0.48 Hz, a 5.8, tau 0.06-0.09, PM ~0 |
+| roll | marginal: wobbles at 0.42 Hz and 0.76 Hz; a 5.1, range 3.7-16 (the two frequencies) | a 7-12 (assumed range) |
+| CG | 5.7% of the front-rear spacing aft (44/56% thrust; pitch I -0.11 agrees) | 3% (47/53%, other windows) |
+| vibration above 15 Hz, pitch gyro | 2.4 deg/s | 2.3 |
+| hover throttle | 0.46 against Q_M_THST_HOVER 0.36 | the same |
+
+The roll range is wide because the roll wobble has two frequencies (0.42 and 0.76-0.82 Hz) and the 21 Oct flights
+show the higher one. The app does not pick one: the roll design must hold for the whole range.
+
+### Old app, new app, hand tune, flown (15 Oct logs)
+
+| | old app (rules, 16 Oct) | new app (model) | hand tune | flown outcome |
+|---|---|---|---|---|
+| yaw | P 0.36, I 0.036, ANG 3; model: 41 deg lift-off swing, still oscillating | P 3.1, I 0.155, IMAX 0.7, ANG 1.0, RATE_Y_MAX / PLT_Y_RATE / RATE_WPY_MAX 20, ACC_Y_MAX 15; predicted swing 9-13 deg | steps P 1.5 / 2.5 / 3.5, I/P ~0.07, ANG 1-1.5, IMAX 0.7, limits 20 / 15 / 20 | Step 1: 13 deg, Step 2: 11 deg, steady |
+| pitch | P = I = 0.5, D 0.0054, ANG 3: worst PM 6 deg | gyro 10, P 0.71, I 0.21, D 0.009, ANG 0.75, ACC 90, INPUT_TC 0.2: worst PM 43 deg (41 on the hand's set) | gyro 10, P 0.5, I 0.15, D 0.009, ANG 1.0, ACC 100: PM 42 | 22 Oct: "very good" |
+| roll | P = I = 0.5, D 0.007, ANG 3: worst PM 11 deg | P 0.36, I 0.072, D 0.009, ANG 0.75: worst PM 47 deg (46 on the hand's set) | P 0.4, I 0.1, D 0.009, ANG 1.0: PM 40 | 22 Oct: "very good" |
+
+The flown 22 Oct pitch set has a worst phase margin of 43 deg on the app's pitch model (hand: 42); the flown roll set
+42 deg on the 15 Oct roll model and 28 deg on the wider range that includes the 21 Oct roll frequency, which is why the
+app proposes a slightly softer roll rate P after the 21 Oct flights (0.26). The app's pitch rate P is higher than the hand's
+(0.71 against 0.5) with the same margin target; both pass every test on both models.
+
+### Predicted against flown (next-flight check)
+
+| flight | recognised as | yaw heading swing predicted / flown | pitch | verdict |
+|---|---|---|---|---|
+| `2026-10-21 00-34-01` (yaw P 1.5, I 0.11, ANG 1, limits 20/15/20) | Step 1, flown with other values (P 1.5 against the proposed 3.1) | 15-21 / 13 deg (with this flight's trim 0.33; hand: 14-20) | wobble expected, still there (0.46 Hz, +-5 deg) | confirmed; yaw re-fit a 0.29, c 0.22, trim 0.33 (hand re-fit 0.31, 0.11, 0.34) |
+| `2026-10-21 01-11-37` (yaw P 2.5, I 0.19) | Step 1 (other values) | 8-11 / 11 deg (hand: 9-11) | growing wobble detected (+-5 deg growing to +-8) | confirmed; "keep the yaw settings you fly"; roll + pitch step proposed |
+
+Things to know:
+- On 21 Oct the pitch gyro above 15 Hz was 7.2 and 9.7 deg/s against 2.4 on 15 Oct (x3-4): flagged as mechanical
+  (props, mounts, flight-controller mount), as in the hand analysis.
+- The Step 1 flight's yaw model differs from 15 Oct (a 0.29 against 0.19); the design holds for both.
+- The 22 Oct log (pitch / roll set flown, "very good") is not on this PC yet. Analysing it with the saved plan will check
+  the pitch / roll prediction (no 0.4-0.5 Hz peak expected) and review QHOVER / QLOITER (hover throttle learning,
+  altitude hold, compass).

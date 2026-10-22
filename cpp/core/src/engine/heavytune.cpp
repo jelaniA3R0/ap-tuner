@@ -332,6 +332,22 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
   models[2] = yawModel(yid, my.measured ? my.umax : std::max(0.5, my.umax), my.measured);
   if (models[2].ok) {
     for (std::size_t k = 0; k < yid.hoverIdx.size(); ++k) yawTrims.push_back({yid.hoverIdx[k], yid.trims[k]});
+    // a saved yaw model that disagrees with this fit: the design must hold for both
+    AxisModel pm = planModel(2);
+    if (pm.ok) {
+      const double ratio = models[2].set[0].a / pm.set[0].a;
+      if (ratio > 1.3 || ratio < 1 / 1.3) {
+        const double shift = models[2].trim - pm.trim;
+        for (auto p : pm.set) {
+          p.trim += shift;
+          p.umax = models[2].umax;
+          models[2].set.push_back(p);
+        }
+        models[2].method += " + saved model (they disagree)";
+        modelNotes.push_back("yaw: this flight gives control power " + num(models[2].set[0].a, 2) + ", the saved model " + num(pm.set[0].a, 2) +
+                             ": the yaw design must hold for both");
+      }
+    }
   } else {
     AxisModel pm = planModel(2);
     for (std::size_t hi = 0; hi < hovers.size(); ++hi) {
@@ -726,6 +742,16 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
       bool any = false;
       for (int a : G.axes) any = any || design.axes[static_cast<std::size_t>(a)].ok;
       if (!any) continue;
+      // what is flown already passes every test and the design is not clearly better (15%): keep it
+      bool keep = true;
+      for (int a : G.axes) {
+        const AxisDesign& d = design.axes[static_cast<std::size_t>(a)];
+        if (d.ok && !(d.flownAcceptable && d.score >= 0.85 * d.flownScore)) keep = false;
+      }
+      if (keep) {
+        notesJ.push("Keep the " + G.title + " settings you fly: they pass every test on the model and the design would not be clearly better.");
+        continue;
+      }
       for (int stepNo = 0; stepNo < 4; ++stepNo) {
         std::vector<Row> rows;
         std::array<cc::Gains, 3> nx = cur;
@@ -738,7 +764,12 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
           cc::Gains& g = nx[A];
           const bool jump = valid[A];
           auto mv = [&](double from, double to, double k) {
-            const double v = jump ? to : towards(from, to, k);
+            double v = jump ? to : towards(from, to, k);
+            // an intermediate step: two significant figures
+            if (std::fabs(v - to) > 1e-12 && v > 0) {
+              const double e = std::pow(10.0, std::floor(std::log10(v)) - 1);
+              v = std::round(v / e) * e;
+            }
             if (std::fabs(v - to) > 1e-9) limited = true;
             return v;
           };
@@ -767,7 +798,7 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
           if (a != 2) add("D", cur[A].D, g.D, "rate D", reasonTxt);
           add("IMAX", cur[A].IMAX, g.IMAX, "I limit", d.lim.why.size() > 2 && a == 2 ? d.lim.why[2] : "holds the measured trim with 0.2 to spare");
           add("ANG", cur[A].angleP, g.angleP, "angle P", "the angle loop must stay slower than the rate loop (cascade rule)");
-          add("ACC", cur[A].accMax, g.accMax, "acceleration limit (deg/s/s)", d.lim.why.empty() ? "what the vehicle can do" : d.lim.why[0]);
+          add("ACC", cur[A].accMax, g.accMax, "acceleration limit (deg/s/s)", d.lim.why.empty() ? "what the vehicle can do" : a == 2 ? d.lim.why[0] : "70% of what the vehicle can do, the same for roll and pitch: " + [&] { std::string s; for (const auto& w : d.lim.why) s += (s.empty() ? "" : "; ") + w; return s; }());
           if (a == 2) {
             add("RMAX", cur[A].rateMax, g.rateMax, "rate limit (deg/s)", d.lim.why.size() > 1 ? d.lim.why[1] : "stopping distance");
             add("PLT_RATE", cur[A].pltRate, g.pltRate, "pilot yaw rate (deg/s)", "the same as the rate limit");

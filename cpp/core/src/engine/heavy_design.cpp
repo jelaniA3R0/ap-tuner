@@ -201,7 +201,16 @@ AxisDesign designRp(const cc::Gains& cur, const AxisModel& m, double gyroHz, dou
   d.wm = pick->wm;
   d.noiseRatio = pick->noiseRatio;
   d.metrics = pick->metrics;
+  d.score = pick->score;
   d.ok = true;
+  // the flown gains on the same tests: when they pass and the design is not clearly better, nothing needs to change
+  {
+    const cc::WorstMargins fw = cc::worstMargins(cur, m.set);
+    const RpMetrics a = rpMetrics(cur, nom), b = rpMetrics(cur, slow);
+    d.flownScore = std::max(a.takeoff, b.takeoff) + 2 * std::max(a.gustRms, b.gustRms) + std::max(a.overshoot, b.overshoot) +
+                   2 * std::max(a.rise, b.rise) + 2 * std::max(a.lateP2p, b.lateP2p) + 20 * std::max(a.lim, b.lim);
+    d.flownAcceptable = fw.pmDeg >= 40 && fw.gmDb >= 10 && fw.ms <= 1.8;
+  }
   (void)axis;
   return d;
 }
@@ -437,7 +446,21 @@ Design designAll(const DesignInputs& in) {
   dy.g = pick->g;
   dy.wm = pick->wm;
   dy.metrics = pick->metrics;
+  dy.score = pick->score;
   dy.ok = true;
+  {
+    double zMin = 1, worst = 0;
+    bool stable = true;
+    for (const auto& p : my.set) {
+      const cc::Poles po = cc::slowAxisPoles(p.a, p.c, yawCur.P, yawCur.I, yawCur.angleP);
+      zMin = std::min(zMin, po.zeta);
+      stable = stable && po.stable;
+      worst = std::max(worst, yawMetrics(yawCur, p).score);
+    }
+    const double zNom = cc::slowAxisPoles(n.a, n.c, yawCur.P, yawCur.I, yawCur.angleP).zeta;
+    dy.flownScore = worst;
+    dy.flownAcceptable = stable && zNom >= 0.35 && zMin >= 0.2 && cc::worstMargins(yawCur, my.set).gmDb >= 6 && yawCur.IMAX >= std::fabs(my.trimMax) + 0.15;
+  }
   dy.lim = lim;
   // stress tests of the winner (stages.js): +50 ms delay, rotor kick x2 / x4, gyro noise
   Json st = Json::array();

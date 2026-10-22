@@ -175,6 +175,9 @@ struct AxisDesign {
   int candidates = 0, accepted = 0;
   Limits lim;
   Json metrics = Json::object(), stress = Json::object();
+  double score = 0;              // the design's time-domain score (lower is better)
+  bool flownAcceptable = false;  // the flown gains pass every acceptance test on this model
+  double flownScore = 0;         // and their score
 };
 
 struct DesignInputs {

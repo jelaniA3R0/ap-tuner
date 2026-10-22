@@ -16,6 +16,7 @@ New-Item -ItemType Directory -Force $dst | Out-Null
 Copy-Item (Join-Path $bin 'app\aptuner.exe') $dst
 Copy-Item (Join-Path $bin 'cli\aptuner-analyze.exe') $dst
 Copy-Item (Join-Path $bin 'cli\aptuner-link.exe') $dst
+Copy-Item (Join-Path $bin 'cli\aptuner-heavy.exe') $dst
 robocopy (Join-Path $root 'web') (Join-Path $dst 'web') /E /NFL /NDL /NJH /NJS /NP | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $dst 'docs') | Out-Null
 robocopy (Join-Path $root 'docs') (Join-Path $dst 'docs') /E /NFL /NDL /NJH /NJS /NP | Out-Null
