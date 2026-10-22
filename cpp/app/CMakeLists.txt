@@ -11,6 +11,7 @@ add_library(aptuner_app STATIC
   groundtune.cpp
   http.cpp
   server.cpp
+  heavylive.cpp
 )
 target_include_directories(aptuner_app PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(aptuner_app PUBLIC aptuner_io)
