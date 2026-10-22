@@ -109,7 +109,16 @@ Json analyseAndSave(const std::vector<heavy::FlightRecord>& flights, const std::
 
 // ------------------------------------------------------------------------------------------------- live
 
-HeavyLive::HeavyLive(io::Link& link, std::string sessionsDir) : link_(link), sessionsDir_(std::move(sessionsDir)) {}
+HeavyLive::HeavyLive(io::Link& link, std::string sessionsDir) : link_(link), sessionsDir_(std::move(sessionsDir)) {
+  // always subscribed: the live readout (message rates, attitude) works before recording; recording needs start()
+  for (const char* m : {"PID_TUNING", "ATTITUDE", "NAV_CONTROLLER_OUTPUT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "VFR_HUD", "HEARTBEAT", "STATUSTEXT", "VIBRATION"}) {
+    const std::string name = m;
+    handlers_.push_back(link_.on(name, [this, name](const Json& f) { onMsg(name, f); }));
+  }
+  handlers_.push_back(link_.on("reboot", [this](const Json&) {
+    if (listening_) requestStreams();
+  }));
+}
 
 void HeavyLive::setState(const std::string& s, const std::string& info) {
   state_ = s;
@@ -120,8 +129,16 @@ void HeavyLive::setState(const std::string& s, const std::string& info) {
 Json HeavyLive::state() const {
   Json pid = Json::object();
   for (int a = 0; a < 3; ++a) pid.set(core::axisName(static_cast<core::Axis>(a)), std::round(rec_.pidSeconds(a)));
+  Json rates = Json::object();
+  const double now = Loop::now() / 1000;
+  for (const auto& [k, q] : seen_) {
+    std::size_t n = 0;
+    for (double x : q)
+      if (x >= now - 3) ++n;
+    rates.set(k, std::round(static_cast<double>(n) / 3.0 * 10) / 10);
+  }
   return Json::obj({{"state", state_}, {"info", info_}, {"listening", listening_}, {"armed", rec_.armed()}, {"flights", flights_},
-                    {"recordedS", rec_.startS() >= 0 ? std::round(rec_.lastS() - rec_.startS()) : 0.0}, {"pidSeconds", pid}, {"warnings", warnings_}});
+                    {"recordedS", rec_.startS() >= 0 ? std::round(rec_.lastS() - rec_.startS()) : 0.0}, {"pidSeconds", pid}, {"warnings", warnings_}, {"rates", rates}, {"attitude", att_}, {"mode", customMode_}, {"link", link_.description()}});
 }
 
 void HeavyLive::requestStreams() {
@@ -184,28 +201,29 @@ rt::Task<Json> HeavyLive::start() {
     warnings_.push("GCS_PID_MASK is " + std::to_string(static_cast<int>(params_["GCS_PID_MASK"].numOr(0))) +
                    ": the autopilot does not send the PID telemetry (rate target, actual, P / I / D). In Mission Planner set GCS_PID_MASK = 7 "
                    "(Full Parameter List, Write Params). The app does not change it for you. Without it only the heading and motors can be judged.");
-  if (!listening_) {
-    for (const char* m : {"PID_TUNING", "ATTITUDE", "NAV_CONTROLLER_OUTPUT", "RC_CHANNELS", "SERVO_OUTPUT_RAW", "VFR_HUD", "HEARTBEAT", "STATUSTEXT", "VIBRATION"}) {
-      const std::string name = m;
-      handlers_.push_back(link_.on(name, [this, name](const Json& f) { onMsg(name, f); }));
-    }
-    handlers_.push_back(link_.on("reboot", [this](const Json&) { requestStreams(); }));
-    listening_ = true;
-  }
+  listening_ = true;
   requestStreams();
   setState("waiting", "listening: arm and fly a hover; the recording starts when the vehicle arms and is analysed after it lands");
   co_return state();
 }
 
 void HeavyLive::stop() {
-  for (auto id : handlers_) link_.off(id);
-  handlers_.clear();
   listening_ = false;
   setState("idle", "stopped");
 }
 
 void HeavyLive::onMsg(const std::string& type, const Json& f) {
   const double t = Loop::now() / 1000;
+  {
+    auto& q = seen_[type];
+    q.push_back(t);
+    while (!q.empty() && q.front() < t - 3) q.pop_front();
+  }
+  if (type == "ATTITUDE")
+    att_ = Json::obj({{"roll", std::round(f["roll"].numOr(0) * 573) / 10}, {"pitch", std::round(f["pitch"].numOr(0) * 573) / 10},
+                      {"yaw", std::round(std::fmod(f["yaw"].numOr(0) * 57.3 + 360, 360) * 10) / 10}});
+  if (type == "HEARTBEAT" && f["type"].numOr(0) != 6) customMode_ = f["custom_mode"].numOr(-1);
+  if (!listening_) return;
   const bool before = rec_.armed();
   if (type == "HEARTBEAT") {
     // the autopilot's heartbeat only (a ground station's is type 6)

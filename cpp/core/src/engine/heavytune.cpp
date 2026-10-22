@@ -201,6 +201,16 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
     return res;
   }
   const log::Params flownP = hovers.back().params;   // the latest settings
+  {
+    // the tuning settings in effect (what "check my values" starts from)
+    Json fp = Json::object();
+    const std::string rc = "RC" + std::to_string(static_cast<int>(flownP.getOr("RCMAP_YAW", 4))) + "_";
+    for (const auto& [k, v] : flownP.items())
+      if (k.rfind("Q_A_", 0) == 0 || k.rfind("ATC_", 0) == 0 || k.rfind("Q_PLT_", 0) == 0 || k.rfind("PILOT_Y_", 0) == 0 || k.rfind(rc, 0) == 0 ||
+          k == "INS_GYRO_FILTER" || k == "SCHED_LOOP_RATE" || k == "RCMAP_YAW" || k == "Q_ENABLE")
+        fp.set(k, v);
+    res.set("flownParams", fp);
+  }
   std::array<cc::Gains, 3> flown;
   for (int a = 0; a < 3; ++a) flown[static_cast<std::size_t>(a)] = gainsFromParams(flownP, fam, a);
 
@@ -857,7 +867,9 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
       const ParamFileOut pf = paramFileChecked(rowsJson(rows, false), {head, "Proposals only: check the values before writing."}, ident, true);
       const ParamFileOut uf = paramFileChecked(rowsJson(rows, true), {"UNDO for " + title + ": the values as flown before this step."}, ident, false);
       Json rj = Json::array();
-      for (const Row& r : rows) rj.push(Json::obj({{"group", r.group}, {"name", r.name}, {"label", r.label}, {"from", r.from}, {"to", r.to}, {"reason", r.reason}}));
+      for (const Row& r : rows)
+        rj.push(Json::obj({{"group", r.group}, {"name", r.name}, {"label", r.label}, {"from", r.from}, {"to", r.to}, {"reason", r.reason},
+                           {"text", core::formatParamValue(r.name, r.to)}, {"fromText", std::isfinite(r.from) ? Json(core::formatParamValue(r.name, r.from)) : Json()}}));
       steps.push(Json::obj({{"n", static_cast<int>(s + 1)}, {"title", title}, {"rows", rj}, {"predicted", pred}, {"reboot", reboot}, {"testCard", card},
                             {"paramText", pf.text}, {"undoText", uf.text}, {"paramErrors", pf.errors}, {"paramWarnings", pf.warnings},
                             {"jump", std::all_of(rows.begin(), rows.end(), [&](const Row& r) {
@@ -1001,6 +1013,122 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
   res.set("summary", summary);
   res.set("notes", notesJ);
   return res;
+}
+
+// ------------------------------------------------------------------------------------------------- check my values
+
+double exactValue(const std::string& name, double value) { return std::stod(core::formatParamValue(name, value)); }
+
+Json evaluateSettings(const Json& result, const Json& rows) {
+  const Family fam = core::parseFamily(result["vehicle"]["family"].strOr("vtol")).value_or(Family::Vtol);
+  log::Params base;
+  if (result["flownParams"].isObject())
+    for (const auto& [k, v] : result["flownParams"].items())
+      if (v.isNumber()) base.set(k, v.num());
+  log::Params p = base;
+  Json rowsOut = Json::array();
+  bool allOk = true;
+  std::vector<std::string> names;
+  for (const auto& r : rows.isArray() ? rows.arr() : Json::Array{}) {
+    const std::string name = r["name"].strOr("");
+    double v = r["value"].isNumber() ? r["value"].num() : std::nan("");
+    if (r["value"].isString()) {
+      try {
+        std::size_t used = 0;
+        const std::string s = r["value"].str();
+        v = std::stod(s, &used);
+        if (used != s.size()) v = std::nan("");
+      } catch (const std::exception&) {
+        v = std::nan("");
+      }
+    }
+    Json errors = Json::array(), warnings = Json::array();
+    std::string text;
+    if (name.empty() || !std::isfinite(v)) {
+      errors.push("is not a number");
+    } else {
+      v = exactValue(name, v);
+      text = core::formatParamValue(name, v);
+      const core::ParamCheck c = core::validateParam(name, Json(v));
+      for (const auto& e : c.errors) errors.push(e);
+      for (const auto& w : c.warnings) warnings.push(w);
+      if (!base.has(name)) warnings.push("is not among the settings of the analysed flights: the model cannot judge it");
+      p.set(name, v);
+      names.push_back(name);
+    }
+    const bool ok = errors.size() == 0;
+    allOk = allOk && ok;
+    rowsOut.push(Json::obj({{"name", name}, {"value", std::isfinite(v) ? Json(v) : Json()}, {"text", text}, {"ok", ok}, {"errors", errors}, {"warnings", warnings}}));
+  }
+  Json axes = Json::object();
+  for (int a = 0; a < 3; ++a) {
+    // which rows act on this axis (the gyro filter and stick shaping are shared by roll and pitch)
+    bool touched = false;
+    for (const auto& n : names) {
+      for (const char* k : {"P", "I", "D", "FF", "IMAX", "FLTT", "FLTE", "FLTD", "ANG", "ACC", "ACC_OLD", "RMAX"})
+        if (n == paramName(fam, a, k)) touched = true;
+      if (a < 2 && (n == "INS_GYRO_FILTER" || n == paramName(fam, a, "INPUT_TC"))) touched = true;
+      if (a == 2 && (n == paramName(fam, 2, "PLT_RATE") || n == paramName(fam, 2, "WPY"))) touched = true;
+    }
+    const AxisModel m = AxisModel::fromJson(result["plan"]["models"][kAxisNames[a]]);
+    Json ax = Json::obj({{"touched", touched}});
+    if (!m.ok) {
+      ax.set("pass", Json());
+      ax.set("why", Json(Json::Array{Json(std::string("no model of this axis: the values can only be range-checked"))}));
+      axes.set(kAxisNames[a], ax);
+      continue;
+    }
+    const cc::Gains g = gainsFromParams(p, fam, a), cur = gainsFromParams(base, fam, a);
+    Json tests = Json::array();
+    bool pass = true;
+    auto test = [&](bool ok, bool hard, const std::string& text) {
+      tests.push(Json::obj({{"ok", ok}, {"hard", hard}, {"text", text}}));
+      if (hard && !ok) pass = false;
+    };
+    if (a == 2) {
+      ax.set("predicted", predictYaw(g, m));
+      const cc::Plant& n = m.set[0];
+      double zMin = 1;
+      bool stable = true;
+      for (const auto& pl : m.set) {
+        const cc::Poles po = cc::slowAxisPoles(pl.a, pl.c, g.P, g.I, g.angleP);
+        zMin = std::min(zMin, po.zeta);
+        stable = stable && po.stable;
+      }
+      const double zNom = cc::slowAxisPoles(n.a, n.c, g.P, g.I, g.angleP).zeta;
+      test(stable, true, stable ? "stable on every plant of the model" : "UNSTABLE on at least one plant of the model");
+      test(zNom >= 0.35, true, "slow-mode damping on the nominal plant " + num(zNom, 2) + " (needs 0.35 or more)");
+      test(zMin >= 0.2, true, "slow-mode damping on the worst plant " + num(zMin, 2) + " (needs 0.2 or more)");
+      test(g.IMAX >= std::fabs(m.trimMax) + 0.15, true, "IMAX " + num(g.IMAX, 2) + " against the torque trim " + num(std::fabs(m.trimMax), 2) + " (needs 0.15 to spare)");
+      const double strong = n.a * (m.umax + std::fabs(m.trim)) * 57.29577951308232;
+      if (g.accMax > 0) test(g.accMax <= 1.3 * strong, false, "acceleration limit " + num(g.accMax, 0) + " deg/s/s; the vehicle can do about " + num(strong, 0));
+      if (g.rateMax > 0 && g.accMax > 0)
+        test(g.rateMax * g.rateMax / (2 * g.accMax) <= 20, false, "a " + num(g.rateMax, 0) + " deg/s turn stops within " + num(g.rateMax * g.rateMax / (2 * g.accMax), 0) + " deg");
+    } else {
+      const Json pr = predictRp(g, m);
+      ax.set("predicted", pr);
+      const double pm = pr["pmWorstDeg"].numOr(-99), gm = pr["gmWorstDb"].isNumber() ? pr["gmWorstDb"].num() : 99, ms = pr["ms"].numOr(99);
+      test(pm >= 40, true, "worst phase margin " + num(pm, 0) + " deg (needs 40 or more)");
+      test(gm >= 10, true, "worst gain margin " + (gm >= 98 ? std::string("large") : num(gm, 1) + " dB") + " (needs 10 dB or more)");
+      test(ms <= 1.8, true, "sensitivity peak " + num(ms, 2) + " (needs 1.8 or less)");
+      Vec nf;
+      if (result["noisePeaksHz"].isArray())
+        for (const auto& f : result["noisePeaksHz"].arr()) nf.push_back(f.numOr(0));
+      if (nf.empty()) nf = {1.25 * cur.gyroHz, 1.85 * cur.gyroHz};
+      double nr = 0;
+      for (double f : nf) {
+        const double c = cc::noiseGain(cur, f);
+        if (c > 0) nr = std::max(nr, cc::noiseGain(g, f) / c);
+      }
+      test(nr <= 1.15, true, "motor noise from the gyro x" + num(nr, 2) + " of what is flown (needs 1.15 or less)");
+      const double cap = m.set[0].a * std::max(0.05, m.umax - std::fabs(m.trim)) * 57.29577951308232;
+      if (g.accMax > 0) test(g.accMax <= cap, false, "acceleration limit " + num(g.accMax, 0) + " deg/s/s; the vehicle can do about " + num(cap, 0));
+    }
+    ax.set("pass", pass);
+    ax.set("tests", tests);
+    axes.set(kAxisNames[a], ax);
+  }
+  return Json::obj({{"ok", allOk}, {"rows", rowsOut}, {"axes", axes}});
 }
 
 }  // namespace aptuner::engine::heavy
