@@ -13,7 +13,8 @@
 <header class="top">
   <div class="brand"><img src="icon.png" alt=""><div><b>AP Tuner</b><small>ArduPilot tuning, made simple</small></div></div>
   <nav class="views">
-    <button data-view="flight" class="active">Flight</button>
+    <button data-view="model" class="active">Model tune</button>
+    <button data-view="flight">Flight</button>
     <button data-view="ground">Telemetry + USB</button>
     <button data-view="live">Advanced</button>
     <button data-view="log">Log file</button>
@@ -27,8 +28,36 @@
 </header>
 
 <main>
+<!-- ======================= MODEL TUNE (heavy / slow vehicles) ======================= -->
+<section id="view-model" class="view active">
+  <div class="hero">
+    <div class="eyebrow">Model tuning · heavy and slow drones</div>
+    <h2>Find what's wrong, build a model of your drone, get safe step-by-step settings</h2>
+    <p class="muted">The app measures your drone from ordinary hovers, proves the model by replaying your real flights, designs gains for every axis and gives you parameter files with an UNDO file. It never changes anything on the drone: you load the files in Mission Planner yourself.</p>
+  </div>
+  <div class="cards cols-2" style="margin-top:12px">
+    <div class="card">
+      <h3>1 · Live, through Mission Planner</h3>
+      <p class="explain">Connect Mission Planner to the drone as usual (telemetry radio). Press <b>Connect</b>: the app finds Mission Planner by itself. Then press <b>Start listening</b>, take off, hover 30 s with the sticks centred, give a few gentle inputs, land. The app records the flight and analyses it when you disarm.</p>
+      <div class="row" style="margin-top:8px"><button id="hvConnect" class="btn">Connect</button><button id="hvListen" class="btn primary">Start listening</button><button id="hvNow" class="btn ghost hidden">Analyse now</button><button id="hvStop" class="btn ghost hidden">Stop</button></div>
+      <div id="hvLive" class="muted small" style="margin-top:8px">Not listening.</div>
+      <div id="hvWarn"></div>
+    </div>
+    <div class="card">
+      <h3>2 · From log files</h3>
+      <p class="explain">Drop one or more <code>.bin</code> logs of the <b>same drone</b> (more hovers give a better model), or pick them from the list.</p>
+      <div class="drop" id="hvDrop"><div class="big">Drop .bin logs here</div><div class="muted">or click to choose files</div><input type="file" id="hvFile" accept=".bin,.BIN" multiple class="hidden"></div>
+      <div class="row" style="margin-top:8px"><button id="hvFind" class="btn">Find logs on this PC</button><label class="field">Front-rear motor spacing (m, optional)<input id="hvSpacing" type="number" step="0.01" min="0" placeholder="e.g. 1.6" style="width:110px"></label><button id="hvGo" class="btn primary">Analyse</button></div>
+      <div id="hvChosen" class="small" style="margin-top:6px"></div>
+      <div id="hvList" class="filelist" style="margin-top:6px"></div>
+    </div>
+  </div>
+  <div id="hvBusy" class="banner hidden"><div class="ico">⏳</div><div><b>Working…</b><span id="hvBusyText">building the model and testing thousands of settings on it (up to a minute)</span></div></div>
+  <div id="hvResult" style="margin-top:12px"></div>
+</section>
+
 <!-- ======================= FLIGHT ======================= -->
-<section id="view-flight" class="view active">
+<section id="view-flight" class="view">
   <div class="flight">
     <aside class="rail" id="frail">
       <div class="ph" data-ph="setup"><span class="n">1</span><div>Connect &amp; read<small>vehicle and settings</small></div></div>
@@ -311,5 +340,6 @@
 <script src="app.js"></script>
 <script src="flight.js"></script>
 <script src="ground.js"></script>
+<script src="heavy.js"></script>
 </body>
 </html>

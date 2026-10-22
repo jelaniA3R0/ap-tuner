@@ -24,6 +24,7 @@
 #include "common.hpp"
 #include "flight.hpp"
 #include "groundtune.hpp"
+#include "heavylive.hpp"
 #include "http.hpp"
 #include "journal.hpp"
 #include "notchlive.hpp"
@@ -115,7 +116,8 @@ HttpResponse jsonResp(int code, const Json& j) {
 
 // API routes that only read: GET, no token. Everything else under /api/ changes state: POST + token.
 const std::set<std::string> kReadRoutes{"/api/events",   "/api/ports",         "/api/presets",       "/api/notch/status", "/api/live/rows", "/api/live/param",
-                                        "/api/log/list", "/api/log/param",     "/api/ground/result", "/api/ground/state", "/api/ground/file", "/api/journal"};
+                                        "/api/log/list", "/api/log/param",     "/api/ground/result", "/api/ground/state", "/api/ground/file", "/api/journal",
+                                        "/api/heavy/state", "/api/heavy/result", "/api/heavy/file"};
 
 std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -248,7 +250,14 @@ class App {
         tuner(link, pathStr(fsPath(o.sessionsDir)), &journal),
         notch(link, tuner),
         flight(link, tuner, notch),
-        ground(link, o.sessionsDir, &journal) {
+        ground(link, o.sessionsDir, &journal),
+        heavy(link, o.sessionsDir) {
+    heavy.on("state", [this](const Json& s) { hub.publish("heavy", s.dump()); });
+    heavy.on("progress", [this](const Json& p) { hub.publish("heavyProgress", p.dump()); });
+    heavy.onResult = [this](const Json& r) {
+      lastHeavy = r;
+      hub.publish("heavyResult", Json::obj({{"ok", !r.has("error")}}).dump());
+    };
     link.on("status", [this](const Json& s) { tuner.log("link", s.strOr("")); });
     tuner.on("log", [this](const Json& e) { hub.publish("log", e.dump()); });
     tuner.on("state", [this](const Json& s) { hub.publish("state", s.dump()); });
@@ -602,6 +611,44 @@ class App {
       r.headers.push_back({"Content-Disposition", "attachment; filename=\"" + std::regex_replace(base, binRe, "") + " - AP Tuner.param\""});
       co_return r;
     }
+    // ---- model tuning (heavy / slow vehicles): live recording, result, files
+    if (path == "/api/heavy/live/start") co_return jsonResp(200, co_await heavy.start());
+    if (path == "/api/heavy/live/stop") {
+      heavy.stop();
+      co_return ok();
+    }
+    if (path == "/api/heavy/live/analyse") {
+      heavy.analyseNow();
+      co_return ok();
+    }
+    if (path == "/api/heavy/state")
+      co_return jsonResp(200, Json::obj({{"live", heavy.state()}, {"hasResult", lastHeavy.isObject()}, {"connected", link.connected()}, {"alive", link.alive()}}));
+    if (path == "/api/heavy/result") co_return jsonResp(200, lastHeavy.isObject() ? lastHeavy : Json::object());
+    if (path == "/api/heavy/file") {
+      if (!lastHeavy.isObject()) co_return jsonResp(400, Json::obj({{"error", "analyse a flight first"}}));
+      const std::string kind = req.param("kind");
+      const int n = std::atoi(req.param("step").c_str());
+      const Json& v = lastHeavy["vehicle"];
+      const std::string who = "AP Tuner sysid " + (v["sysid"].isNumber() ? core::jsToString(v["sysid"].num()) : std::string("unknown"));
+      HttpResponse r;
+      r.contentType = "text/plain";
+      std::string fname;
+      if (kind == "plan") {
+        r.contentType = "application/json";
+        r.body = lastHeavy["plan"].dump();
+        fname = who + " plan.json";
+      } else {
+        const Json* st = nullptr;
+        for (const auto& s : lastHeavy["steps"].isArray() ? lastHeavy["steps"].arr() : Json::Array{})
+          if (static_cast<int>(s["n"].numOr(0)) == n) st = &s;
+        if (!st) co_return jsonResp(404, Json::obj({{"error", "no such step"}}));
+        r.body = kind == "undo" ? (*st)["undoText"].strOr("") : (*st)["paramText"].strOr("");
+        fname = who + " Step " + std::to_string(n) + (kind == "undo" ? " UNDO" : "") + ".param";
+        journal.append("export", Json::obj({{"what", "model-tuning .param"}, {"step", n}, {"kind", kind.empty() ? "param" : kind}}));
+      }
+      r.headers.push_back({"Content-Disposition", "attachment; filename=\"" + fname + "\""});
+      co_return r;
+    }
     co_return jsonResp(404, Json::obj({{"error", "unknown api"}}));
   }
 
@@ -694,6 +741,49 @@ class App {
           body = Json::object();
         }
       }
+      // model tuning of one or more logs of the same vehicle (pure work: on the connection thread, like the log analysis)
+      if (req.path == "/api/heavy/upload") {
+        std::string name = req.hasParam("name") ? req.param("name") : "upload.bin";
+        static const std::regex bad("[^\\w .()-]");
+        name = std::regex_replace(name, bad, "_");
+        const std::string file = pathStr(fsPath(opts_.sessionsDir) / "uploads" / name);
+        writeText(file, req.body);
+        c.send(jsonResp(200, Json::obj({{"ok", true}, {"path", file}})));
+        return;
+      }
+      if (req.path == "/api/heavy/analyze") {
+        Json b = Json::object();
+        try {
+          b = Json::parse(req.body);
+        } catch (const std::exception&) {
+        }
+        std::vector<engine::heavy::FlightRecord> flights;
+        try {
+          for (const auto& p : b["paths"].isArray() ? b["paths"].arr() : Json::Array{}) {
+            const std::string fp = p.strOr("");
+            if (fp.empty() || !fs::exists(fsPath(fp))) {
+              c.send(jsonResp(400, Json::obj({{"error", "file not found: " + fp}})));
+              return;
+            }
+            flights.push_back(engine::heavy::recordFromLogFile(fp));
+          }
+          if (flights.empty()) {
+            c.send(jsonResp(400, Json::obj({{"error", "choose one or more .bin logs of the same vehicle"}})));
+            return;
+          }
+          Json r = analyseAndSave(flights, opts_.sessionsDir, b["spacingM"].numOr(0));
+          std::promise<void> done;
+          Loop::main().post([this, r, &done] {
+            lastHeavy = r;
+            done.set_value();
+          });
+          done.get_future().get();
+          c.send(jsonResp(200, r));
+        } catch (const std::exception& e) {
+          c.send(jsonResp(500, Json::obj({{"error", e.what()}})));
+        }
+        return;
+      }
       if (req.path == "/api/log/analyze") {
         const std::string p = body["path"].strOr("");
         if (p.empty() || !fs::exists(fsPath(p))) {
@@ -748,6 +838,8 @@ class App {
   NotchLive notch;
   FlightSession flight;
   GroundTune ground;
+  HeavyLive heavy;
+  Json lastHeavy;   // the latest model-tuning result (loop thread)
   io::AutoConnectState autoState;
   Json lastLogResult;
   SseHub hub;

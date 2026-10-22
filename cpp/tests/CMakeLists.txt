@@ -2,6 +2,8 @@ add_executable(aptuner-tests
   test_main.cpp
   test_build_info.cpp
   test_golden_core.cpp
+  test_cascade.cpp
+  test_heavy.cpp
   test_dfreader.cpp
   test_logintegrity.cpp
   test_reallogs.cpp
@@ -14,7 +16,9 @@ add_executable(aptuner-tests
 target_link_libraries(aptuner-tests PRIVATE aptuner_app)
 target_compile_definitions(aptuner-tests PRIVATE APTUNER_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden")
 
-add_test(NAME unit COMMAND aptuner-tests -live_ -wv_)
+add_test(NAME unit COMMAND aptuner-tests -live_ -wv_ -heavylog_)
+# model tuning on the tandem QuadPlane logs (skipped when they are not on this PC; about a minute)
+add_test(NAME heavy_logs COMMAND aptuner-tests heavylog_)
 # the in-flight safety scenarios on a fake vehicle (about a minute: real-time watches)
 add_test(NAME live_safety COMMAND aptuner-tests live_)
 # verified writes bound to the right aircraft (audit R3) on fake vehicles (real-time: about two minutes)

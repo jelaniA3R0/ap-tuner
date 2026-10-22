@@ -11,6 +11,15 @@ Programs
                           aptuner.exe --server      server only (http://127.0.0.1:8090)
   aptuner-analyze.exe   command-line log analysis:  aptuner-analyze <log.bin> [--json out.json] [--param out.param]
   aptuner-link.exe      link check:                 aptuner-link auto   |   aptuner-link serial COM5 57600
+  aptuner-heavy.exe     model tuning of heavy / slow drones from logs of one vehicle:
+                          aptuner-heavy <log.bin> [more.bin ...] [--plan plan.json] [--out folder] [--spacing m]
+
+Model tune (heavy and slow drones)
+  The "Model tune" tab: drop logs of one drone, or connect (Mission Planner is found by itself) and press Start
+  listening. The app finds what's wrong, builds a model of the drone, replays your real flights on it, designs the
+  settings and gives you step files with an UNDO file. It never writes them to the drone: load them in Mission
+  Planner (Full Parameter List > Load from file > Write Params). Fly the step, bring the log (or fly while the app
+  listens) and it checks its own prediction.
 
 Folders
   web\        the user interface (HTML / JavaScript)

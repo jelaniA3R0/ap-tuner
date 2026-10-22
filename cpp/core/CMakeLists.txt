@@ -3,6 +3,7 @@
 add_library(aptuner_core STATIC
   src/build_info.cpp
   src/cx.cpp
+  src/cascade.cpp
   src/fft.cpp
   src/spectra.cpp
   src/stepresp.cpp
@@ -24,6 +25,11 @@ add_library(aptuner_core STATIC
   src/engine/issues.cpp
   src/engine/report.cpp
   src/engine/identity.cpp
+  src/engine/flightrec.cpp
+  src/engine/heavy_data.cpp
+  src/engine/heavy_ident.cpp
+  src/engine/heavy_design.cpp
+  src/engine/heavytune.cpp
 )
 target_include_directories(aptuner_core
   PUBLIC
