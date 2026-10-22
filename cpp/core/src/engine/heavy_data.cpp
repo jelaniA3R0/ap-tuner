@@ -153,17 +153,21 @@ std::vector<Hover> detectHovers(const std::vector<FlightRecord>& flights, std::v
       h.index = ++idx;
       h.t0 = s0;
       h.t1 = s1;
-      // lift-off: the yaw controller output starts to work (|P + I| > 0.02) within 6 s of the span start
+      // lift-off: the throttle reaches 90% of this hover's median (thrust carries the weight; before that the ground
+      // holds the vehicle and no torque imbalance can turn it)
+      Vec ht;
+      for (std::size_t i = r.throttle.indexAt(s0); i < r.throttle.size() && r.throttle.t[i] <= s1; ++i)
+        if (r.throttle.t[i] >= s0) ht.push_back(r.throttle.v[i]);
+      const double hoverThr = median(ht);
       h.tLift = s0;
-      if (!yaw.P.empty())
-        for (std::size_t i = yaw.P.indexAt(s0 - 6); i < yaw.P.size() && yaw.P.t[i] < s0 + 6; ++i) {
-          const double t = yaw.P.t[i];
-          if (t < s0 - 6 || !live(t)) continue;
-          if (std::fabs(yaw.P.v[i] + yaw.I.at(t)) > 0.02) {
-            h.tLift = std::min(t, s1);
-            break;
-          }
+      for (std::size_t i = r.throttle.indexAt(s0 - 6); i < r.throttle.size() && r.throttle.t[i] < s1; ++i) {
+        const double t = r.throttle.t[i];
+        if (t < s0 - 6 || !live(t)) continue;
+        if (r.throttle.v[i] >= 0.9 * hoverThr) {
+          h.tLift = t;
+          break;
         }
+      }
       h.params = r.paramsAt(h.t0 + 0.01);
       double sum = 0;
       int n = 0;
@@ -336,6 +340,28 @@ Oscillation findOscillation(const std::vector<FlightRecord>& flights, const std:
   o.persistence = static_cast<double>(same.size()) / static_cast<double>(wins.size());
   if (same.size() < 2 || o.persistence < 0.4) return o;
   o.intermittent = o.persistence < 0.6;
+  // a second cluster (another mode, or the same loop wandering): kept so the identification can widen its range
+  {
+    double f2 = 0;
+    std::size_t n2 = 0;
+    for (double c : fs) {
+      if (std::fabs(c - f0) <= 0.15 * f0) continue;
+      std::size_t n = 0;
+      for (double f : fs)
+        if (std::fabs(f - c) <= 0.15 * c && std::fabs(f - f0) > 0.15 * f0) ++n;
+      if (n > n2) {
+        n2 = n;
+        f2 = c;
+      }
+    }
+    if (n2 >= 2 && static_cast<double>(n2) >= 0.25 * static_cast<double>(wins.size())) {
+      Vec c2;
+      for (double f : fs)
+        if (std::fabs(f - f2) <= 0.15 * f2 && std::fabs(f - f0) > 0.15 * f0) c2.push_back(f);
+      o.f2Hz = median(c2);
+      o.persistence2 = static_cast<double>(n2) / static_cast<double>(wins.size());
+    }
+  }
   cc::Cx Sta(0, 0);
   double Stt = 0, Saa = 0, amp = 0, prom = 0, iAmp = 0;
   for (const Win* w : same) {

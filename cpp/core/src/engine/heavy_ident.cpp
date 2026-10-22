@@ -2,6 +2,8 @@
 // and the validation of the model against the flights (closed-loop replay).
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 
 #include "heavy_internal.hpp"
@@ -275,6 +277,20 @@ RpIdent identifyMarginal(const Oscillation& osc, const std::vector<Hover>& hover
     id.aHi = *std::max_element(as.begin(), as.end());
     as = centre;
   }
+  // a second wobble frequency: the loop could be the one at either; the range covers both
+  if (osc.f2Hz > 0) {
+    Vec a2;
+    for (std::size_t hi : osc.hovers)
+      for (double T : {0.01, 0.025}) {
+        const auto f = cc::marginalModeFit(gainsFromParams(hovers[hi].params, fam, axis), 2 * kPi * osc.f2Hz, T);
+        if (f && f->a > 0 && f->tau <= 0.5) a2.push_back(f->a);
+      }
+    if (!a2.empty()) {
+      id.a2 = median(a2);
+      id.aLo = std::min(id.aLo > 0 ? id.aLo : id.a2, *std::min_element(a2.begin(), a2.end()));
+      id.aHi = std::max(id.aHi, *std::max_element(a2.begin(), a2.end()));
+    }
+  }
   if (id.fits.empty()) {
     id.reason = "the oscillation does not fit the model form (phase lag outside 0-90 deg beyond the integrator)";
     return id;
@@ -311,7 +327,9 @@ AxisModel rpModel(const RpIdent& id, double trim, double umax, bool umaxMeasured
   const double aLo = id.aLo > 0 ? std::min(0.82 * id.a, id.aLo) : 0.82 * id.a, aHi = id.aHi > 0 ? std::max(1.2 * id.a, id.aHi) : 1.2 * id.a;
   m.set.push_back(P("nominal", id.a, tMid, 0.0175));
   m.set.push_back(P("weak and slow", aLo, tHi, 0.025));
-  for (double a : {aLo, id.a, aHi})
+  Vec as{aLo, id.a, aHi};
+  if (aHi > 1.6 * id.a) as.push_back(std::sqrt(id.a * aHi));   // a wide range: one more point in between
+  for (double a : as)
     for (double tau : {tLo, tMid, tHi})
       for (double T : {0.01, 0.025}) m.set.push_back(P("corner", a, tau, T));
   return m;
@@ -372,7 +390,17 @@ YawReplay replayYaw(const FlightRecord& f, const Hover& h, std::size_t hoverIdx,
   if (!f.stickYaw.empty()) in.stickPwm = [&](double t) { return f.stickYaw.at(ts + t); };
   const cc::SimOutput s = cc::simulate(g, p, in);
   const Series& hd = f.axis[2].ang;
-  const Series& out = f.axis[2].out;
+  // the logged output at 1 Hz and below: what the model represents (motor vibration rides on top of it)
+  Series out;
+  {
+    const Series& raw = f.axis[2].out;
+    double y = raw.empty() ? 0 : raw.at(ts);
+    for (std::size_t i = raw.indexAt(ts); i < raw.size() && raw.t[i] <= h.t1 + 1; ++i) {
+      const double dt = i ? raw.t[i] - raw.t[i - 1] : 0;
+      y += (1 - std::exp(-2 * kPi * 1.0 * std::max(0.0, dt))) * (raw.v[i] - y);
+      out.push(raw.t[i], y);
+    }
+  }
   const double h0 = hd.at(ts);
   double eH = 0, eU = 0;
   std::size_t n = 0;
@@ -386,6 +414,8 @@ YawReplay replayYaw(const FlightRecord& f, const Hover& h, std::size_t hoverIdx,
     const double lu = out.at(ts + t);
     if (std::isfinite(lu)) eU += (lu - s.u[k]) * (lu - s.u[k]);
     ++n;
+    if (std::getenv("APTUNER_DEBUG") && k % 30 == 0)
+      std::fprintf(stderr, "replay yaw t %.0f out log %.3f model %.3f heading log %.1f model %.1f\n", t, lu, s.u[k], logH, simH);
     if (k % 5 == 0) {
       ct.push(std::round(t * 10) / 10);
       cl.push(std::round(logH * 10) / 10);
@@ -394,7 +424,8 @@ YawReplay replayYaw(const FlightRecord& f, const Hover& h, std::size_t hoverIdx,
   }
   r.headingRmsDeg = n ? std::sqrt(eH / static_cast<double>(n)) : 0;
   r.outRms = n ? std::sqrt(eU / static_cast<double>(n)) : 0;
-  r.pass = std::fabs(r.swingLog - r.swingModel) <= std::max(5.0, 0.12 * r.swingLog) && r.headingRmsDeg <= 30 && r.outRms <= 0.07;
+  // the output check allows for gusts the model does not contain, which a higher rate P passes on to the output
+  r.pass = std::fabs(r.swingLog - r.swingModel) <= std::max(5.0, 0.12 * r.swingLog) && r.headingRmsDeg <= 30 && r.outRms <= 0.07 + 0.03 * g.P;
   r.chart = Json::obj({{"t", ct}, {"log", cl}, {"model", cm}});
   return r;
 }

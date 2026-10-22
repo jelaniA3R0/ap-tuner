@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <map>
 #include <numeric>
 #include <regex>
 
@@ -110,12 +111,18 @@ MixLimit mixerLimit(const std::vector<FlightRecord>& fl, const std::vector<Hover
     }
   }
   if (n) m.limitedPct = 100.0 * static_cast<double>(nl) / static_cast<double>(n);
+  // the mixer also raises LIMIT when the other axes or the throttle use up the motors: the limit is at least as large
+  // as the largest output it actually delivered (99th percentile)
+  double p99 = 0;
+  if (!all.empty()) {
+    std::sort(all.begin(), all.end());
+    p99 = all[static_cast<std::size_t>(0.99 * static_cast<double>(all.size() - 1))];
+  }
   if (atLim.size() >= 10) {
-    m.umax = median(atLim);
+    m.umax = std::max(median(atLim), p99);
     m.measured = true;
   } else if (!all.empty()) {
-    std::sort(all.begin(), all.end());
-    m.umax = std::max(0.3, all[static_cast<std::size_t>(0.995 * static_cast<double>(all.size() - 1))] + 0.02);
+    m.umax = std::max(0.3, p99 + 0.02);
   }
   return m;
 }
@@ -297,19 +304,59 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
   // ---------------------------------------------------------------------------------- 3. oscillations (roll / pitch)
   std::array<Oscillation, 3> osc;
   for (int a = 0; a < 2; ++a) osc[static_cast<std::size_t>(a)] = findOscillation(flights, hovers, a);
-
   // ---------------------------------------------------------------------------------- 4. identification
   std::array<AxisModel, 3> models;
+  std::vector<std::string> modelNotes;
+  auto aRangeOf = [](const AxisModel& m) {
+    if (!m.ok || m.set.empty()) return Json();
+    double lo = 1e18, hi = 0;
+    for (const auto& p : m.set) {
+      lo = std::min(lo, p.a);
+      hi = std::max(hi, p.a);
+    }
+    return Json(Json::Array{r3(lo), r3(hi)});
+  };
+  auto planModel = [&](int a) {
+    if (!opts.plan.isObject() || !opts.plan["models"][kAxisNames[a]].isObject()) return AxisModel();
+    return AxisModel::fromJson(opts.plan["models"][kAxisNames[a]]);
+  };
+  // the steady yaw output of every hover (this flight's torque trim, also when the yaw fit has too little to work on)
+  std::vector<std::pair<std::size_t, double>> yawTrims;   // {hover, trim}
   const YawIdent yid = identifyYaw(flights, hovers, fam);
   const MixLimit& my = mix[2];
   models[2] = yawModel(yid, my.measured ? my.umax : std::max(0.5, my.umax), my.measured);
+  if (models[2].ok) {
+    for (std::size_t k = 0; k < yid.hoverIdx.size(); ++k) yawTrims.push_back({yid.hoverIdx[k], yid.trims[k]});
+  } else {
+    AxisModel pm = planModel(2);
+    for (std::size_t hi = 0; hi < hovers.size(); ++hi) {
+      const Vec v = hoverAxisValues(flights, {hovers[hi]}, 2, &AxisRec::out, 5);
+      if (!v.empty()) yawTrims.push_back({hi, mean(v)});
+    }
+    if (pm.ok && !yawTrims.empty()) {
+      double t = 0;
+      for (const auto& [h, v] : yawTrims) t += v;
+      t /= static_cast<double>(yawTrims.size());
+      const double shift = t - pm.trim;
+      for (auto& p : pm.set) p.trim += shift;
+      pm.trimMax += shift;
+      pm.trim = t;
+      if (my.measured) {
+        pm.umax = my.umax;
+        for (auto& p : pm.set) p.umax = my.umax;
+      }
+      pm.method = "saved model (" + pm.method + "), trim from this flight";
+      modelNotes.push_back("yaw: " + yid.reason + "; the saved yaw model is used with this flight's trim (" + num(t, 2) + ")");
+      models[2] = pm;
+    }
+  }
   Json identJ = Json::object();
   {
     Json tr = Json::array();
-    for (double t : yid.trims) tr.push(r2(t));
-    identJ.set("yaw", Json::obj({{"ok", yid.ok}, {"reason", yid.reason}, {"method", "windowed integral regression (1 s windows, a trim per hover)"},
-                                 {"a", r3(yid.a)}, {"c", r3(yid.c)}, {"tauBest", yid.tau}, {"r2", r3(yid.r2)}, {"windows", yid.windows},
-                                 {"aRange", Json(Json::Array{r3(yid.aLo), r3(yid.aHi)})}, {"trims", tr}, {"umax", r2(models[2].umax)},
+    for (const auto& [h, v] : yawTrims) tr.push(r2(v));
+    identJ.set("yaw", Json::obj({{"ok", models[2].ok}, {"fitOk", yid.ok}, {"reason", yid.reason}, {"method", models[2].ok ? models[2].method : std::string("yaw regression")},
+                                 {"a", models[2].ok ? Json(r3(models[2].set[0].a)) : Json(r3(yid.a))}, {"c", models[2].ok ? Json(r3(models[2].set[0].c)) : Json(r3(yid.c))},
+                                 {"r2", r3(yid.r2)}, {"windows", yid.windows}, {"aRange", aRangeOf(models[2])}, {"trims", tr}, {"umax", r2(models[2].umax)},
                                  {"umaxMeasured", my.measured}, {"limitedPct", r2(my.limitedPct)}}));
   }
   for (int a = 0; a < 2; ++a) {
@@ -319,15 +366,32 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
     const double trim = iv.empty() ? 0 : mean(iv);
     const MixLimit& ml = mix[A];
     const double umax = ml.measured ? ml.umax : 0.5;
+    AxisModel pm = planModel(a);
+    if (pm.ok) {
+      for (auto& p : pm.set) {
+        p.trim = trim;
+        if (ml.measured) p.umax = umax;
+      }
+      pm.trim = pm.trimMax = trim;
+    }
     if (rid.ok) {
       models[A] = rpModel(rid, trim, umax, ml.measured);
-    } else if (opts.plan.isObject() && opts.plan["models"][kAxisNames[a]].isObject()) {
-      models[A] = AxisModel::fromJson(opts.plan["models"][kAxisNames[a]]);
-      if (models[A].ok) {
-        models[A].method = "saved model (" + models[A].method + ")";
-        for (auto& p : models[A].set) p.trim = trim;
-        models[A].trim = trim;
+      if (rid.a2 > 0)
+        modelNotes.push_back(std::string(kAxisNames[a]) + " wobbles at two frequencies (" + num(osc[A].fHz, 2) + " and " + num(osc[A].f2Hz, 2) +
+                             " Hz): the control power is somewhere in " + num(rid.aLo, 1) + "-" + num(rid.aHi, 1) + " rad/s/s per unit; the design covers all of it");
+      // a saved model that disagrees: both are kept, the design must hold on all of them
+      if (pm.ok) {
+        const double ratio = models[A].set[0].a / pm.set[0].a;
+        if (ratio > 1.5 || ratio < 1 / 1.5) {
+          for (const auto& p : pm.set) models[A].set.push_back(p);
+          models[A].method += " + saved model (they disagree)";
+          modelNotes.push_back(std::string(kAxisNames[a]) + ": this flight gives control power " + num(models[A].set[0].a, 1) + ", the saved model " +
+                               num(pm.set[0].a, 1) + ": the " + kAxisNames[a] + " model is uncertain, so the design must hold for both");
+        }
       }
+    } else if (pm.ok) {
+      models[A] = pm;
+      models[A].method = "saved model (" + models[A].method + ")";
     } else {
       models[A].ok = false;
       models[A].reason = rid.reason;
@@ -336,10 +400,13 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
     for (const auto& f : rid.fits) fits.push(Json::obj({{"a", r2(f.a)}, {"tau", r3(f.tau)}, {"T", f.T}}));
     identJ.set(kAxisNames[a], Json::obj({{"ok", models[A].ok}, {"method", models[A].method}, {"reason", models[A].ok ? std::string() : models[A].reason},
                                          {"a", models[A].ok ? Json(r2(models[A].set[0].a)) : Json()},
-                                         {"tauRange", rid.ok ? Json(Json(Json::Array{r3(rid.tauLo), r3(rid.tauHi)})) : Json()},
-                                         {"fits", fits}, {"aRange", models[A].ok ? Json(Json::Array{r2(std::min_element(models[A].set.begin(), models[A].set.end(), [](const cc::Plant& x, const cc::Plant& y) { return x.a < y.a; })->a), r2(std::max_element(models[A].set.begin(), models[A].set.end(), [](const cc::Plant& x, const cc::Plant& y) { return x.a < y.a; })->a)}) : Json()}, {"frequencyHz", osc[A].found ? Json(r2(osc[A].fHz)) : Json()}, {"trim", r3(trim)}, {"umax", r2(umax)}, {"umaxMeasured", ml.measured}}));
+                                         {"tauRange", rid.ok ? Json(Json::Array{r3(rid.tauLo), r3(rid.tauHi)}) : Json()}, {"fits", fits},
+                                         {"aRange", aRangeOf(models[A])}, {"frequencyHz", osc[A].found ? Json(r2(osc[A].fHz)) : Json()},
+                                         {"secondFrequencyHz", osc[A].f2Hz > 0 ? Json(r2(osc[A].f2Hz)) : Json()}, {"trim", r3(trim)}, {"umax", r2(umax)},
+                                         {"umaxMeasured", ml.measured}}));
   }
   res.set("identification", identJ);
+  for (const auto& s : modelNotes) notesJ.push(s);
 
   // ---------------------------------------------------------------------------------- 5. validation
   Json axesJ = Json::object();
@@ -350,11 +417,11 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
   if (models[2].ok) {
     Json hr = Json::array();
     int pass = 0, n = 0;
-    for (std::size_t k = 0; k < yid.hoverIdx.size(); ++k) {
-      const Hover& h = hovers[yid.hoverIdx[k]];
+    for (const auto& [hIdx, trim] : yawTrims) {
+      const Hover& h = hovers[hIdx];
       cc::Plant p = models[2].set[0];
-      p.trim = yid.trims[k];
-      const YawReplay rp = replayYaw(flights[h.flight], h, yid.hoverIdx[k], gainsFromParams(h.params, fam, 2), p);
+      p.trim = trim;
+      const YawReplay rp = replayYaw(flights[h.flight], h, hIdx, gainsFromParams(h.params, fam, 2), p);
       ++n;
       if (rp.pass) ++pass;
       hr.push(Json::obj({{"hover", h.id()}, {"flight", flights[h.flight].name}, {"swingLogDeg", std::round(rp.swingLog)}, {"swingModelDeg", std::round(rp.swingModel)},
@@ -364,6 +431,7 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
     const std::string txt = std::to_string(pass) + " of " + std::to_string(n) + " hovers replayed within 5 deg (or 12%) of the logged heading swing";
     replayJ.set("yaw", Json::obj({{"ok", valid[2]}, {"text", txt}, {"hovers", hr}}));
   }
+
   for (int a = 0; a < 2; ++a) {
     const auto A = static_cast<std::size_t>(a);
     if (!models[A].ok) continue;
@@ -770,33 +838,53 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
     Json ck = Json::object();
     const Json& plan = opts.plan;
     if (!(plan["vehicle"]["sysid"] == sysid)) ck.set("warning", "The plan was made for system id " + plan["vehicle"]["sysid"].dump() + ", this flight is system id " + sysid.dump() + ".");
-    // which step was flown: the latest step whose values are in effect
+    // which step was flown: the latest step whose values are in effect, or whose parameters moved away from the values
+    // the plan started from (applied with other values)
     int stepFound = 0;
+    bool asProposed = false;
     Json diffs = Json::array();
+    std::map<std::string, double> baseline;   // the value each parameter had when the plan was made
+    if (plan["steps"].isArray())
+      for (const auto& st : plan["steps"].arr())
+        for (const auto& r : st["rows"].arr())
+          if (!baseline.count(r["name"].strOr("")) && r["from"].isNumber()) baseline[r["name"].strOr("")] = r["from"].num();
     if (plan["steps"].isArray())
       for (const auto& st : plan["steps"].arr()) {
-        int hit = 0, n = 0;
+        int hit = 0, moved = 0, n = 0;
         Json d = Json::array();
         for (const auto& r : st["rows"].arr()) {
           const auto v = flownP.get(r["name"].strOr(""));
           if (!v) continue;
           ++n;
           const double to = r["to"].numOr(0);
+          const double from = baseline.count(r["name"].strOr("")) ? baseline[r["name"].strOr("")] : std::nan("");
           const bool same = std::fabs(*v - to) <= 0.02 * std::max(std::fabs(to), 1e-3) + 1e-6;
+          const bool away = std::isfinite(from) && std::fabs(*v - from) > 0.02 * std::max(std::fabs(from), 1e-3) + 1e-6;
           if (same) ++hit;
           else d.push(Json::obj({{"name", r["name"]}, {"proposed", to}, {"flown", *v}}));
+          if (same || away) ++moved;
         }
-        if (n && hit * 10 >= 6 * n) {
+        if (n && (hit * 10 >= 6 * n || moved * 10 >= 6 * n)) {
           stepFound = static_cast<int>(st["n"].numOr(0));
+          asProposed = hit == n;
           diffs = d;
         }
       }
     ck.set("stepFlown", stepFound);
+    ck.set("asProposed", asProposed);
     ck.set("differences", diffs);
     // predicted (saved model, the gains actually flown) against what the flight shows
     Json axc = Json::object();
-    const AxisModel pyaw = AxisModel::fromJson(plan["models"]["yaw"]);
+    AxisModel pyaw = AxisModel::fromJson(plan["models"]["yaw"]);
     if (pyaw.ok) {
+      // the saved model with this flight's torque trim (the trim is a condition of the day, not of the gains)
+      double thisTrim = 0;
+      for (const auto& [h, v] : yawTrims) thisTrim += v;
+      if (!yawTrims.empty()) {
+        thisTrim /= static_cast<double>(yawTrims.size());
+        const double shift = thisTrim - pyaw.trim;
+        for (auto& p : pyaw.set) p.trim += shift;
+      }
       const Json pr = predictYaw(flown[2], pyaw);
       Vec sw;
       for (const Hover& h : hovers) {
@@ -805,13 +893,16 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
       }
       const double lo = pr["swingDeg"][0].numOr(0), hi = pr["swingDeg"][1].numOr(0);
       const double flownSwing = sw.empty() ? std::nan("") : median(sw);
-      const bool conf = std::isfinite(flownSwing) && flownSwing <= hi * 1.2 + 2 && flownSwing >= lo * 0.6 - 2;
+      const double tol = std::max(3.0, 0.2 * lo);
+      const bool inRange = std::isfinite(flownSwing) && flownSwing >= lo - tol && flownSwing <= hi + std::max(3.0, 0.2 * hi);
+      const bool better = std::isfinite(flownSwing) && flownSwing < lo - tol;
       Json swj = Json::array();
       for (double s : sw) swj.push(std::round(s));
       axc.set("yaw", Json::obj({{"predictedSwingDeg", pr["swingDeg"]}, {"flownSwingDeg", std::isfinite(flownSwing) ? Json(std::round(flownSwing)) : Json()},
-                                {"perHover", swj}, {"confirmed", conf},
-                                {"text", "Heading swing after lift-off: predicted " + num(lo, 0) + "-" + num(hi, 0) + " deg for the gains flown, flown " + num(flownSwing, 0) + " deg: " +
-                                             (conf ? "prediction confirmed." : "not as predicted: the model is re-fitted from this flight.")}}));
+                                {"perHover", swj}, {"confirmed", inRange}, {"betterThanPredicted", better}, {"trimUsed", r2(yawTrims.empty() ? pyaw.trim : thisTrim)},
+                                {"text", "Heading swing after lift-off: predicted " + num(lo, 0) + "-" + num(hi, 0) + " deg for the gains flown (with this flight's torque trim " +
+                                             num(yawTrims.empty() ? pyaw.trim : thisTrim, 2) + "), flown " + num(flownSwing, 0) + " deg: " +
+                                             (inRange ? "prediction confirmed." : better ? "better than predicted (the model is on the safe side)." : "worse than predicted: the model is re-fitted from this flight.")}}));
     }
     for (int a = 0; a < 2; ++a) {
       const AxisModel pm = AxisModel::fromJson(plan["models"][kAxisNames[a]]);

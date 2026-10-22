@@ -76,6 +76,7 @@ struct Oscillation {
   double iSwing = 0;                        // I-term amplitude at the peak (output units)
   bool growing = false;
   bool intermittent = false;                // in 40-60% of the windows only
+  double f2Hz = 0, persistence2 = 0;        // a second wobble frequency (>= 25% of the windows), 0 = none
   double ampEarlyDeg = 0, ampLateDeg = 0;
   int windows = 0;
   std::vector<std::size_t> hovers;          // hovers that show it
@@ -100,7 +101,8 @@ struct RpIdent {
   bool ok = false;
   std::string reason, method;   // method: "oscillation" | "plan"
   double a = 0, tauLo = 0, tauHi = 0;
-  double aLo = 0, aHi = 0;   // spread of the per-window fits
+  double aLo = 0, aHi = 0;   // spread of the per-window fits (and of a second wobble frequency)
+  double a2 = 0;             // control power if the second wobble frequency were the loop's (0 = none)
   std::vector<cc::MarginalFit> fits;
 };
 RpIdent identifyMarginal(const Oscillation& osc, const std::vector<Hover>& hovers, Family fam, int axis);

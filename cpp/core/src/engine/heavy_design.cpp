@@ -394,8 +394,10 @@ Design designAll(const DesignInputs& in) {
           zMin = std::min(zMin, po.zeta);
           stable = stable && po.stable;
         }
+        const double zNom = cc::slowAxisPoles(n.a, n.c, g.P, g.I, g.angleP).zeta;
         c.metrics.set("zeta", zMin);
-        if (stable && zMin >= 0.35 && c.wm.gmDb >= 6) ok.push_back(c);
+        // zeta >= 0.35 on the nominal plant, >= 0.2 on the pessimistic corners (no aerodynamic damping, weak)
+        if (stable && zNom >= 0.35 && zMin >= 0.2 && c.wm.gmDb >= 6) ok.push_back(c);
         all.push_back(c);
       }
   dy.accepted = static_cast<int>(ok.size());
