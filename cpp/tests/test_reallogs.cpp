@@ -1,6 +1,6 @@
 // The owner's tandem QuadPlane hover logs (ArduPlane 4.7.1, 2026-10-15) and the audit's refusal cases made from
-// them: the C++ counterpart of test/reallogs.test.js. Skipped when the logs are not on this PC (folder: the
-// APTUNER_LOG_DIR environment variable, else Documents\Mission Planner\logs\FIXED_WING\1 under the user profile).
+// them. Skipped unless APTUNER_LOG_DIR (environment, or the CMake option of the same name) names the folder that
+// holds them (the logs are not published with the source).
 // Expected values are computed here from the raw records, independently of the analysis pipeline.
 #include <algorithm>
 #include <cmath>
@@ -28,17 +28,17 @@ using aptuner::core::Vec;
 namespace {
 
 std::string logPath(const std::string& name) {
-  std::string dir;
-  if (const char* d = std::getenv("APTUNER_LOG_DIR")) {
-    dir = d;
-  } else {
-    const char* home = std::getenv("USERPROFILE");
-    if (!home) home = std::getenv("HOME");
-    dir = std::string(home ? home : "") + "/OneDrive/Documents/Mission Planner/logs/FIXED_WING/1";
-  }
+  // the folder with the tandem QuadPlane logs: APTUNER_LOG_DIR (CMake option APTUNER_LOG_DIR); unset: the tests skip
+  const char* d = std::getenv("APTUNER_LOG_DIR");
+  if (!d || !*d) return "";
+  const std::string dir = d;
   return dir + "/2026-10-15 " + name + ".bin";
 }
 bool present(const std::string& p) {
+  if (p.empty()) {
+    std::printf("        (skipped: set APTUNER_LOG_DIR to the folder with the tandem logs)\n");
+    return false;
+  }
   std::ifstream f(p, std::ios::binary);
   if (f.good()) return true;
   std::printf("        (skipped: %s not found)\n", p.c_str());

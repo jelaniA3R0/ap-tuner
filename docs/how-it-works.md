@@ -388,7 +388,7 @@ The tandem 4+1 QuadPlane (~100 kg, `docs/validation/tandem-hover-logs.md`) showe
 working: yaw drifted 70-110 deg after every lift-off and pitch wobbled at 0.45 Hz. The rule-based proposals
 (QuikTune yaw ceiling 0.5, x2 per round, angle-P floor 3), evaluated on the validated models, gave pitch a phase
 margin of 6 deg and a 41 deg yaw swing, against 42 deg and 11 deg for the hand tune that flew. The model tuner
-implements that hand tune (`research/tandem-2026-10/` holds the reference scripts).
+implements that hand tune (its reference scripts are kept by the author and are not in the repository; their numbers are in `docs/validation/tandem-hover-logs.md`).
 
 **The axis chain** (`core/cascade`, checked against the ArduPilot source):
 - Pilot shaping: first order with `INPUT_TC` (yaw: `PLT_Y_RATE_TC`), then the acceleration limit `ACC_*_MAX` in

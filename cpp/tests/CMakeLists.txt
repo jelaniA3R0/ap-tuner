@@ -19,6 +19,12 @@ target_compile_definitions(aptuner-tests PRIVATE APTUNER_GOLDEN_DIR="${CMAKE_CUR
 add_test(NAME unit COMMAND aptuner-tests -live_ -wv_ -heavylog_)
 # model tuning on the tandem QuadPlane logs (skipped when they are not on this PC; about a minute)
 add_test(NAME heavy_logs COMMAND aptuner-tests heavylog_)
+# the folder with the tandem QuadPlane logs (not published): -DAPTUNER_LOG_DIR=... or the APTUNER_LOG_DIR environment
+# variable; empty: the real-log tests skip
+set(APTUNER_LOG_DIR "$ENV{APTUNER_LOG_DIR}" CACHE PATH "folder with the tandem QuadPlane .bin logs for the real-log tests (optional)")
+if(APTUNER_LOG_DIR)
+  set_tests_properties(unit heavy_logs PROPERTIES ENVIRONMENT "APTUNER_LOG_DIR=${APTUNER_LOG_DIR}")
+endif()
 # the in-flight safety scenarios on a fake vehicle (about a minute: real-time watches)
 add_test(NAME live_safety COMMAND aptuner-tests live_)
 # verified writes bound to the right aircraft (audit R3) on fake vehicles (real-time: about two minutes)

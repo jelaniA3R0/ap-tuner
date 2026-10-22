@@ -18,6 +18,16 @@ design from raw gyro data.
 edition was removed; it is in the git history up to commit `35bc01c`). Paths like `src/engine/tuner.js` further
 down name the JavaScript module a C++ file was ported from; the C++ file has the same name under `cpp/`.
 
+> **Status: beta (v0.2.0).** The model-based tuner for heavy drones has been proven on one airframe so far (a
+> ~100 kg tandem QuadPlane) and predicted two real flights correctly. Read **Status and limitations** below before
+> you fly settings from it, and keep the UNDO file of every step.
+
+| Model tune: what the flights show | Next-flight check |
+|---|---|
+| ![Model tune overview](docs/img/model-tune-15oct.png) | ![Next-flight check](docs/img/next-flight-check.png) |
+| **Model check: the model replays your real hovers** | **Settings & apply: edit, re-check, file or write** |
+| ![Model check](docs/img/model-check.png) | ![Settings and apply](docs/img/settings-apply.png) |
+
 ## Model tune: heavy and slow drones (in plain words)
 
 Big drones are slow: the motors and props take a long time to change thrust, and the angle loop
@@ -169,6 +179,35 @@ the filtered gyro and warns you.
 * **Diagnostics**: tracking, oscillation band energy and peak, actuator saturation, D/P share,
   slew-rate limiter activity (SRate, Dmod), noise, trim (I term), graded A-F with explanations.
 
+## Status and limitations (read before flying)
+
+AP Tuner is beta software for experienced builders. It proposes and, if you ask it to, writes autopilot settings.
+Wrong settings can crash an aircraft; you are responsible for what you fly.
+
+**Model tune (heavy and slow drones):**
+* **Proven on one airframe.** The method and several of its thresholds (damping limits, replay tolerances, the rate-P
+  cap from the motor lag, how a second wobble frequency widens the roll range) were developed and checked on one
+  ~100 kg tandem 4+1 QuadPlane: 5 hovers of identification, 2 later flights whose predictions were confirmed
+  (`docs/validation/tandem-hover-logs.md`). Other heavy drones may behave in ways the method has not seen yet.
+* **Uncertain axes are reported, not hidden.** On the tandem the roll wobble has two frequencies, so the roll model
+  spans a wide range and the roll proposal is designed to hold over all of it. The proposed pitch rate P (0.71) is
+  higher than the 0.5 that was flown; both pass every test on both models, but only 0.5 has flown.
+* **Live recording and writing from the app** were tested on simulated telemetry and on ArduPilot's simulator, not yet
+  through a real radio link and Mission Planner. Writes only happen on the ground, disarmed, to the drone the flights
+  came from, verified value by value with an UNDO file first.
+* **Telemetry is enough for the slow motions**, not for vibration: the vibration checks and the notch design need a
+  log with the fast data.
+* **Multirotors and QuadPlane VTOL flight only**; a drone that is not heavy or slow gets no model-based proposal (use
+  the other tabs).
+
+**The other tabs (Flight, Telemetry + USB, Advanced, Log file)** were validated on ArduPilot's simulator (quad and
+QuadPlane models) and on real logs, not by in-air tuning of a real aircraft. **Allow changes in flight** is
+experimental and off by default.
+
+**Not checked on every platform.** The C++ code is built and tested on Windows (clang); GitHub Actions also builds it
+with MSVC, GCC (Linux) and Clang (macOS). The installer and the app window are Windows only; on Linux / macOS the app
+runs as a local web server (`aptuner --open`).
+
 ## Safety
 
 Keep a hand on the mode switch, tune in calm air at a safe height, one axis at a time, with a
@@ -223,39 +262,30 @@ How a value is written (2026-10-17 audit, R3):
   Planner and mark the values that act after a reboot; a value ArduPilot does not accept is left out with a note,
   and a value outside the documented range gets a note.
 
-## Testing without a vehicle (SITL)
+## Building and testing
 
-> The `tools/*.js` helpers named in this section and the next belonged to the JavaScript edition: they are in the git
-> history (up to commit `35bc01c`). `sitl/pilot.js` (the scripted pilot) is still here and needs Node.js.
+`cpp\build.cmd` builds the release and runs every test (portable toolchain in `D:\toolchain`, see `cpp/README.md`;
+any CMake 3.21+ and C++20 compiler works too, and GitHub Actions builds with MSVC, GCC and Clang):
 
-`sitl\run-sitl.cmd` starts an ArduCopter software-in-the-loop (Windows build from
-firmware.ardupilot.org). `node sitl\pilot.js 5760 10` arms, takes off to 12 m and flies stick
-taps for 10 minutes. Connect AP Tuner to `127.0.0.1:5762` (TCP). Mission Planner can watch on
-5763. This is how the app was verified: a detuned SITL quad was identified, re-tuned axis by
-axis with auto-apply, each step held under the watchdog, and the session journaled.
+* **unit**: the maths against golden results, the log reader and its integrity checks, the cascade model against the
+  hand analysis, the model tuner on a simulated drone's telemetry, every step file checked value by value against
+  the float32 the autopilot stores, "check my values";
+* **live_safety** and **write_verify**: the in-flight safety scenarios and the verified writes, on fake vehicles
+  (real time, a few minutes);
+* **heavy_logs**: the model tuner on the tandem QuadPlane logs with the acceptance criteria of the hand tune. The
+  logs are not published: set `APTUNER_LOG_DIR` (environment or `-DAPTUNER_LOG_DIR=...`; on Windows a git-ignored
+  `cpp\local-settings.cmd` with `set "APTUNER_LOG_DIR=..."` is read by `build.cmd`) to run it; otherwise it skips.
 
-Safety regression tests: `node tools/sitl-f01.js --port <app port>` repeats the audit's F-01 case (the notch
-switched on in flight with high pitch gains; the app must switch it back and pause within 5 s of the onset),
-`node tools/flight-demo.js --port <app port>` flies a whole guided session and lists every pause and trip, and
-`node tools/osc-episodes.js <log.BIN>` lists the sustained oscillations in the simulator's own log.
-`node tools/sitl-ground-write.js --cpp` writes on the ground to a fresh simulator, disarmed, in both editions:
-four gains written, read back and undone, a value the autopilot refuses, a whole-number value, and the notch
-with its reboot, Undo and second reboot (results in `sitl\run-ground-write\`). Unit tests: `npm test`
-(JavaScript, including fake vehicles with 26 safety and 41 write-verification scenarios, the API security
-checks and the page-escaping check) and `cpp\build.cmd` (C++, the same scenarios).
+**ArduPilot's simulator (SITL).** `sitl\` holds the Windows SITL programs from firmware.ardupilot.org
+(`ArduCopter.exe`, `ArduPlane.exe`) and parameter files. `sitl\run-sitl.cmd` starts a quad; for the QuadPlane:
+`ArduPlane.exe --model quadplane --defaults ..\demo-quadplane.parm` in an empty folder. The simulator waits for its
+first connection on TCP 5760: connect AP Tuner there. `node sitl\pilot.js 5760 10` (Node.js) arms, takes off and flies
+stick taps. The writing path of the Model tune tab was checked this way on the QuadPlane: two steps (8 and 16 values)
+written, read back identical, rebooted, read again identical.
 
-## Demonstrations
-
-`demo/index.html` links the before/after demonstrations made with ArduPilot's simulator: for each vehicle
-(a medium quadcopter and a medium quadplane VTOL) the same scripted stick sequence was flown with under-tuned
-starting gains, then AP Tuner tuned the vehicle in a separate flight, and the sequence was flown again. Each
-folder holds the autopilot's own logs (`before.BIN`, `tuning.BIN`, `after.BIN`), the parameter file the
-app produced (`tuned.param`), a comparison report (`report.html`) and a side-by-side video (`.avi`).
-`node tools/demo-run.js quad|quadplane` reproduces a demonstration with the app running.
-
-The method itself was checked against the simulator: `tools/osc-experiment.js` raises roll P step by step
-until the autopilot's own oscillation signal fires, and the gain at which that happened is compared with the
-gain the app's model predicts (logs in `docs/validation/`, numbers in `docs/how-it-works.md`).
+The earlier JavaScript edition's demonstrations and SITL scripts (before/after videos, the oscillation-onset
+experiment, the guided-flight and ground-write drivers) are in the git history up to commit `35bc01c`; their results
+are summarised in `docs/how-it-works.md` and `docs/validation/`.
 
 ## Files
 
@@ -272,5 +302,5 @@ gain the app's model predicts (logs in `docs/validation/`, numbers in `docs/how-
 * `cpp/io` event loop, MAVLink, TCP / UDP / serial links, auto-connect (Mission Planner mirror), log download.
 * `cpp/app` the application: HTTP + SSE server for `web/`, live tuner, guided flight, Telemetry + USB, live notch.
 * `cpp/tests` unit, golden, real-log and model-tuning tests (`cpp\build.cmd` builds and runs them).
-* `web` the user interface (uPlot for charts). `research/` (not packaged) the hand analysis of the tandem
-  QuadPlane that the model tuner implements.
+* `web` the user interface (uPlot for charts). `docs/img` the screenshots. The hand analysis of the tandem QuadPlane that the model tuner implements
+  (`research/`) stays with the author: it holds local log paths and is not part of the repository.

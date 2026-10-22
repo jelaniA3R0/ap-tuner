@@ -16,3 +16,8 @@ build/
 # editor / assistant settings
 .claude/
 .vscode/
+
+# this PC only
+cpp/local-settings.cmd
+# the hand analysis of the tandem QuadPlane (reference scripts with local log paths; not published)
+research/

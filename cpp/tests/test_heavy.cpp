@@ -1,6 +1,6 @@
 // Model-based tuning of heavy / slow vehicles (engine/heavytune): the live-telemetry path on a simulated flight, the
 // marginal-mode identification on a simulated oscillating loop, and the tandem QuadPlane logs as regression cases
-// (skipped when the logs are not on this PC; the acceptance criteria of the hand tune, docs/validation/tandem-hover-logs.md).
+// (skipped unless APTUNER_LOG_DIR names the folder that holds them; the acceptance criteria of the hand tune, docs/validation/tandem-hover-logs.md).
 #include <cmath>
 #include <map>
 #include <cstdlib>
@@ -45,10 +45,11 @@ Json quadplaneParams(double yawP, double yawI, double yawK) {
   return p;
 }
 
+/** a tandem QuadPlane log in the folder APTUNER_LOG_DIR (CMake option APTUNER_LOG_DIR); "" when not set */
 std::string tandemLog(const char* name) {
-  const char* home = std::getenv("USERPROFILE");
-  if (!home) return "";
-  return std::string(home) + "/OneDrive/Documents/Mission Planner/logs/FIXED_WING/1/" + name;
+  const char* d = std::getenv("APTUNER_LOG_DIR");
+  if (!d || !*d) return "";
+  return std::string(d) + "/" + name;
 }
 bool exists(const std::string& p) { return !p.empty() && std::filesystem::exists(p); }
 
@@ -202,7 +203,7 @@ TEST(heavy_marginal_mode_on_simulated_oscillation) {
 TEST(heavylog_tandem_acceptance) {
   const std::string a = tandemLog("2026-10-15 04-20-29.bin"), b = tandemLog("2026-10-15 04-33-02.bin"), c = tandemLog("2026-10-15 04-43-00.bin");
   if (!exists(a) || !exists(b) || !exists(c)) {
-    std::printf("    skipped: the tandem logs are not on this PC\n");
+    std::printf("    skipped: set APTUNER_LOG_DIR to the folder with the tandem logs\n");
     return;
   }
   const Json r = heavy::analyzeFlights({heavy::recordFromLogFile(a), heavy::recordFromLogFile(b), heavy::recordFromLogFile(c)});

@@ -760,6 +760,8 @@ Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opt
       }
       if (keep) {
         notesJ.push("Keep the " + G.title + " settings you fly: they pass every test on the model and the design would not be clearly better.");
+        for (int a : G.axes)
+          if (design.axes[static_cast<std::size_t>(a)].ok) res.at("axes").at(kAxisNames[a]).at("design").set("kept", true);
         continue;
       }
       for (int stepNo = 0; stepNo < 4; ++stepNo) {

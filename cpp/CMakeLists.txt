@@ -2,7 +2,7 @@
 #   cmake -G Ninja -S cpp -B build -DCMAKE_BUILD_TYPE=Release
 #   cmake --build build && ctest --test-dir build --output-on-failure
 cmake_minimum_required(VERSION 3.21)
-project(aptuner VERSION 0.1.0 LANGUAGES CXX
+project(aptuner VERSION 0.2.0 LANGUAGES CXX
         DESCRIPTION "Log-based and live ArduPilot rate-PID and notch-filter tuning")
 
 set(CMAKE_CXX_STANDARD 20)
