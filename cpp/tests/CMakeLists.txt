@@ -2,6 +2,7 @@ add_executable(aptuner-tests
   test_main.cpp
   test_build_info.cpp
   test_golden_core.cpp
+  test_cascade.cpp
   test_dfreader.cpp
   test_logintegrity.cpp
   test_reallogs.cpp

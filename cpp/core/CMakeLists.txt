@@ -3,6 +3,7 @@
 add_library(aptuner_core STATIC
   src/build_info.cpp
   src/cx.cpp
+  src/cascade.cpp
   src/fft.cpp
   src/spectra.cpp
   src/stepresp.cpp
