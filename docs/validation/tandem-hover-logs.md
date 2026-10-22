@@ -140,7 +140,7 @@ app proposes a slightly softer roll rate P after the 21 Oct flights (0.26). The 
 | flight | recognised as | yaw heading swing predicted / flown | pitch | verdict |
 |---|---|---|---|---|
 | `2026-10-21 00-34-01` (yaw P 1.5, I 0.11, ANG 1, limits 20/15/20) | Step 1, flown with other values (P 1.5 against the proposed 3.1) | 15-21 / 13 deg (with this flight's trim 0.33; hand: 14-20) | wobble expected, still there (0.46 Hz, +-5 deg) | confirmed; yaw re-fit a 0.29, c 0.22, trim 0.33 (hand re-fit 0.31, 0.11, 0.34) |
-| `2026-10-21 01-11-37` (yaw P 2.5, I 0.19) | Step 1 (other values) | 8-11 / 11 deg (hand: 9-11) | growing wobble detected (+-5 deg growing to +-8) | confirmed; "keep the yaw settings you fly"; roll + pitch step proposed |
+| `2026-10-21 01-11-37` (yaw P 2.5, I 0.19) | Step 1 (other values) | 8-14 / 11 deg (hand: 9-11; the range covers both yaw models) | growing wobble detected (+-5 deg growing to +-8) | confirmed; "keep the yaw settings you fly"; roll + pitch step proposed |
 
 Things to know:
 - On 21 Oct the pitch gyro above 15 Hz was 7.2 and 9.7 deg/s against 2.4 on 15 Oct (x3-4): flagged as mechanical

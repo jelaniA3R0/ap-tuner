@@ -496,7 +496,7 @@ of the same flights):
 3. compares: the yaw swing must fall within the predicted range +-20% (or 3 deg); a wobble expected or not;
 4. re-fits the model and proposes the next step, or says to stop.
 
-On the tandem: Step 1 predicted 15-21 deg, flew 13; Step 2 predicted 8-11 deg, flew 11 (the hand predictions were
+On the tandem: Step 1 predicted 15-21 deg, flew 13; Step 2 predicted 8-14 deg, flew 11 (the hand predictions were
 14-20 and 9-11).
 
 **Live.** With the vehicle connected (Mission Planner's mirror is found automatically), the app:
