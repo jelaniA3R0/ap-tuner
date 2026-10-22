@@ -270,7 +270,7 @@ edition does the same, `tools/compare-cpp.js` checks it):
   diagnostics flag saturation and high-frequency noise).
 * The live tuner never changes `MOT_*`, `ATC_ACC_*_MAX`, `ATC_INPUT_TC` or other feel/limit parameters.
   The model tuner for heavy / slow vehicles (below) *proposes* `ACC_*_MAX`, `RATE_*_MAX`, the pilot yaw rate,
-  `INPUT_TC`, `IMAX` and the gyro filter, each with its reason, in parameter files only; it never writes them.
+  `INPUT_TC`, `IMAX` and the gyro filter, each with its reason, in parameter files, or writes them from the Model tune tab only when you confirm it (disarmed, the same drone, verified).
 
 ## 4. Connection, installation and the live notch (second iteration)
 
@@ -504,4 +504,17 @@ On the tandem: Step 1 predicted 15-21 deg, flew 13; Step 2 predicted 8-14 deg, f
 - asks for the telemetry streams (PID_TUNING needs `GCS_PID_MASK = 7`, which the app reports but does not set);
 - records each flight from arming to disarming and analyses it after landing.
 
-25 Hz telemetry is enough for these slow motions; only the vibration checks need a log. Nothing is written to the vehicle.
+25 Hz telemetry is enough for these slow motions; only the vibration checks need a log. Recording never writes anything to the vehicle.
+
+**Applying a step (Settings & apply).** The values are shown exactly as the autopilot stores them: the shortest decimal
+that gives back the same float32, whole numbers for integer parameters, the same text in the table, the `.param` file
+and the write. You may type other values: `POST /api/heavy/evaluate` (engine `evaluateSettings`) checks each one as for a
+parameter file and re-runs the predictions and the acceptance tests of the design on the model (yaw: stable, damping
+0.35 nominal / 0.2 worst, IMAX against the trim; roll / pitch: phase margin 40 deg, gain margin 10 dB, Ms 1.8, noise
+x1.15; limits as warnings). The parameter file is built from the values on screen. Writing from the app is two-stage:
+`writeplan` refuses unless the drone is connected, disarmed and has the analysed system id, accepts only the step's
+parameters, reads their current values and returns the exact list with a hash; `write` needs that hash, saves an UNDO
+file of the values read, then writes every changed value with read-back and rolls everything back on the first failure
+(the verified transaction the live tuner uses), and journals it. A changed `INS_GYRO_FILTER` gets the reboot workflow
+(the restart proven, every value read again). Checked on ArduPlane QuadPlane SITL: 16 values written, verified, rebooted,
+read back identical.

@@ -708,7 +708,8 @@ class App {
       };
       const Json txn = items.size() ? co_await runTransaction(link, items, to) : Json::obj({{"ok", true}, {"rows", Json::array()}});
       bool reboot = false;
-      for (const auto& r : p["rows"].arr()) reboot = reboot || core::isRebootRequired(r["name"].strOr("")) || r["name"].strOr("") == "INS_GYRO_FILTER";
+      for (const auto& r : p["rows"].arr())
+        if (!r["same"].asBool()) reboot = reboot || core::isRebootRequired(r["name"].strOr("")) || r["name"].strOr("") == "INS_GYRO_FILTER";
       heavyLastWrite = Json::obj({{"txn", txn}, {"undoFile", items.size() ? Json(undo) : Json()}, {"reboot", reboot && txn["ok"].asBool()}, {"rows", p["rows"]},
                                   {"text", items.size() ? txnText(txn) : std::string("every value was already on the drone: nothing written")}});
       co_return jsonResp(200, heavyLastWrite);

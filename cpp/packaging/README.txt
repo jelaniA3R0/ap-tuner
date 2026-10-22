@@ -17,9 +17,10 @@ Programs
 Model tune (heavy and slow drones)
   The "Model tune" tab: drop logs of one drone, or connect (Mission Planner is found by itself) and press Start
   listening. The app finds what's wrong, builds a model of the drone, replays your real flights on it, designs the
-  settings and gives you step files with an UNDO file. It never writes them to the drone: load them in Mission
-  Planner (Full Parameter List > Load from file > Write Params). Fly the step, bring the log (or fly while the app
-  listens) and it checks its own prediction.
+  settings and gives you the exact values. Type your own and the model re-checks them; download the .param file of
+  the values shown and load it in Mission Planner (Full Parameter List > Load from file > Write Params); or press
+  "Write to drone" (connected, disarmed, the same drone: UNDO file first, every value read back, rolled back if one
+  does not hold). Fly the step, bring the log (or fly while the app listens) and it checks its own prediction.
 
 Folders
   web\        the user interface (HTML / JavaScript)

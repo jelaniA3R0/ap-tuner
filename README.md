@@ -38,9 +38,17 @@ find a working tune. The **Model tune** tab does what an engineer would do by ha
    range (phase margin ≥ 40°, gain margin ≥ 10 dB for roll / pitch; damping for yaw), noise no higher than now,
    time simulations of lift-off, gusts, stick steps, extra delay and rotor kick; limits (acceleration, rate,
    pilot yaw rate, IMAX) from what the motors can actually do; one gyro filter for all axes.
-6. **Gives you steps**: a `.param` file per step with the reason for every value, an **UNDO** file with the values
-   you flew, the predicted result and a short test card. Load the file in Mission Planner (Full Parameter List →
-   Load from file → Write Params). The app never writes these to the drone itself.
+6. **Gives you steps** (Settings & apply): the exact values, with the reason for each, the predicted result, an
+   **UNDO** file with the values you flew and a short test card. Every value is shown exactly as the autopilot will
+   store it (float32 / whole numbers). Then pick one of three ways:
+   * **type your own values**: the model re-checks them at once (stability, damping, phase / gain margin, noise,
+     limits) and says "safe on the model" or which test fails;
+   * **download the parameter file** of exactly the values on screen, and load it in Mission Planner (Full Parameter
+     List → Load from file → Write Params);
+   * **write to the drone** from the app: only when it is connected, disarmed and is the drone the flights came from.
+     You first see the drone's current values next to the new ones; on your OK the app saves an UNDO file, writes
+     each value, reads it back, and if one does not hold puts everything back. When the gyro filter changes it offers
+     the reboot and reads every value again afterwards.
 7. **Checks your next flight**: analyse the next log (or fly with the app listening) and it recognises which step
    you flew, compares the prediction with what happened ("prediction confirmed"), re-fits the model and gives
    the next step, or says to stop.
