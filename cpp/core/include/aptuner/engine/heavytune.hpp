@@ -36,4 +36,15 @@ struct Options {
  */
 Json analyzeFlights(const std::vector<FlightRecord>& flights, const Options& opts = {});
 
+/**
+ * "Check my values": the settings flown with some values replaced (rows [{name, value}], e.g. typed by the user) judged on
+ * the models of an analysis result: every value checked as for a parameter file (exact float32 / integer form, ranges),
+ * then per axis the predictions and the same acceptance tests the design used. Returns
+ * {ok, rows [{name, value, text, ok, errors, warnings}], axes {roll, pitch, yaw: {touched, pass, why [text], predicted}}}.
+ */
+Json evaluateSettings(const Json& result, const Json& rows);
+
+/** the exact value a parameter file carries for a value (float32 shortest form, whole numbers for integer parameters) */
+double exactValue(const std::string& name, double value);
+
 }  // namespace aptuner::engine::heavy

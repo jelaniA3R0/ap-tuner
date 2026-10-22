@@ -2,6 +2,7 @@
 // marginal-mode identification on a simulated oscillating loop, and the tandem QuadPlane logs as regression cases
 // (skipped when the logs are not on this PC; the acceptance criteria of the hand tune, docs/validation/tandem-hover-logs.md).
 #include <cmath>
+#include <map>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -11,6 +12,7 @@
 #include "aptuner/core/cascade.hpp"
 #include "aptuner/engine/flightrec.hpp"
 #include "aptuner/engine/heavytune.hpp"
+#include "aptuner/core/parammeta.hpp"
 #include "check.hpp"
 
 using aptuner::core::Json;
@@ -58,7 +60,7 @@ const Json* issueWith(const Json& r, const std::string& title) {
 
 }  // namespace
 
-TEST(heavy_live_telemetry_pipeline) {
+static heavy::FlightRecord syntheticTelemetryFlight() {
   // a slow yaw axis (a 0.25, c 0.1, motor lag 0.2 s, torque trim 0.4) flown three times with stock-like gains; the
   // telemetry the app would see through Mission Planner (25 Hz) goes through the recorder and the full analysis
   cc::Gains g;
@@ -112,7 +114,11 @@ TEST(heavy_live_telemetry_pipeline) {
     for (int k = 0; k < 75; ++k) hb(t0 + k / 25.0, false);
     t0 += 10;
   }
-  const heavy::FlightRecord fr = rec.finish("telemetry test");
+  return rec.finish("telemetry test");
+}
+
+TEST(heavy_live_telemetry_pipeline) {
+  const heavy::FlightRecord fr = syntheticTelemetryFlight();
   const Json r = heavy::analyzeFlights({fr});
   CHECK(!r.has("error"));
   CHECK(r["hovers"].size() == 3);
@@ -267,4 +273,65 @@ TEST(heavylog_tandem_acceptance) {
   for (const auto& s : r2["steps"].arr())
     if (s["title"].strOr("").find("roll and pitch") != std::string::npos) rpStep = true;
   CHECK(rpStep);
+}
+
+namespace {
+/** float32 equality: what the autopilot stores */
+bool sameF32(double a, double b) { return static_cast<float>(a) == static_cast<float>(b); }
+}  // namespace
+
+TEST(heavy_files_exact_and_check_my_values) {
+  const Json r = heavy::analyzeFlights({syntheticTelemetryFlight()});
+  CHECK(r["steps"].size() > 0);
+  for (const auto& s : r["steps"].arr()) {
+    // every NAME,VALUE line of the step file is exactly the value shown (same text, same float32), and every row is in it
+    std::map<std::string, std::string> file, undo;
+    auto parse = [](const std::string& text, std::map<std::string, std::string>& out) {
+      std::size_t a = 0;
+      while (a < text.size()) {
+        std::size_t b = text.find('\n', a);
+        if (b == std::string::npos) b = text.size();
+        std::string line = text.substr(a, b - a);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && line[0] != '#') {
+          const auto c = line.find(',');
+          out[line.substr(0, c)] = line.substr(c + 1);
+        }
+        a = b + 1;
+      }
+    };
+    parse(s["paramText"].strOr(""), file);
+    parse(s["undoText"].strOr(""), undo);
+    CHECK(file.size() == s["rows"].size());
+    for (const auto& row : s["rows"].arr()) {
+      const std::string n = row["name"].strOr("");
+      CHECK(file.count(n) && file[n] == row["text"].strOr("?"));
+      CHECK(file.count(n) && sameF32(std::stod(file[n]), row["to"].num()));
+      CHECK(undo.count(n) && sameF32(std::stod(undo[n]), row["from"].num()));
+      CHECK(aptuner::core::validateParam(n, Json(std::stod(file[n]))).ok);
+    }
+    // "check my values" with the step as proposed: valid, and the same prediction as the step
+    Json rows = Json::array();
+    for (const auto& row : s["rows"].arr()) rows.push(Json::obj({{"name", row["name"]}, {"value", row["text"]}}));
+    const Json ev = heavy::evaluateSettings(r, rows);
+    CHECK(ev["ok"].asBool());
+    if (s["predicted"]["yaw"].isObject()) {
+      CHECK(ev["axes"]["yaw"]["touched"].asBool());
+      CHECK(ev["axes"]["yaw"]["predicted"]["swingDeg"] == s["predicted"]["yaw"]["swingDeg"]);
+    }
+  }
+  // typed values: a typo and an impossible value are refused; a value is stored as the float32 the autopilot keeps
+  const Json ev = heavy::evaluateSettings(r, Json(Json::Array{Json::obj({{"name", "Q_A_RAT_YAW_P"}, {"value", "3.1x"}}),
+                                                             Json::obj({{"name", "Q_A_RAT_YAW_P"}, {"value", 50}}),
+                                                             Json::obj({{"name", "Q_A_RAT_YAW_I"}, {"value", "0.155"}})}));
+  CHECK(!ev["ok"].asBool());
+  CHECK(!ev["rows"][0]["ok"].asBool());
+  CHECK(!ev["rows"][1]["ok"].asBool());
+  CHECK(ev["rows"][2]["ok"].asBool() && ev["rows"][2]["text"].strOr("") == "0.155" && sameF32(ev["rows"][2]["value"].num(), 0.155));
+  // a value with more digits than float32 holds is shown as what the autopilot will store
+  CHECK(heavy::exactValue("Q_A_RAT_YAW_P", 0.123456789) == std::stod(aptuner::core::formatParamValue("Q_A_RAT_YAW_P", 0.123456789)));
+  CHECK(sameF32(heavy::exactValue("Q_A_RAT_YAW_P", 0.123456789), 0.123456789));
+  // unstable gains fail the yaw tests
+  const Json bad = heavy::evaluateSettings(r, Json(Json::Array{Json::obj({{"name", "Q_A_RAT_YAW_P"}, {"value", 0.05}}), Json::obj({{"name", "Q_A_ANG_YAW_P"}, {"value", 12}})}));
+  CHECK(bad["axes"]["yaw"]["pass"].isBool() && !bad["axes"]["yaw"]["pass"].asBool());
 }

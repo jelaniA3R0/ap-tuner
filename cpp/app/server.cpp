@@ -25,6 +25,9 @@
 #include "flight.hpp"
 #include "groundtune.hpp"
 #include "heavylive.hpp"
+#include "paramwrite.hpp"
+#include "aptuner/core/parammeta.hpp"
+#include "aptuner/engine/heavytune.hpp"
 #include "http.hpp"
 #include "journal.hpp"
 #include "notchlive.hpp"
@@ -611,6 +614,116 @@ class App {
       r.headers.push_back({"Content-Disposition", "attachment; filename=\"" + std::regex_replace(base, binRe, "") + " - AP Tuner.param\""});
       co_return r;
     }
+    // ---- model tuning: check edited values, exact files, write a step to the drone (two stages, verified)
+    if (path == "/api/heavy/paramfile") {
+      if (!lastHeavy.isObject()) co_return jsonResp(400, Json::obj({{"error", "analyse a flight first"}}));
+      const Json ev = engine::heavy::evaluateSettings(lastHeavy, body["rows"]);
+      Json rows = Json::array();
+      for (const auto& r : ev["rows"].arr())
+        if (r["ok"].asBool()) {
+          const Json fp = lastHeavy["flownParams"][r["name"].strOr("")];
+          Json row = Json::obj({{"group", body["title"].strOr("settings")}, {"name", r["name"]}, {"value", r["value"]}, {"label", ""}});
+          if (fp.isNumber()) row.set("from", fp);
+          rows.push(row);
+        }
+      const std::string title = body["title"].strOr("Model tuning step");
+      const Json who = Json(engine::logIdentityText(Json::obj({{"file", lastHeavy["flights"][0]["name"]},
+                                                               {"params", Json::obj({{"SYSID_THISMAV", lastHeavy["vehicle"]["sysid"]}})},
+                                                               {"firmware", lastHeavy["vehicle"]["firmware"]}})));
+      const engine::ParamFileOut pf = engine::paramFileChecked(rows, {title + " - values as shown in AP Tuner", "Proposals only: check the values before writing."}, who, true);
+      journal.append("export", Json::obj({{"what", "model-tuning .param (as shown)"}, {"rows", rows}, {"errors", pf.errors}}));
+      co_return jsonResp(200, Json::obj({{"text", pf.text}, {"errors", pf.errors}, {"warnings", pf.warnings}, {"check", ev}}));
+    }
+    if (path == "/api/heavy/writeplan") {
+      if (!lastHeavy.isObject()) throw rt::Error("analyse a flight first");
+      if (!link.alive()) throw rt::Error("the drone is not connected: press Connect (Mission Planner is found by itself)");
+      if (link.vehicle()["armed"].asBool()) throw rt::Error("the drone is armed: land and disarm first. Values are only written on the ground");
+      const Json id = link.identity();
+      const Json want = lastHeavy["vehicle"]["sysid"];
+      if (!want.isNumber() || !(id["sysid"] == want))
+        throw rt::Error("the connected autopilot is system id " + id["sysid"].dump() + ", the analysed flights come from system id " + want.dump() +
+                        ": write only to the drone the flights came from");
+      // only the parameters of the step (values may be edited, names may not)
+      const int n = static_cast<int>(body["step"].numOr(0));
+      const Json* st = nullptr;
+      if (lastHeavy["steps"].isArray())
+        for (const auto& s : lastHeavy["steps"].arr())
+        if (static_cast<int>(s["n"].numOr(0)) == n) st = &s;
+      if (!st) throw rt::Error("no such step");
+      std::set<std::string> allowed;
+      for (const auto& r : (*st)["rows"].arr()) allowed.insert(r["name"].strOr(""));
+      for (const auto& r : body["rows"].isArray() ? body["rows"].arr() : Json::Array{})
+        if (!allowed.count(r["name"].strOr(""))) throw rt::Error(r["name"].strOr("?") + " is not part of step " + std::to_string(n));
+      const Json ev = engine::heavy::evaluateSettings(lastHeavy, body["rows"]);
+      for (const auto& r : ev["rows"].arr())
+        if (!r["ok"].asBool()) throw rt::Error(r["name"].strOr("?") + " " + (r["errors"].size() ? r["errors"][0].strOr("") : std::string("is not valid")));
+      // the values on the drone right now
+      std::vector<std::string> names;
+      for (const auto& r : ev["rows"].arr()) names.push_back(r["name"].str());
+      const Json now = co_await link.requestParams(names, 4);
+      Json rows = Json::array();
+      std::string canon;
+      for (const auto& r : ev["rows"].arr()) {
+        const std::string nm = r["name"].str();
+        if (!now[nm].isNumber()) throw rt::Error(nm + " could not be read from the drone");
+        const std::string vt = core::formatParamValue(nm, now[nm].num());
+        rows.push(Json::obj({{"name", nm}, {"vehicle", now[nm]}, {"vehicleText", vt}, {"to", r["value"]}, {"text", r["text"]}, {"same", vt == r["text"].str()}}));
+        canon += nm + "=" + r["text"].str() + ";";
+      }
+      std::uint64_t h = 1469598103934665603ULL;
+      for (unsigned char ch : canon) h = (h ^ ch) * 1099511628211ULL;
+      char hx[20];
+      std::snprintf(hx, sizeof hx, "%016llx", static_cast<unsigned long long>(h));
+      heavyPending = Json::obj({{"id", randomHex(8)}, {"hash", std::string(hx)}, {"step", n}, {"rows", rows}, {"gen", link.generation()}, {"sysid", id["sysid"]},
+                                {"compid", id["compid"]}, {"check", ev["axes"]}});
+      co_return jsonResp(200, heavyPending);
+    }
+    if (path == "/api/heavy/write") {
+      const Json p = heavyPending;
+      if (!p.isObject() || body["id"].strOr("") != p["id"].strOr("x") || body["hash"].strOr("") != p["hash"].strOr("x"))
+        throw rt::Error("the list changed since it was shown: look at it again, then press Write");
+      if (!link.alive()) throw rt::Error("the drone is not connected");
+      const Json id = link.identity();
+      if (p["gen"].numOr(-1) != link.generation() || !(p["sysid"] == id["sysid"]) || !(p["compid"] == id["compid"]))
+        throw rt::Error("the connection changed since the list was shown: show it again, then Write");
+      if (link.vehicle()["armed"].asBool()) throw rt::Error("the drone is armed: land and disarm first");
+      if (!journal.ok()) throw rt::Error("the write journal cannot be written (" + journal.error() + "): nothing is written");
+      heavyPending = Json();
+      journal.append("approval", Json::obj({{"what", "model-tuning step"}, {"step", p["step"]}, {"hash", p["hash"]}, {"by", "user"}, {"rows", p["rows"]}}));
+      Json items = Json::array();
+      for (const auto& r : p["rows"].arr())
+        if (!r["same"].asBool()) items.push(Json::obj({{"name", r["name"]}, {"to", r["to"]}, {"expect", r["vehicle"]}, {"reason", "model-tuning step"}}));
+      const std::string undo = pathStr(fsPath(opts_.sessionsDir) / "heavy-writes" /
+                                       (isoStampForFile().substr(0, 19) + " UNDO step " + core::jsToString(p["step"].numOr(0)) + ".param"));
+      TxnOpts to;
+      to.journal = [this](const std::string& k, const Json& d) { journal.append(k, d); };
+      to.ctx = Json::obj({{"via", "model tuning"}, {"step", p["step"]}, {"hash", p["hash"]}});
+      to.afterPreRead = [undo](const Json& before) {
+        Json urows = Json::array();
+        for (const auto& b : before.arr()) urows.push(Json::obj({{"group", "before AP Tuner"}, {"name", b["name"]}, {"value", b["before"]}}));
+        std::error_code ec;
+        fs::create_directories(fsPath(undo).parent_path(), ec);
+        if (!writeText(undo, engine::paramFile(urows, {"Values on the drone before AP Tuner wrote, " + localNow(), "Load this file to go back."}, Json(), false)))
+          throw std::runtime_error("the UNDO file could not be saved (" + undo + "): nothing was written");
+      };
+      const Json txn = items.size() ? co_await runTransaction(link, items, to) : Json::obj({{"ok", true}, {"rows", Json::array()}});
+      bool reboot = false;
+      for (const auto& r : p["rows"].arr())
+        if (!r["same"].asBool()) reboot = reboot || core::isRebootRequired(r["name"].strOr("")) || r["name"].strOr("") == "INS_GYRO_FILTER";
+      heavyLastWrite = Json::obj({{"txn", txn}, {"undoFile", items.size() ? Json(undo) : Json()}, {"reboot", reboot && txn["ok"].asBool()}, {"rows", p["rows"]},
+                                  {"text", items.size() ? txnText(txn) : std::string("every value was already on the drone: nothing written")}});
+      co_return jsonResp(200, heavyLastWrite);
+    }
+    if (path == "/api/heavy/reboot") {
+      if (!heavyLastWrite.isObject() || !heavyLastWrite["txn"]["ok"].asBool()) throw rt::Error("write a step first");
+      if (link.vehicle()["armed"].asBool()) throw rt::Error("the drone is armed: land and disarm first");
+      Json expect = Json::array();
+      for (const auto& r : heavyLastWrite["rows"].arr()) expect.push(Json::obj({{"name", r["name"]}, {"value", r["to"]}}));
+      RebootOpts ro;
+      ro.journal = [this](const std::string& k, const Json& d) { journal.append(k, d); };
+      ro.ctx = Json::obj({{"via", "model tuning"}});
+      co_return jsonResp(200, co_await rebootAndVerify(link, expect, ro));
+    }
     // ---- model tuning (heavy / slow vehicles): live recording, result, files
     if (path == "/api/heavy/live/start") co_return jsonResp(200, co_await heavy.start());
     if (path == "/api/heavy/live/stop") {
@@ -622,7 +735,9 @@ class App {
       co_return ok();
     }
     if (path == "/api/heavy/state")
-      co_return jsonResp(200, Json::obj({{"live", heavy.state()}, {"hasResult", lastHeavy.isObject()}, {"connected", link.connected()}, {"alive", link.alive()}}));
+      co_return jsonResp(200, Json::obj({{"live", heavy.state()}, {"hasResult", lastHeavy.isObject()}, {"connected", link.connected()}, {"alive", link.alive()},
+                                         {"vehicle", link.alive() ? link.vehicle() : Json()}, {"identity", link.alive() ? link.identity() : Json()},
+                                         {"lastWrite", heavyLastWrite}}));
     if (path == "/api/heavy/result") co_return jsonResp(200, lastHeavy.isObject() ? lastHeavy : Json::object());
     if (path == "/api/heavy/file") {
       if (!lastHeavy.isObject()) co_return jsonResp(400, Json::obj({{"error", "analyse a flight first"}}));
@@ -639,7 +754,8 @@ class App {
         fname = who + " plan.json";
       } else {
         const Json* st = nullptr;
-        for (const auto& s : lastHeavy["steps"].isArray() ? lastHeavy["steps"].arr() : Json::Array{})
+        if (lastHeavy["steps"].isArray())
+        for (const auto& s : lastHeavy["steps"].arr())
           if (static_cast<int>(s["n"].numOr(0)) == n) st = &s;
         if (!st) co_return jsonResp(404, Json::obj({{"error", "no such step"}}));
         r.body = kind == "undo" ? (*st)["undoText"].strOr("") : (*st)["paramText"].strOr("");
@@ -751,6 +867,26 @@ class App {
         c.send(jsonResp(200, Json::obj({{"ok", true}, {"path", file}})));
         return;
       }
+      if (req.path == "/api/heavy/evaluate") {
+        Json b = Json::object();
+        try {
+          b = Json::parse(req.body);
+        } catch (const std::exception&) {
+        }
+        std::promise<Json> got;
+        Loop::main().post([this, &got] { got.set_value(lastHeavy); });
+        const Json r = got.get_future().get();
+        if (!r.isObject()) {
+          c.send(jsonResp(400, Json::obj({{"error", "analyse a flight first"}})));
+          return;
+        }
+        try {
+          c.send(jsonResp(200, engine::heavy::evaluateSettings(r, b["rows"])));
+        } catch (const std::exception& e) {
+          c.send(jsonResp(500, Json::obj({{"error", e.what()}})));
+        }
+        return;
+      }
       if (req.path == "/api/heavy/analyze") {
         Json b = Json::object();
         try {
@@ -840,6 +976,7 @@ class App {
   GroundTune ground;
   HeavyLive heavy;
   Json lastHeavy;   // the latest model-tuning result (loop thread)
+  Json heavyPending, heavyLastWrite;   // the list shown before a write, and the last write
   io::AutoConnectState autoState;
   Json lastLogResult;
   SseHub hub;

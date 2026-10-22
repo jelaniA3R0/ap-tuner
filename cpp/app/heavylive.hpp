@@ -5,6 +5,8 @@
 // streams (as Mission Planner itself does).
 #pragma once
 
+#include <deque>
+#include <map>
 #include <memory>
 #include <string>
 
@@ -44,6 +46,9 @@ class HeavyLive : public rt::Emitter {
   core::Json warnings_ = core::Json::array();
   std::vector<std::uint64_t> handlers_;
   int flights_ = 0;
+  std::map<std::string, std::deque<double>> seen_;   // arrival times of each message type (last 3 s)
+  core::Json att_ = core::Json::object();
+  double customMode_ = -1;
 };
 
 /** the parameters the model tuner reads from a live vehicle */
