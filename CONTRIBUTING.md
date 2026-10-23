@@ -32,7 +32,7 @@ Everything is C++20 with no external libraries; the user interface is plain HTML
 
 * **Windows:** the portable toolchain described in `cpp/README.md` (llvm-mingw + CMake + Ninja), then
   `cpp\build.cmd` (builds and runs all tests). Visual Studio 2022 with the C++ workload also works.
-* **Linux / macOS:** `cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build`.
+* **Linux / macOS** (GCC 14 or newer, or Clang): `cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build`.
 * **Run the app from the source tree:** `build\...\app\aptuner --open --web web` (or `aptuner --server` and open
   http://127.0.0.1:8090).
 * **Real-log tests** need the tandem QuadPlane logs, which are not in the repository: they skip unless

@@ -12,7 +12,7 @@ cpp\build.cmd          release build + tests  ->  cpp\build\release
 cpp\build.cmd debug    debug build + tests    ->  cpp\build\debug
 ```
 
-Any platform with CMake 3.21+ and a C++20 compiler (MSVC 2022, GCC 11+, Clang 14+):
+Any platform with CMake 3.21+ and a C++20 compiler (MSVC 2022 or newer, GCC 14+, Clang 16+):
 
 ```
 cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release

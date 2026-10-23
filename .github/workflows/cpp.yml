@@ -24,7 +24,8 @@ jobs:
       matrix:
         include:
           - { name: windows-msvc, os: windows-latest, cxx: '', werror: 'OFF' }
-          - { name: linux-gcc, os: ubuntu-latest, cxx: g++, werror: 'ON' }
+          # GCC 13 crashes on some of the coroutines (internal compiler error); GCC 14 or newer is needed
+          - { name: linux-gcc, os: ubuntu-latest, cxx: g++-14, werror: 'ON' }
           - { name: macos-clang, os: macos-latest, cxx: clang++, werror: 'ON' }
     steps:
       - uses: actions/checkout@v4
