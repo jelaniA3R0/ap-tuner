@@ -22,7 +22,7 @@ down name the JavaScript module a C++ file was ported from; the C++ file has the
 > ~100 kg tandem QuadPlane) and predicted two real flights correctly. Read **Status and limitations** below before
 > you fly settings from it, and keep the UNDO file of every step.
 >
-> **Download:** the Windows package is on the [Releases page](https://github.com/jelaniA3R0/ap-tuner/releases/latest)
+> **Download:** the Windows package is on the [Releases page](https://github.com/jelaniA3R0/ap-tuner/releases)
 > (unzip, double-click `Install AP Tuner.cmd`). **Help make it better:** share how a tune flew, report bugs or send
 > code: see [Contributing](CONTRIBUTING.md). Changes per version: [CHANGELOG](CHANGELOG.md).
 
