@@ -6,7 +6,8 @@
   let chosen = [];          // log paths to analyse together
   let result = null;        // the latest analysis
   let st = null;            // the latest /heavy/state
-  let tab = 'overview';
+  // the result tab to show; a link may name it (#overview, #model, #apply, #details)
+  let tab = ['overview', 'model', 'apply', 'details'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'overview';
   let chartsDrawn = false;
   const evalTimers = {};
 
@@ -135,7 +136,10 @@
     const x = (r.axes || {})[a] || {}, d = x.design || {}, pf = x.predictedFlown || {}, pd = d.predicted || {};
     const id = (r.identification || {})[a] || {};
     let g = '';
-    if (a === 'yaw') g = `<div class="mt-gauge">${gauge(pf.zeta, pd.zeta, 0, 1, 0.35)}<div class="mt-gnum">damping<b>${num(pf.zeta, 2)} → ${d.ok ? num(pd.zeta, 2) : '–'}</b>swing ${rng(pf.swingDeg)}° → ${d.ok ? rng(pd.swingDeg) + '°' : '–'}</div></div>`;
+    if (d.kept) g = a === 'yaw'
+      ? `<div class="mt-gauge">${gauge(pf.zeta, pf.zeta, 0, 1, 0.35)}<div class="mt-gnum">damping<b>${num(pf.zeta, 2)} · keep</b>swing ${rng(pf.swingDeg)}° · what you fly passes every test</div></div>`
+      : `<div class="mt-gauge">${gauge(pf.pmWorstDeg, pf.pmWorstDeg, -30, 70, 40)}<div class="mt-gnum">phase margin<b>${pmTxt(pf.pmWorstDeg)} · keep</b>what you fly passes every test</div></div>`;
+    else if (a === 'yaw') g =`<div class="mt-gauge">${gauge(pf.zeta, pd.zeta, 0, 1, 0.35)}<div class="mt-gnum">damping<b>${num(pf.zeta, 2)} → ${d.ok ? num(pd.zeta, 2) : '–'}</b>swing ${rng(pf.swingDeg)}° → ${d.ok ? rng(pd.swingDeg) + '°' : '–'}</div></div>`;
     else g = `<div class="mt-gauge">${gauge(pf.pmWorstDeg, d.ok ? d.pmWorstDeg : undefined, -30, 70, 40)}<div class="mt-gnum">phase margin<b>${pmTxt(pf.pmWorstDeg)} → ${d.ok ? pmTxt(d.pmWorstDeg) : '–'}</b>${pf.oscillationExpected ? 'wobbles now' : 'calm now'} · safe ≥ 40°</div></div>`;
     const valid = r.replay && r.replay[a] ? r.replay[a].ok : null;
     return `<div class="mt-card mt-axis ${worst}"><h3>${a}<span class="pill ${valid ? 'ok' : valid === false ? 'warn' : ''}">${valid ? 'model proven' : valid === false ? 'model not proven' : 'no model'}</span></h3>

@@ -182,8 +182,9 @@ rt::Task<Json> HeavyLive::start() {
     if (val.isNumber()) params_.set(k, val);
   // older firmware: acceleration limits under their old names (centi-degrees)
   if (!params_.has(std::string(q ? "Q_A_" : "ATC_") + "ACC_R_MAX")) {
-    const Json old = co_await link_.requestParams({std::string(q ? "Q_A_" : "ATC_") + "ACCEL_R_MAX", std::string(q ? "Q_A_" : "ATC_") + "ACCEL_P_MAX",
-                                                   std::string(q ? "Q_A_" : "ATC_") + "ACCEL_Y_MAX"}, 3);
+    const std::string A = q ? "Q_A_" : "ATC_";
+    const std::vector<std::string> oldNames{A + "ACCEL_R_MAX", A + "ACCEL_P_MAX", A + "ACCEL_Y_MAX"};
+    const Json old = co_await link_.requestParams(oldNames, 3);
     for (const auto& [k, val] : old.items())
       if (val.isNumber()) params_.set(k, val);
   }
