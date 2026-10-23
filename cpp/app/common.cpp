@@ -59,7 +59,7 @@ std::tm localOf(double epochMs) {
 std::string isoNow() {
   long long ms = 0;
   const std::tm tm = utcNow(ms);
-  char buf[40];
+  char buf[96];
   std::snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour,
                 tm.tm_min, tm.tm_sec, static_cast<int>(ms % 1000));
   return buf;
@@ -77,7 +77,7 @@ std::string localNow() {
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
   const std::tm tm = localOf(now);
-  char buf[40];
+  char buf[96];
   std::snprintf(buf, sizeof buf, "%d/%d/%04d, %d:%02d:%02d %s", tm.tm_mon + 1, tm.tm_mday, tm.tm_year + 1900,
                 (tm.tm_hour % 12) ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_sec, tm.tm_hour < 12 ? "AM" : "PM");
   return buf;
@@ -85,7 +85,7 @@ std::string localNow() {
 
 std::string localTime(double epochMs) {
   const std::tm tm = localOf(epochMs);
-  char buf[32];
+  char buf[96];
   std::snprintf(buf, sizeof buf, "%d:%02d:%02d %s", (tm.tm_hour % 12) ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_sec,
                 tm.tm_hour < 12 ? "AM" : "PM");
   return buf;

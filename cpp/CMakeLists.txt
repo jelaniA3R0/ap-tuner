@@ -33,10 +33,10 @@ else()
   target_compile_options(aptuner_options INTERFACE -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion)
   if(APTUNER_WARNINGS_AS_ERRORS)
     target_compile_options(aptuner_options INTERFACE -Werror)
-    # GCC reports "maybe uninitialized" and "stringop-overflow" for code it cannot fully see through (std::optional,
+    # GCC reports "maybe uninitialized", "stringop-overflow" and "format-truncation" for code it cannot fully see through (std::optional,
     # vector fills); it changes between GCC versions, so those stay warnings, not errors, on GCC
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-      target_compile_options(aptuner_options INTERFACE -Wno-error=maybe-uninitialized -Wno-error=stringop-overflow)
+      target_compile_options(aptuner_options INTERFACE -Wno-error=maybe-uninitialized -Wno-error=stringop-overflow -Wno-error=format-truncation)
     endif()
   endif()
   if(WIN32)
