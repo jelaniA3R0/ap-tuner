@@ -614,6 +614,16 @@ class App {
       r.headers.push_back({"Content-Disposition", "attachment; filename=\"" + std::regex_replace(base, binRe, "") + " - AP Tuner.param\""});
       co_return r;
     }
+    if (path.rfind("/api/heavy/", 0) == 0) co_return co_await heavyApi(path, body, req);
+    co_return jsonResp(404, Json::obj({{"error", "unknown api"}}));
+  }
+  /** the model-tuning routes (/api/heavy/...): a coroutine of their own keeps api() small enough for every compiler */
+  rt::Task<HttpResponse> heavyApi(std::string path, Json body, HttpRequest req) {
+    auto ok = [](Json extra = Json::object()) {
+      Json j = Json::obj({{"ok", true}});
+      for (const auto& [k, v] : extra.items()) j.set(k, v);
+      return jsonResp(200, j);
+    };
     // ---- model tuning: check edited values, exact files, write a step to the drone (two stages, verified)
     if (path == "/api/heavy/paramfile") {
       if (!lastHeavy.isObject()) co_return jsonResp(400, Json::obj({{"error", "analyse a flight first"}}));

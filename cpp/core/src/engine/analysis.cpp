@@ -360,6 +360,8 @@ std::optional<Resampled> resample(const Vec& t, const std::vector<const Vec*>& c
 std::vector<std::uint8_t> usableMask(const AxisData& data) {
   const std::size_t n = data.target.size();
   std::vector<std::uint8_t> m;
+  // (a size no vector can have: tells GCC 13 the fills below are bounded, -Wstringop-overflow)
+  if (n > static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max())) return m;
   for (const auto* mask : {&data.valid, &data.airborne}) {
     if (mask->empty()) continue;
     if (m.empty()) {

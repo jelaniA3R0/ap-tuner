@@ -33,7 +33,7 @@ namespace aptuner::io {
 
 namespace {
 
-std::string lastErrorText() {
+[[maybe_unused]] std::string lastErrorText() {   // used by the platform-specific serial code
 #ifdef _WIN32
   const DWORD e = GetLastError();
   char buf[512] = {0};
