@@ -81,9 +81,9 @@ std::intptr_t openAppWindow(const std::string& url, bool appWindow) {
 #else
   (void)appWindow;
 #ifdef __APPLE__
-  std::system(("open '" + url + "'").c_str());
+  [[maybe_unused]] const int rc = std::system(("open '" + url + "'").c_str());
 #else
-  std::system(("xdg-open '" + url + "' >/dev/null 2>&1 &").c_str());
+  [[maybe_unused]] const int rc = std::system(("xdg-open '" + url + "' >/dev/null 2>&1 &").c_str());
 #endif
   return 0;
 #endif
