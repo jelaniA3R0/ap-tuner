@@ -1,0 +1,44 @@
+name: Flight report
+description: Share how a tune from AP Tuner flew. This is how the model tuner gets proven on more airframes.
+labels: [flight report]
+body:
+  - type: markdown
+    attributes:
+      value: Every report helps the next builder. Good or bad results are both useful.
+  - type: input
+    id: version
+    attributes:
+      label: AP Tuner version
+    validations:
+      required: true
+  - type: textarea
+    id: airframe
+    attributes:
+      label: Airframe
+      description: Frame type, weight, motors, props, battery, flight controller, firmware.
+      placeholder: "Tandem 4+1 QuadPlane, ~100 kg, X13-18S motors, 56x20 props, 18S, Cube Orange+, ArduPlane 4.7.1"
+    validations:
+      required: true
+  - type: textarea
+    id: app
+    attributes:
+      label: What the app said and proposed
+      description: The issues it found, the step you flew (or paste the step .param file).
+  - type: textarea
+    id: flown
+    attributes:
+      label: What you flew and how it flew
+      description: Did the next-flight check confirm the prediction? Anything unexpected?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Attach or link the .bin logs (before and after) if you can.
+  - type: checkboxes
+    id: share
+    attributes:
+      label: Test set
+      options:
+        - label: My logs may be used in AP Tuner's test set

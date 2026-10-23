@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# a newer push to the same branch cancels the older run
+concurrency:
+  group: cpp-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: ${{ matrix.name }}

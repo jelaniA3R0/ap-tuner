@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in AP Tuner did not work as it should. For a flight-safety problem start the title with [SAFETY].
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for reporting. The more of the fields below you fill in, the faster it can be fixed.
+  - type: input
+    id: version
+    attributes:
+      label: AP Tuner version
+      description: Help tab, or `aptuner --version`
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where
+      options: [Model tune, Flight, Telemetry + USB, Advanced (live tuner), Log file, Installer / startup, Other]
+    validations:
+      required: true
+  - type: input
+    id: vehicle
+    attributes:
+      label: Vehicle and firmware
+      placeholder: "QuadPlane, ~25 kg, ArduPlane 4.7.1, Cube Orange+"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: files
+    attributes:
+      label: Logs and files
+      description: Attach (or link) the .bin log, the AP Tuner .param / UNDO files and a screenshot if you can.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety
+      options:
+        - label: This affected how the aircraft flew, or what was written to it

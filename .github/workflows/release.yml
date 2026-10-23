@@ -1,0 +1,45 @@
+# Publishes a release when a version tag is pushed (git tag v0.3.0 && git push origin v0.3.0): builds the Windows
+# package with MSVC, runs the unit tests, and attaches "AP-Tuner-<version>-windows.zip" to a GitHub release whose notes
+# are that version's section of CHANGELOG.md.
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -G Ninja -S cpp -B cpp/build/release -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build/release
+      - name: Test
+        run: ctest --test-dir cpp/build/release -R "unit|version|usage|refuses" --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File tools/make-release.ps1 -SkipBuild
+          $zip = Join-Path (Split-Path -Parent $PWD) 'AP Tuner C++.zip'
+          if (-not (Test-Path $zip)) { throw 'the package was not made' }
+          $name = "AP-Tuner-$($env:GITHUB_REF_NAME)-windows.zip"
+          Move-Item $zip $name
+          "ZIP=$name" | Out-File -Append $env:GITHUB_ENV
+          # the notes: this version's section of CHANGELOG.md
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $text = Get-Content CHANGELOG.md -Raw
+          $m = [regex]::Match($text, "(?ms)^## $([regex]::Escape($v))[^\n]*\n(.*?)(?=^## |\z)")
+          ($m.Success ? $m.Groups[1].Value : "See CHANGELOG.md") | Out-File -Encoding utf8 notes.md
+          exit 0
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}
+          body_path: notes.md
+          prerelease: ${{ contains(github.ref_name, '-') }}

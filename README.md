@@ -21,6 +21,10 @@ down name the JavaScript module a C++ file was ported from; the C++ file has the
 > **Status: beta (v0.2.0).** The model-based tuner for heavy drones has been proven on one airframe so far (a
 > ~100 kg tandem QuadPlane) and predicted two real flights correctly. Read **Status and limitations** below before
 > you fly settings from it, and keep the UNDO file of every step.
+>
+> **Download:** the Windows package is on the [Releases page](https://github.com/jelaniA3R0/ap-tuner/releases/latest)
+> (unzip, double-click `Install AP Tuner.cmd`). **Help make it better:** share how a tune flew, report bugs or send
+> code: see [Contributing](CONTRIBUTING.md). Changes per version: [CHANGELOG](CHANGELOG.md).
 
 | Model tune: what the flights show | Next-flight check |
 |---|---|
@@ -76,14 +80,17 @@ The method, step by step: `docs/how-it-works.md` ("Model-based tuning"); the tan
 
 ## Install or just run
 
-* **Build the release** (needs the portable toolchain in `D:\toolchain`, see `cpp/README.md`):
-  `powershell -ExecutionPolicy Bypass -File tools\make-release.ps1` writes `D:\AP Tuner C++.zip`.
+* **Download** `AP-Tuner-<version>-windows.zip` from the
+  [Releases page](https://github.com/jelaniA3R0/ap-tuner/releases) (or build it yourself:
+  `powershell -ExecutionPolicy Bypass -File tools\make-release.ps1` with the toolchain of `cpp/README.md`).
 * **Install:** unzip it and double-click **`Install AP Tuner.cmd`**: it copies the app to your user folder,
   puts **AP Tuner** on the Desktop and in the Start Menu, and starts it in its own window (Microsoft Edge app
   mode). Close the window to stop it. `Uninstall AP Tuner.cmd` removes it again.
 * **Run without installing:** double-click `aptuner.exe` in the unzipped folder.
 
-Nothing else to install: one program plus the `web` folder, no runtime, no internet.
+Nothing else to install: one program plus the `web` folder, no runtime, no internet. Windows may warn about an
+unrecognised app the first time (the package is not code-signed): "More info" → "Run anyway".
+
 ## One guided flight (Flight tab, recommended)
 
 Press **Start flight check**. The app connects, reads the vehicle, and then leads you through one flight:
@@ -305,3 +312,16 @@ are summarised in `docs/how-it-works.md` and `docs/validation/`.
 * `cpp/tests` unit, golden, real-log and model-tuning tests (`cpp\build.cmd` builds and runs them).
 * `web` the user interface (uPlot for charts). `docs/img` the screenshots. The hand analysis of the tandem QuadPlane that the model tuner implements
   (`research/`) stays with the author: it holds local log paths and is not part of the repository.
+
+## Help make it better
+
+AP Tuner grew out of what others shared about tuning ArduPilot aircraft; it is free (MIT licence) so it can help
+the next builder the same way. You can help without writing code:
+
+* **Flight reports** are the most valuable thing right now: open an issue with the *Flight report* template and tell
+  how a tune from the app flew on your airframe (with the logs if you can). Each one proves or improves the method
+  on another aircraft.
+* **Bug reports and ideas**: the *Bug report* and *Feature request* templates in Issues. Put **[SAFETY]** in the title
+  of anything that affected how an aircraft flew.
+* **Code and docs**: fork, branch, change, test, open a pull request. [CONTRIBUTING.md](CONTRIBUTING.md) says how to
+  build, test and keep the safety rules; [docs/how-it-works.md](docs/how-it-works.md) explains the method.

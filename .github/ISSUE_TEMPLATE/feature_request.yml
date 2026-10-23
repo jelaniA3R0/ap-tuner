@@ -1,0 +1,20 @@
+name: Feature request
+description: An idea that would make AP Tuner more useful.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem or the situation, in your own words.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Vehicle type, logs, links to ArduPilot docs or forum threads.
