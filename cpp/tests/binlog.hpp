@@ -205,7 +205,7 @@ inline std::vector<std::uint8_t> hoverLog(const HoverOpts& o = {}) {
     add(t, o.thrMsg, {0, (t >= o.flyFrom && t < o.flyTo ? 0.5 : 0) * o.thrScale});
   }
   if (o.imu)
-    for (long i = 1; i <= o.seconds * o.imu->first; i++) {
+    for (long i = 1; static_cast<double>(i) <= o.seconds * o.imu->first; i++) {
       const double t = static_cast<double>(i) / o.imu->first + 0.00011;
       add(t, "IMU", {0, 0, 0.01 * std::sin(2 * kPiT * 40 * t), 0, 0, o.imu->second});
     }

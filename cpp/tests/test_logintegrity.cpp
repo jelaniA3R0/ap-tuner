@@ -83,7 +83,7 @@ struct GyroLogOpts {
 };
 log::LogData gyroLog(const GyroLogOpts& o) {
   std::vector<double> ts;
-  for (long i = 0; i < o.fs * o.seconds; i++) {
+  for (long i = 0; static_cast<double>(i) < o.fs * o.seconds; i++) {
     const double t = static_cast<double>(i) / o.fs;
     if (!o.keep || o.keep(t)) ts.push_back(t);
   }

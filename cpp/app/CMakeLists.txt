@@ -27,3 +27,9 @@ if(WIN32)
   set_target_properties(aptuner PROPERTIES WIN32_EXECUTABLE TRUE)
   target_link_libraries(aptuner PRIVATE shell32)
 endif()
+
+# Visual Studio 2026's compiler (CL.exe 19.5x) crashes in its optimizer on this library's coroutines. The app library
+# is the server and live-session glue, not the maths (aptuner_core stays fully optimised), so MSVC builds it unoptimised.
+if(MSVC)
+  target_compile_options(aptuner_app PRIVATE /Od /Ob0)
+endif()
